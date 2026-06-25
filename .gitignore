@@ -15,6 +15,7 @@
 /.continue/
 /documents/
 /utilities/
+/Outlook365/installer/output
 *.pyc
 __pycache__
 .pytest_cache
