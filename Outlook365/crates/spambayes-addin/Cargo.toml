@@ -1,0 +1,21 @@
+[package]
+name = "spambayes-addin"
+version = "0.1.0"
+edition = "2021"
+description = "COM add-in DLL for Outlook integration"
+
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "spambayes_manager"
+path = "src/bin/spambayes_manager.rs"
+
+[dependencies]
+spambayes-core = { path = "../spambayes-core" }
+spambayes-storage = { path = "../spambayes-storage" }
+spambayes-config = { path = "../spambayes-config" }
+spambayes-mapi = { path = "../spambayes-mapi" }
+thiserror = { workspace = true }
+windows = { workspace = true }
+libc = "0.2"

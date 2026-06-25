@@ -1,0 +1,11 @@
+[package]
+name = "spambayes-mapi"
+version = "0.1.0"
+edition = "2021"
+description = "MAPI abstraction layer for Outlook message store access"
+
+[dependencies]
+spambayes-core = { path = "../spambayes-core" }
+thiserror = { workspace = true }
+log = { workspace = true }
+windows = { workspace = true }

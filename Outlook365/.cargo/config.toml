@@ -1,0 +1,12 @@
+# Cargo configuration for SpamBayes Outlook Add-in
+# Supports both 32-bit and 64-bit Outlook builds
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Default to 64-bit Windows MSVC target
+[build]
+target = "x86_64-pc-windows-msvc"
