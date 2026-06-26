@@ -33,6 +33,8 @@ use spambayes_core::Classification;
 use spambayes_mapi::MsgStoreError;
 use spambayes_storage::{MessageDatabase, StorageBackend};
 
+use crate::statistics::StatisticsManager;
+
 // ─── FilterError ─────────────────────────────────────────────────────────────
 
 /// Errors that can occur during filter operations.
@@ -270,6 +272,8 @@ pub struct FilterEngine {
     message_db: Arc<Mutex<Box<dyn MessageDatabase>>>,
     /// Email tokenizer for extracting scoring features.
     tokenizer: Tokenizer,
+    /// Optional statistics observer for classification tracking.
+    statistics: Option<StatisticsManager>,
 }
 
 impl FilterEngine {
@@ -279,6 +283,7 @@ impl FilterEngine {
         classifier: Arc<Mutex<Classifier>>,
         storage: Arc<Mutex<Box<dyn StorageBackend>>>,
         message_db: Arc<Mutex<Box<dyn MessageDatabase>>>,
+        statistics: Option<StatisticsManager>,
     ) -> Self {
         Self {
             config,
@@ -286,6 +291,7 @@ impl FilterEngine {
             storage,
             message_db,
             tokenizer: Tokenizer::with_defaults(),
+            statistics,
         }
     }
 
@@ -296,6 +302,7 @@ impl FilterEngine {
         storage: Arc<Mutex<Box<dyn StorageBackend>>>,
         message_db: Arc<Mutex<Box<dyn MessageDatabase>>>,
         tokenizer: Tokenizer,
+        statistics: Option<StatisticsManager>,
     ) -> Self {
         Self {
             config,
@@ -303,6 +310,7 @@ impl FilterEngine {
             storage,
             message_db,
             tokenizer,
+            statistics,
         }
     }
 
@@ -423,6 +431,11 @@ impl FilterEngine {
     ) -> Result<FilterResult, FilterError> {
         // Step 1: Score and classify the message.
         let result = self.classify_raw(message_bytes)?;
+
+        // Notify the statistics observer of the classification result.
+        if let Some(stats) = &self.statistics {
+            stats.on_classified(result.classification);
+        }
 
         // Step 2: If save_spam_info is enabled, save the score to the message.
         if self.config.save_spam_info {
@@ -1034,7 +1047,7 @@ mod tests {
         let message_db: Arc<Mutex<Box<dyn MessageDatabase>>> =
             Arc::new(Mutex::new(Box::new(MockMessageDb)));
 
-        FilterEngine::new(config, classifier, storage, message_db)
+        FilterEngine::new(config, classifier, storage, message_db, None)
     }
 
     fn default_general_config() -> GeneralConfig {

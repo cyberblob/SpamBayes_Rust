@@ -69,6 +69,8 @@ pub use session::{MapiSession as MapiSessionImpl, StoreInfo};
 pub use store::MessageStoreOps;
 #[cfg(target_os = "windows")]
 pub use store::MessageIterator;
+#[cfg(target_os = "windows")]
+pub use store::FolderTreeNode;
 
 use std::ffi::c_void;
 

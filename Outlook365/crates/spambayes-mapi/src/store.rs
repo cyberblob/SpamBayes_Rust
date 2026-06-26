@@ -90,6 +90,17 @@ impl MessageStoreOps {
         &self.store_id
     }
 
+    /// Returns the raw `IMsgStore` COM pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not release this pointer (it is owned by `MapiSession`).
+    /// Must only be used from the COM apartment thread.
+    #[must_use]
+    pub fn store_ptr_raw(&self) -> *mut c_void {
+        self.store_ptr
+    }
+
     /// Get the root folder (IPM subtree) of this message store.
     ///
     /// Reads `PR_IPM_SUBTREE_ENTRYID` from the store, then opens that
@@ -698,6 +709,155 @@ impl MessageStoreOps {
 /// the call partially succeeded. We treat this as success and read what
 /// we can.
 const MAPI_W_ERRORS_RETURNED: i32 = 0x00040380;
+
+// ─── Folder Hierarchy Tree ──────────────────────────────────────────────────
+
+/// A node in the folder hierarchy tree, for use by the GUI folder browser.
+///
+/// This is a simple data structure that can be sent across threads (unlike
+/// MAPI COM pointers which are apartment-bound).
+#[derive(Debug, Clone)]
+pub struct FolderTreeNode {
+    /// Display name of the folder.
+    pub name: String,
+    /// Hex-encoded store entry ID.
+    pub store_id_hex: String,
+    /// Hex-encoded folder entry ID.
+    pub entry_id_hex: String,
+    /// Child sub-folders.
+    pub children: Vec<FolderTreeNode>,
+}
+
+impl MessageStoreOps {
+    /// Build a hierarchical folder tree starting from the IPM subtree root.
+    ///
+    /// Returns the children of the root folder as `FolderTreeNode`s. Each
+    /// node contains hex-encoded entry IDs and recursively includes all
+    /// sub-folders.
+    ///
+    /// This method must be called from the COM apartment thread.
+    pub fn get_folder_hierarchy(&self) -> Result<Vec<FolderTreeNode>, MsgStoreError> {
+        let root = self.get_root_folder()?;
+        let children = self.build_tree_children(&root.entry_id);
+        Ok(children)
+    }
+
+    /// Recursively build `FolderTreeNode` children for a given parent folder.
+    fn build_tree_children(&self, parent_eid: &[u8]) -> Vec<FolderTreeNode> {
+        if self.store_ptr.is_null() {
+            return Vec::new();
+        }
+
+        unsafe { self.build_tree_children_inner(parent_eid) }
+    }
+
+    /// Inner unsafe recursive tree builder.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from the COM apartment thread with a valid store pointer.
+    unsafe fn build_tree_children_inner(&self, parent_eid: &[u8]) -> Vec<FolderTreeNode> {
+        let mut children = Vec::new();
+
+        // Open the parent folder
+        let folder_ptr = match self.open_entry_raw(parent_eid, MAPI_BEST_ACCESS | MAPI_DEFERRED_ERRORS) {
+            Ok(ptr) => ptr,
+            Err(_) => return children,
+        };
+
+        let folder_obj = folder_ptr.cast::<IMAPIFolderObj>();
+        let vtbl = &*(*folder_obj).vtbl;
+
+        // Get the hierarchy table (sub-folders)
+        let mut table_ptr: *mut c_void = ptr::null_mut();
+        let hr = (vtbl.get_hierarchy_table)(folder_ptr, MAPI_DEFERRED_ERRORS, &raw mut table_ptr);
+
+        if hr != S_OK || table_ptr.is_null() {
+            release_com(folder_ptr);
+            return children;
+        }
+
+        let table_obj = table_ptr.cast::<IMAPITableObj>();
+        let table_vtbl = &*(*table_obj).vtbl;
+
+        // Set columns: entry ID, store entry ID, display name
+        #[repr(C)]
+        struct PropTagArray3 {
+            c_values: u32,
+            tags: [u32; 3],
+        }
+        let columns = PropTagArray3 {
+            c_values: 3,
+            tags: [PR_ENTRYID, PR_STORE_ENTRYID, PR_DISPLAY_NAME_W],
+        };
+
+        let hr = (table_vtbl.set_columns)(
+            table_ptr,
+            (&raw const columns).cast::<SPropTagArray>(),
+            0,
+        );
+        if hr != S_OK {
+            release_com(table_ptr);
+            release_com(folder_ptr);
+            return children;
+        }
+
+        // Query all rows (up to 500 sub-folders per level)
+        let mut row_set: *mut SRowSet = ptr::null_mut();
+        let hr = (table_vtbl.query_rows)(table_ptr, 500, 0, &raw mut row_set);
+
+        if hr != S_OK || row_set.is_null() {
+            release_com(table_ptr);
+            release_com(folder_ptr);
+            return children;
+        }
+
+        let num_rows = (*row_set).c_rows;
+        let store_id_hex = hex_encode(&self.store_id);
+
+        for i in 0..num_rows {
+            let row_ptr = (row_set as *const u8)
+                .add(std::mem::offset_of!(SRowSet, a_row))
+                .add(i as usize * std::mem::size_of::<SRow>())
+                .cast::<SRow>();
+            let row = &*row_ptr;
+
+            if row.c_values < 3 || row.lp_props.is_null() {
+                continue;
+            }
+
+            let props = row.lp_props;
+            let sub_eid = read_binary_prop(props.add(0));
+            let _sub_store_eid = read_binary_prop(props.add(1));
+            let sub_name = read_display_name(props.add(2));
+
+            if sub_eid.is_empty() {
+                continue;
+            }
+
+            // Recurse into sub-folder
+            let sub_children = self.build_tree_children_inner(&sub_eid);
+
+            children.push(FolderTreeNode {
+                name: sub_name,
+                store_id_hex: store_id_hex.clone(),
+                entry_id_hex: hex_encode(&sub_eid),
+                children: sub_children,
+            });
+        }
+
+        MAPIFreeBuffer(row_set.cast::<c_void>());
+        release_com(table_ptr);
+        release_com(folder_ptr);
+
+        children
+    }
+}
+
+/// Encode bytes to a lowercase hex string.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// `MAPI_UNICODE` flag — request Unicode string properties.
 const MAPI_UNICODE_FLAG: u32 = 0x80000000;

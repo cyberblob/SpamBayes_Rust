@@ -5,11 +5,20 @@ edition = "2021"
 description = "COM add-in DLL for Outlook integration"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "spambayes_manager"
 path = "src/bin/spambayes_manager.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "mapi_test"
+path = "src/bin/mapi_test.rs"
+
+[features]
+default = []
+gui = ["dep:gtk4", "dep:glib"]
 
 [dependencies]
 spambayes-core = { path = "../spambayes-core" }
@@ -17,5 +26,14 @@ spambayes-storage = { path = "../spambayes-storage" }
 spambayes-config = { path = "../spambayes-config" }
 spambayes-mapi = { path = "../spambayes-mapi" }
 thiserror = { workspace = true }
+log = { workspace = true }
 windows = { workspace = true }
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gtk4 = { version = "0.9", features = ["v4_12"], optional = true }
+glib = { version = "0.20", optional = true }
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,5 +1,5 @@
 # Cargo configuration for SpamBayes Outlook Add-in
-# Supports both 32-bit and 64-bit Outlook builds
+# GTK4 is installed via MSYS2 ucrt64
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
@@ -10,3 +10,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # Default to 64-bit Windows MSVC target
 [build]
 target = "x86_64-pc-windows-msvc"
+
+# Environment variables for GTK4 pkg-config discovery (ucrt64)
+[env]
+PKG_CONFIG_PATH = { value = "C:\\msys64\\ucrt64\\lib\\pkgconfig", force = false }

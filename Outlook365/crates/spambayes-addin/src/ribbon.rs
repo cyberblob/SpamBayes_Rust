@@ -145,6 +145,10 @@ impl RibbonExtensibility {
             "GetSpamEnabled" => 105,
             "GetNotSpamEnabled" => 106,
             "GetNotSpamVisible" => 107,
+            "GetSpamVisible" => 109,
+            "LoadImage" => 108,
+            "OnShowCluesClick" => 110,
+            "GetShowCluesEnabled" => 111,
             _ => {
                 *rg_disp_id = -1;
                 return DISP_E_UNKNOWNNAME;
@@ -185,7 +189,34 @@ impl RibbonExtensibility {
                 S_OK
             }
             104 => {
-                // Ribbon_OnLoad
+                // Ribbon_OnLoad - store the IRibbonUI reference for later Invalidate calls
+                if !_params.is_null() {
+                    #[repr(C)]
+                    struct DISPPARAMS {
+                        rgvarg: *mut c_void,
+                        rgdispid_named: *mut i32,
+                        c_args: u32,
+                        c_named_args: u32,
+                    }
+                    let dp = &*(_params as *const DISPPARAMS);
+                    if dp.c_args > 0 && !dp.rgvarg.is_null() {
+                        let var_ptr = dp.rgvarg as *const u8;
+                        let vt = *(var_ptr as *const u16);
+                        if vt == 9 || vt == 13 { // VT_DISPATCH or VT_UNKNOWN
+                            let ribbon_ptr = *(var_ptr.add(8) as *const *mut c_void);
+                            if !ribbon_ptr.is_null() {
+                                // AddRef on the ribbon UI
+                                let vtbl_ptr = *(ribbon_ptr as *const *const usize);
+                                let addref_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
+                                    std::mem::transmute(*vtbl_ptr.add(1));
+                                addref_fn(ribbon_ptr);
+                                crate::addin_core::GLOBAL_RIBBON_UI = ribbon_ptr;
+                                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                    .and_then(|mut f| { use std::io::Write; writeln!(f, "Ribbon_OnLoad: stored IRibbonUI={:?}", ribbon_ptr) });
+                            }
+                        }
+                    }
+                }
                 S_OK
             }
             105 | 106 => {
@@ -201,18 +232,225 @@ impl RibbonExtensibility {
                 S_OK
             }
             107 => {
-                // GetNotSpamVisible -> return True
+                // GetNotSpamVisible -> check if in spam/unsure folder
+                let visible = crate::addin_core::AddinCore::is_in_spam_or_unsure_folder();
                 if !p_result.is_null() {
                     let var_ptr = p_result as *mut u8;
                     *(var_ptr as *mut u16) = 11; // VT_BOOL
                     *(var_ptr.add(2) as *mut u16) = 0;
                     *(var_ptr.add(4) as *mut u16) = 0;
                     *(var_ptr.add(6) as *mut u16) = 0;
-                    *(var_ptr.add(8) as *mut i16) = -1; // VARIANT_TRUE
+                    *(var_ptr.add(8) as *mut i16) = if visible { -1 } else { 0 };
+                }
+                S_OK
+            }
+            109 => {
+                // GetSpamVisible -> visible when NOT in spam folder
+                let in_spam = crate::addin_core::AddinCore::is_in_spam_folder_only();
+                if !p_result.is_null() {
+                    let var_ptr = p_result as *mut u8;
+                    *(var_ptr as *mut u16) = 11; // VT_BOOL
+                    *(var_ptr.add(2) as *mut u16) = 0;
+                    *(var_ptr.add(4) as *mut u16) = 0;
+                    *(var_ptr.add(6) as *mut u16) = 0;
+                    *(var_ptr.add(8) as *mut i16) = if !in_spam { -1 } else { 0 };
+                }
+                S_OK
+            }
+            108 => {
+                // LoadImage callback: receives image ID string, returns IPictureDisp
+                let image_id = Self::extract_first_bstr_param(_params);
+                let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: LoadImage called with id={:?}", image_id) });
+
+                if let Some(id) = image_id {
+                    let filename = match id.as_str() {
+                        "delete_as_spam" => "delete_as_spam.bmp",
+                        "recover_ham" => "recover_ham.bmp",
+                        _ => {
+                            let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: LoadImage unknown id: {}", id) });
+                            return S_OK;
+                        }
+                    };
+
+                    // Find the images directory relative to the DLL location
+                    let image_path = Self::find_image_path(filename);
+                    let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: LoadImage path={:?}", image_path) });
+
+                    if let Some(path) = image_path {
+                        let picture = Self::load_picture_from_bmp(&path);
+                        let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
+                            .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: LoadImage picture={:?}", picture.map(|p| p as usize)) });
+
+                        if let Some(pdisp) = picture {
+                            // Return as VT_DISPATCH (vt=9) in the VARIANT result
+                            if !p_result.is_null() {
+                                let var_ptr = p_result as *mut u8;
+                                // Clear the VARIANT first
+                                std::ptr::write_bytes(var_ptr, 0, 16);
+                                // VT_DISPATCH = 9
+                                *(var_ptr as *mut u16) = 9;
+                                // punkVal/pdispVal is at offset 8 in VARIANT
+                                *(var_ptr.add(8) as *mut *mut c_void) = pdisp;
+                            }
+                        }
+                    }
+                }
+                S_OK
+            }
+            110 => {
+                // OnShowCluesClick — score the selected message and show clues
+                let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: OnShowCluesClick!") });
+                crate::addin_core::AddinCore::show_clues_for_selected();
+                S_OK
+            }
+            111 => {
+                // GetShowCluesEnabled — enabled when classifier is loaded
+                let enabled = crate::addin_core::AddinCore::is_classifier_loaded();
+                if !p_result.is_null() {
+                    let var_ptr = p_result as *mut u8;
+                    *(var_ptr as *mut u16) = 11; // VT_BOOL
+                    *(var_ptr.add(2) as *mut u16) = 0;
+                    *(var_ptr.add(4) as *mut u16) = 0;
+                    *(var_ptr.add(6) as *mut u16) = 0;
+                    *(var_ptr.add(8) as *mut i16) = if enabled { -1 } else { 0 };
                 }
                 S_OK
             }
             _ => S_OK
+        }
+    }
+
+    /// Extract the first BSTR parameter from DISPPARAMS.
+    ///
+    /// DISPPARAMS layout:
+    ///   - rgvarg: *mut VARIANT (array of args, in reverse order)
+    ///   - rgdispidNamedArgs: *mut i32
+    ///   - cArgs: u32
+    ///   - cNamedArgs: u32
+    ///
+    /// For loadImage callback, the first (and only) arg is the image ID string (VT_BSTR=8).
+    unsafe fn extract_first_bstr_param(params: *mut c_void) -> Option<String> {
+        if params.is_null() { return None; }
+
+        #[repr(C)]
+        struct DISPPARAMS {
+            rgvarg: *mut c_void,       // VARIANT array
+            rgdispid_named: *mut i32,
+            c_args: u32,
+            c_named_args: u32,
+        }
+
+        let dp = &*(params as *const DISPPARAMS);
+        if dp.c_args == 0 || dp.rgvarg.is_null() { return None; }
+
+        // Args are in reverse order; for a single arg, it's at index 0
+        let variant_ptr = dp.rgvarg as *const u8;
+        let vt = *(variant_ptr as *const u16);
+
+        if vt == 8 {
+            // VT_BSTR: BSTR pointer is at offset 8
+            let bstr_ptr = *(variant_ptr.add(8) as *const *const u16);
+            if bstr_ptr.is_null() { return None; }
+            // BSTR: length prefix at bstr_ptr - 2 (in bytes), string starts at bstr_ptr
+            let mut len = 0usize;
+            while *bstr_ptr.add(len) != 0 { len += 1; }
+            Some(String::from_utf16_lossy(std::slice::from_raw_parts(bstr_ptr, len)))
+        } else {
+            None
+        }
+    }
+
+    /// Find the path to an image file.
+    ///
+    /// Search order:
+    /// 1. Next to the DLL: {dll_dir}\..\images\{filename}
+    /// 2. Install directory: {dll_dir}\..\..\images\{filename}  
+    /// 3. Data directory: %LOCALAPPDATA%\SpamBayes\images\{filename}
+    fn find_image_path(filename: &str) -> Option<std::path::PathBuf> {
+        use std::path::{Path, PathBuf};
+
+        // Get DLL directory
+        let dll_dir = Self::get_dll_directory();
+
+        if let Some(ref dir) = dll_dir {
+            // Pattern: {install_dir}\x64\spambayes_addin.dll -> {install_dir}\images\{filename}
+            let parent = Path::new(dir).parent()?;
+            let candidate = parent.join("images").join(filename);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // Also check next to the DLL directly
+            let candidate = PathBuf::from(dir).join("images").join(filename);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        // Fallback: %LOCALAPPDATA%\SpamBayes\images\{filename}
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let candidate = PathBuf::from(local_app_data).join("SpamBayes").join("images").join(filename);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+
+    /// Get the directory containing this DLL.
+    fn get_dll_directory() -> Option<String> {
+        use windows::Win32::Foundation::MAX_PATH;
+        use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+
+        let hmodule = crate::get_dll_module();
+        let mut buffer = vec![0u16; MAX_PATH as usize];
+        let len = unsafe { GetModuleFileNameW(hmodule, &mut buffer) } as usize;
+        if len == 0 { return None; }
+        let path = String::from_utf16_lossy(&buffer[..len]);
+        // Return the directory portion
+        path.rfind('\\').map(|pos| path[..pos].to_string())
+    }
+
+    /// Load a BMP file and return an IPictureDisp pointer.
+    ///
+    /// Uses OleLoadPicturePath to load the bitmap as an IPictureDisp COM object.
+    unsafe fn load_picture_from_bmp(path: &std::path::Path) -> Option<*mut c_void> {
+        extern "system" {
+            fn OleLoadPicturePath(
+                sz_url_or_path: *const u16,
+                punk_caller: *mut c_void,
+                dw_reserved: u32,
+                clr_reserved: u32,
+                riid: *const GUID,
+                ppv_ret: *mut *mut c_void,
+            ) -> HRESULT;
+        }
+
+        // IID_IDispatch — OleLoadPicturePath returns IPictureDisp through IDispatch QI
+        let iid_idispatch = GUID::from_u128(0x00020400_0000_0000_C000_000000000046);
+
+        // Convert path to wide string (OleLoadPicturePath expects a file path or URL)
+        let path_str = path.to_string_lossy();
+        let wide_path: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut ppic: *mut c_void = std::ptr::null_mut();
+        let hr = OleLoadPicturePath(
+            wide_path.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            &iid_idispatch,
+            &mut ppic,
+        );
+
+        if hr.0 == 0 && !ppic.is_null() {
+            Some(ppic)
+        } else {
+            None
         }
     }
 

@@ -78,11 +78,14 @@ pub mod error_reporter;
 pub mod export;
 pub mod filter;
 pub mod folder_sink;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod logger;
 pub mod manager_dlg;
 pub mod notification;
 pub mod registry;
 pub mod ribbon;
+pub mod statistics;
 pub mod timer;
 pub mod toolbar;
 pub mod train;

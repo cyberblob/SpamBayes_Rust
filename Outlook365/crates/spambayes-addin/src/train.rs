@@ -31,6 +31,7 @@ use spambayes_storage::{ClassifierState, MessageDatabase, MessageInfo, StorageBa
 
 use crate::filter::Progress;
 use crate::logger::Logger;
+use crate::statistics::StatisticsManager;
 
 // ─── TrainError ──────────────────────────────────────────────────────────────
 
@@ -165,6 +166,8 @@ pub struct TrainingEngine {
     tokenizer: Tokenizer,
     /// Logger for diagnostic output.
     logger: Arc<Logger>,
+    /// Optional statistics observer for training tracking.
+    statistics: Option<StatisticsManager>,
 }
 
 impl TrainingEngine {
@@ -174,6 +177,7 @@ impl TrainingEngine {
         storage: Arc<Mutex<Box<dyn StorageBackend>>>,
         message_db: Arc<Mutex<Box<dyn MessageDatabase>>>,
         logger: Arc<Logger>,
+        statistics: Option<StatisticsManager>,
     ) -> Self {
         Self {
             classifier,
@@ -181,6 +185,7 @@ impl TrainingEngine {
             message_db,
             tokenizer: Tokenizer::with_defaults(),
             logger,
+            statistics,
         }
     }
 
@@ -191,6 +196,7 @@ impl TrainingEngine {
         message_db: Arc<Mutex<Box<dyn MessageDatabase>>>,
         tokenizer: Tokenizer,
         logger: Arc<Logger>,
+        statistics: Option<StatisticsManager>,
     ) -> Self {
         Self {
             classifier,
@@ -198,6 +204,7 @@ impl TrainingEngine {
             message_db,
             tokenizer,
             logger,
+            statistics,
         }
     }
 
@@ -281,6 +288,11 @@ impl TrainingEngine {
             db.store_msg(search_key, &new_info);
         }
 
+        // Report training event to statistics.
+        if let Some(stats) = &self.statistics {
+            stats.on_trained(is_spam);
+        }
+
         Ok(true)
     }
 
@@ -333,6 +345,11 @@ impl TrainingEngine {
             let mut db = self.message_db.lock()
                 .map_err(|_| TrainError::MessageDbLockPoisoned)?;
             db.store_msg(search_key, &updated_info);
+        }
+
+        // Report untrain event to statistics.
+        if let Some(stats) = &self.statistics {
+            stats.on_untrained(prev_is_spam);
         }
 
         Ok(Some(prev_is_spam))
@@ -577,6 +594,11 @@ impl TrainingEngine {
             let mut db = self.message_db.lock()
                 .map_err(|_| TrainError::MessageDbLockPoisoned)?;
             db.store_msg(search_key, &updated_info);
+        }
+
+        // Report incremental training event to statistics.
+        if let Some(stats) = &self.statistics {
+            stats.on_trained(train_as_spam);
         }
 
         self.logger.info(
@@ -1588,7 +1610,7 @@ mod tests {
             Arc::new(Mutex::new(Box::new(message_db)));
         let logger = make_logger();
 
-        TrainingEngine::new(classifier, storage, db, logger)
+        TrainingEngine::new(classifier, storage, db, logger, None)
     }
 
     fn make_engine_with_classifier(
@@ -1601,7 +1623,7 @@ mod tests {
             Arc::new(Mutex::new(Box::new(message_db)));
         let logger = make_logger();
 
-        TrainingEngine::new(classifier, storage, db, logger)
+        TrainingEngine::new(classifier, storage, db, logger, None)
     }
 
     fn make_ham_folder_id() -> FolderId {
@@ -2243,7 +2265,7 @@ mod tests {
             Arc::new(Mutex::new(Box::new(message_db)));
         let logger = make_logger();
 
-        TrainingEngine::new(classifier, storage, db, logger)
+        TrainingEngine::new(classifier, storage, db, logger, None)
     }
 
     #[test]

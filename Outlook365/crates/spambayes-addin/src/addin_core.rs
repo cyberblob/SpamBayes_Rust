@@ -15,15 +15,19 @@ use std::sync::{Arc, Mutex};
 use windows::core::{GUID, HRESULT};
 
 use spambayes_config::AppConfig;
+use spambayes_config::ConfigChain;
 use spambayes_core::classifier::Classifier;
 use spambayes_storage::{MmapDbmBackend, StorageBackend};
 
 use crate::error_reporter::ErrorReporter;
 use crate::filter::FilterEngine;
 use crate::logger::Logger;
+use crate::manager_dlg::ManagerState;
 use crate::notification::NotificationManager;
+use crate::statistics::StatisticsManager;
 use crate::timer::TimerFilterState;
 use crate::train::TrainingEngine;
+use crate::wizard::ConfigWizard;
 use crate::{
     dll_add_ref, dll_release, E_NOINTERFACE, E_POINTER, IID_IUNKNOWN, LogLevel, S_OK,
 };
@@ -57,9 +61,22 @@ const BUTTON_POLL_TIMER_ID: usize = 0x5B02;
 /// Timer ID for deferred folder hook setup.
 const FOLDER_HOOK_TIMER_ID: usize = 0x5B03;
 
+/// Timer ID for folder-switch ribbon invalidation polling.
+const FOLDER_SWITCH_TIMER_ID: usize = 0x5B04;
+
+/// Last known folder EntryID for change detection.
+/// SAFETY: Only accessed from the COM STA thread.
+static mut LAST_FOLDER_ENTRY_ID: Option<String> = None;
+
 /// Global pointer to the AddinCore instance for timer callbacks.
 /// SAFETY: Only accessed from the COM STA thread.
 static mut GLOBAL_ADDIN_PTR: *mut AddinCore = std::ptr::null_mut();
+
+/// Global pointer to the IRibbonUI interface for ribbon invalidation.
+/// Stored during `Ribbon_OnLoad` callback, used to refresh button visibility
+/// when the user switches folders.
+/// SAFETY: Only accessed from the COM STA thread.
+pub static mut GLOBAL_RIBBON_UI: *mut c_void = std::ptr::null_mut();
 
 /// Timer callback that polls CommandBars.ActionControl for button clicks.
 unsafe extern "system" fn button_poll_timer_proc(
@@ -227,6 +244,66 @@ unsafe extern "system" fn folder_hook_timer_proc(
         .and_then(|mut f| { use std::io::Write; writeln!(f, "folder_hook_timer_proc: COMPLETE") });
 }
 
+/// Timer callback that polls the current folder and invalidates the ribbon
+/// when the user navigates to a different folder. This ensures the Spam/Not Spam
+/// button visibility is updated dynamically (matching the Python version's OnFolderSwitch).
+///
+/// Fires every 500ms — lightweight (one dispatch_get_string per tick).
+unsafe extern "system" fn folder_switch_timer_proc(
+    _hwnd: windows::Win32::Foundation::HWND,
+    _msg: u32,
+    _id_event: usize,
+    _dw_time: u32,
+) {
+    use crate::com_invoke::{dispatch_get, dispatch_get_string};
+
+    let addin = GLOBAL_ADDIN_PTR;
+    if addin.is_null() { return; }
+    let addin = &*addin;
+
+    // Use POLL_APP_PTR (set by toolbar_timer_proc after CoCreateInstance) 
+    // which is more reliable than the stored application pointer.
+    let app_ptr = if !POLL_APP_PTR.is_null() {
+        POLL_APP_PTR
+    } else {
+        match addin.application {
+            Some(p) if !p.is_null() => p,
+            _ => return,
+        }
+    };
+
+    // Get Application.ActiveExplorer.CurrentFolder.EntryID
+    let explorer = match dispatch_get(app_ptr, "ActiveExplorer") {
+        Ok(p) if !p.is_null() => p,
+        _ => return,
+    };
+    let folder = match dispatch_get(explorer, "CurrentFolder") {
+        Ok(p) if !p.is_null() => p,
+        _ => {
+            AddinCore::release_dispatch(explorer);
+            return;
+        }
+    };
+    let entry_id = dispatch_get_string(folder, "EntryID");
+    AddinCore::release_dispatch(folder);
+    AddinCore::release_dispatch(explorer);
+
+    // Compare with last known folder
+    let last = &raw const LAST_FOLDER_ENTRY_ID;
+    let changed = match (&*last, &entry_id) {
+        (None, Some(_)) => true,
+        (Some(old), Some(new)) => old != new,
+        (Some(_), None) => true,
+        (None, None) => false,
+    };
+
+    if changed {
+        LAST_FOLDER_ENTRY_ID = entry_id;
+        // Invalidate ribbon so getVisible callbacks fire again
+        AddinCore::invalidate_ribbon();
+    }
+}
+
 // ─── ext_ConnectMode ─────────────────────────────────────────────────────────
 
 /// Connection mode passed to `OnConnection`.
@@ -388,6 +465,8 @@ pub struct AddinCore {
     mapi_initialized: bool,
     /// Application configuration loaded from INI files.
     config: Option<AppConfig>,
+    /// Layered configuration chain (for save operations and profile resolution).
+    config_chain: Option<ConfigChain>,
     /// Shared Bayesian classifier instance.
     classifier: Option<Arc<Mutex<Classifier>>>,
     /// Shared storage backend for classifier persistence.
@@ -398,6 +477,8 @@ pub struct AddinCore {
     timer_state: Option<TimerFilterState>,
     /// Training engine for batch and incremental learning.
     training_engine: Option<TrainingEngine>,
+    /// Statistics tracking and persistence manager.
+    statistics: Option<StatisticsManager>,
     /// Notification sound manager.
     notification_mgr: Option<NotificationManager>,
     /// Centralized logger.
@@ -410,6 +491,8 @@ pub struct AddinCore {
     folder_hooks: Vec<crate::folder_sink::FolderHook>,
     /// Shared state for folder event sinks.
     folder_hook_state: Option<Arc<Mutex<crate::folder_sink::FolderHookState>>>,
+    /// GTK4 runtime for native GUI dialogs (None if GTK4 DLLs unavailable).
+    gtk_runtime: Option<std::process::Child>,
 }
 
 // SAFETY: AddinCore is only accessed from the COM apartment thread (STA).
@@ -431,17 +514,20 @@ impl AddinCore {
             mapi_session: None,
             mapi_initialized: false,
             config: None,
+            config_chain: None,
             classifier: None,
             storage: None,
             filter_engine: None,
             timer_state: None,
             training_engine: None,
+            statistics: None,
             notification_mgr: None,
             logger: None,
             error_reporter: ErrorReporter::new(),
             initialized: false,
             folder_hooks: Vec::new(),
             folder_hook_state: None,
+            gtk_runtime: None,
         });
         // Increment global DLL lock count for this COM object.
         dll_add_ref();
@@ -600,6 +686,7 @@ impl AddinCore {
             "GetSpamEnabled" => 105,
             "GetNotSpamEnabled" => 106,
             "GetNotSpamVisible" => 107,
+            "GetSpamVisible" => 108,
             _ => {
                 *rg_disp_id = -1; // DISPID_UNKNOWN
                 return DISP_E_UNKNOWNNAME;
@@ -762,6 +849,35 @@ impl AddinCore {
                     }
                     104 => {
                         // Ribbon_OnLoad - store the IRibbonUI reference
+                        // The IRibbonUI is passed as the first argument in DISPPARAMS
+                        if !p_disp_params.is_null() {
+                            #[repr(C)]
+                            struct DISPPARAMS {
+                                rgvarg: *mut c_void,
+                                rgdispid_named: *mut i32,
+                                c_args: u32,
+                                c_named_args: u32,
+                            }
+                            let dp = &*(p_disp_params as *const DISPPARAMS);
+                            if dp.c_args > 0 && !dp.rgvarg.is_null() {
+                                // The VARIANT at offset 0: VT_DISPATCH (9) with the IRibbonUI ptr at offset 8
+                                let var_ptr = dp.rgvarg as *const u8;
+                                let vt = *(var_ptr as *const u16);
+                                if vt == 9 || vt == 13 { // VT_DISPATCH or VT_UNKNOWN
+                                    let ribbon_ptr = *(var_ptr.add(8) as *const *mut c_void);
+                                    if !ribbon_ptr.is_null() {
+                                        // AddRef on the ribbon UI
+                                        let vtbl = *(ribbon_ptr as *const *const usize);
+                                        let addref_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
+                                            std::mem::transmute(*vtbl.add(1));
+                                        addref_fn(ribbon_ptr);
+                                        GLOBAL_RIBBON_UI = ribbon_ptr;
+                                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                            .and_then(|mut f| { use std::io::Write; writeln!(f, "Ribbon_OnLoad: stored IRibbonUI={:?}", ribbon_ptr) });
+                                    }
+                                }
+                            }
+                        }
                         S_OK
                     }
                     105 | 106 => {
@@ -775,12 +891,24 @@ impl AddinCore {
                         S_OK
                     }
                     107 => {
-                        // GetNotSpamVisible - return True
+                        // GetNotSpamVisible: visible when in spam folder or unsure folder
+                        let visible = Self::is_in_spam_or_unsure_folder();
                         if !_p_var_result.is_null() {
                             let result = &mut *(_p_var_result as *mut [u8; 24]);
                             result[0] = 11; result[1] = 0; // VT_BOOL
                             let bool_slot = &mut *(result.as_mut_ptr().add(8) as *mut i16);
-                            *bool_slot = -1; // VARIANT_TRUE
+                            *bool_slot = if visible { -1 } else { 0 };
+                        }
+                        S_OK
+                    }
+                    108 => {
+                        // GetSpamVisible: visible when NOT in spam folder (but ok in unsure)
+                        let in_spam = Self::is_in_spam_folder_only();
+                        if !_p_var_result.is_null() {
+                            let result = &mut *(_p_var_result as *mut [u8; 24]);
+                            result[0] = 11; result[1] = 0; // VT_BOOL
+                            let bool_slot = &mut *(result.as_mut_ptr().add(8) as *mut i16);
+                            *bool_slot = if !in_spam { -1 } else { 0 };
                         }
                         S_OK
                     }
@@ -897,19 +1025,7 @@ impl AddinCore {
                 writeln!(f, "OnConnection: Logger initialized")
             });
 
-        // Load configuration.
-        let config = self.load_config();
-        self.config = Some(config);
-
-        let _ = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&debug_path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "OnConnection: Config loaded")
-            });
-
-        // Initialize MAPI session.
+        // Initialize MAPI session FIRST so we have the profile name for config loading.
         // Requirement 1.8: If MAPI init fails, show error and don't proceed
         // with classifier/filter setup.
         if !self.initialize_mapi() {
@@ -921,6 +1037,10 @@ impl AddinCore {
                     writeln!(f, "OnConnection: MAPI init FAILED (non-fatal)")
                 });
             self.log_info("OnConnection: MAPI initialization failed, skipping classifier and filter setup");
+
+            // Load config with "default" profile since MAPI is unavailable.
+            self.load_config_chain();
+
             self.error_reporter.report_once(
                 HRESULT(E_FAIL.0),
                 "SpamBayes failed to initialize the MAPI session.\n\
@@ -940,6 +1060,17 @@ impl AddinCore {
                 writeln!(f, "OnConnection: MAPI init succeeded")
             });
 
+        // Load configuration using ConfigChain (now that MAPI is available for profile name).
+        self.load_config_chain();
+
+        let _ = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&debug_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "OnConnection: Config loaded via ConfigChain")
+            });
+
         // Requirement 1.7: Set LC_NUMERIC locale to "C" after MAPI init.
         self.set_lc_numeric_c();
         self.log_info("OnConnection: LC_NUMERIC set to \"C\"");
@@ -948,10 +1079,20 @@ impl AddinCore {
         // Requirement 1.6: If DB load fails, report error and init empty database.
         self.load_classifier_database();
 
+        // Initialize statistics manager.
+        let data_dir = Self::get_data_directory();
+        let statistics = StatisticsManager::new(&data_dir, 10);
+        self.statistics = Some(statistics);
+        self.log_info("StatisticsManager initialized");
+
         // Setup the filter engine.
         self.setup_filter_engine();
 
         self.initialized = true;
+
+        // GUI will be launched on-demand via spambayes_manager.exe subprocess
+        // when the user clicks "SpamBayes Manager" button.
+        self.gtk_runtime = None;
 
         let _ = std::fs::OpenOptions::new()
             .append(true)
@@ -975,6 +1116,11 @@ impl AddinCore {
         // Save dirty classifier data.
         self.save_dirty_data();
 
+        // Persist statistics to disk before releasing components.
+        if let Some(stats) = &self.statistics {
+            stats.save();
+        }
+
         // Release filter engine (cancels timer state).
         self.filter_engine = None;
         self.timer_state = None;
@@ -991,6 +1137,9 @@ impl AddinCore {
 
         // Release training engine.
         self.training_engine = None;
+
+        // Release statistics manager.
+        self.statistics = None;
 
         // Release notification manager.
         self.notification_mgr = None;
@@ -1010,6 +1159,11 @@ impl AddinCore {
 
         // Release Application reference.
         self.application = None;
+
+        // Shut down manager process if still running.
+        if let Some(mut child) = self.gtk_runtime.take() {
+            let _ = child.kill();
+        }
 
         self.initialized = false;
         self.log_info("OnDisconnection: Shutdown complete");
@@ -1050,6 +1204,36 @@ impl AddinCore {
             }
         }
 
+        // First-run detection: if no config exists for this profile, show wizard.
+        {
+            let data_dir = Self::get_data_directory();
+            // Use "default" as the profile name — this matches how configs are
+            // actually saved (default.ini). The MAPI profile name from the
+            // status table is unreliable for this purpose.
+            let profile_name = "default".to_string();
+
+            if ConfigWizard::needs_wizard(&data_dir, &profile_name) {
+                self.log_info("OnStartupComplete: First-run detected, launching manager/wizard");
+                // Launch the manager exe which handles first-run wizard automatically.
+                let dll_dir = Self::get_dll_directory();
+                let manager_path = dll_dir.join("spambayes_manager.exe");
+                if manager_path.is_file() {
+                    match std::process::Command::new(&manager_path)
+                        .current_dir(&dll_dir)
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            log::info!("Launched SpamBayes Manager for first-run (PID {})", child.id());
+                            self.gtk_runtime = Some(child);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to launch manager for first-run: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         // Defer toolbar setup via timer. Direct COM calls during
         // OnStartupComplete often fail with RPC_E_CANTCALLOUT_ININPUTSYNCCALL.
         unsafe {
@@ -1068,6 +1252,9 @@ impl AddinCore {
             // The pointer is only accessed from the STA thread.
             GLOBAL_ADDIN_PTR = self as *mut AddinCore;
             SetTimer(HWND::default(), FOLDER_HOOK_TIMER_ID, 2500, Some(folder_hook_timer_proc));
+            // Start folder-switch polling timer for dynamic ribbon button visibility.
+            // Fires every 500ms to detect folder navigation and invalidate the ribbon.
+            SetTimer(HWND::default(), FOLDER_SWITCH_TIMER_ID, 500, Some(folder_switch_timer_proc));
         }
 
         let _ = std::fs::OpenOptions::new()
@@ -1079,6 +1266,11 @@ impl AddinCore {
             });
 
         self.log_info("OnStartupComplete: Startup complete");
+
+        // Invalidate the ribbon now that config is loaded so button visibility
+        // reflects the current folder state correctly.
+        unsafe { Self::invalidate_ribbon(); }
+
         S_OK
     }
 
@@ -1088,8 +1280,25 @@ impl AddinCore {
     fn handle_on_begin_shutdown(&mut self) -> HRESULT {
         self.log_info("OnBeginShutdown: Preparing for shutdown");
 
+        // Kill the folder-switch polling timer.
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+            use windows::Win32::Foundation::HWND;
+            KillTimer(HWND::default(), FOLDER_SWITCH_TIMER_ID).ok();
+            // Release the IRibbonUI reference
+            if !GLOBAL_RIBBON_UI.is_null() {
+                Self::release_dispatch(GLOBAL_RIBBON_UI);
+                GLOBAL_RIBBON_UI = std::ptr::null_mut();
+            }
+        }
+
         // Save any remaining dirty data before Outlook finalizes shutdown.
         self.save_dirty_data();
+
+        // Persist statistics to disk before shutdown completes.
+        if let Some(stats) = &self.statistics {
+            stats.save();
+        }
 
         self.log_info("OnBeginShutdown: Cleanup complete");
         S_OK
@@ -1100,7 +1309,8 @@ impl AddinCore {
     /// Called by Outlook via IRibbonExtensibility::GetCustomUI.
     pub fn get_ribbon_xml() -> String {
         r#"<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui"
-  onLoad="Ribbon_OnLoad">
+  onLoad="Ribbon_OnLoad"
+  loadImage="LoadImage">
   <ribbon>
     <tabs>
       <tab idMso="TabMail">
@@ -1110,16 +1320,23 @@ impl AddinCore {
           <button id="btnSpam"
                   label="Spam"
                   size="normal"
-                  imageMso="RecordsDeleteRecord"
+                  image="delete_as_spam"
                   onAction="OnSpamClick"
-                  getEnabled="GetSpamEnabled" />
+                  getEnabled="GetSpamEnabled"
+                  getVisible="GetSpamVisible" />
           <button id="btnNotSpam"
                   label="Not Spam"
                   size="normal"
-                  imageMso="AcceptInvitation"
+                  image="recover_ham"
                   onAction="OnNotSpamClick"
                   getEnabled="GetNotSpamEnabled"
                   getVisible="GetNotSpamVisible" />
+          <button id="btnShowClues"
+                  label="Show Clues"
+                  size="normal"
+                  imageMso="TraceDependents"
+                  onAction="OnShowCluesClick"
+                  getEnabled="GetShowCluesEnabled" />
           <button id="btnManager"
                   label="Manager"
                   size="normal"
@@ -1132,27 +1349,668 @@ impl AddinCore {
 </customUI>"#.to_string()
     }
 
-    /// Launch the SpamBayes Manager GUI.
+    /// Launch the SpamBayes Manager GUI via GTK4.
+    ///
+    /// Uses the global `GLOBAL_ADDIN_PTR` to access the GTK runtime and config.
+    /// If GTK4 is unavailable, shows a Win32 MessageBox error.
+    ///
+    /// **Validates: Requirements 14.1, 14.2, 14.3**
     pub fn launch_manager() {
-        let exe_path = r"C:\Program Files\SpamBayes\spambayes_manager.exe";
-        let alt_path = r"D:\My Apps\SpamBayes_Rust\Outlook365\target\x86_64-pc-windows-msvc\release\spambayes_manager.exe";
+        unsafe {
+            if GLOBAL_ADDIN_PTR.is_null() {
+                return;
+            }
+            let addin = &mut *GLOBAL_ADDIN_PTR;
 
-        let path = if std::path::Path::new(exe_path).exists() {
-            exe_path
-        } else if std::path::Path::new(alt_path).exists() {
-            alt_path
-        } else {
-            return;
+            // Get config for building ManagerState.
+            let config = match &addin.config {
+                Some(c) => c.clone(),
+                None => {
+                    Self::show_win32_error(
+                        "Configuration not loaded. Cannot open the manager.",
+                    );
+                    return;
+                }
+            };
+
+            let state = ManagerState::from_config(&config);
+            let data_dir = Self::get_data_directory();
+            let profile_name = addin.get_mapi_profile_name()
+                .unwrap_or_else(|| "default".to_string());
+
+            match &mut addin.gtk_runtime {
+                Some(child) => {
+                    // Check if the process is still running
+                    match child.try_wait() {
+                        Ok(Some(_status)) => {
+                            // Process has exited — clear it and launch a new one
+                            addin.gtk_runtime = None;
+                        }
+                        Ok(None) => {
+                            // Still running — don't launch another
+                            log::info!("Manager already running, ignoring duplicate request.");
+                            return;
+                        }
+                        Err(_) => {
+                            // Error checking status — clear and re-launch
+                            addin.gtk_runtime = None;
+                        }
+                    }
+                }
+                None => {}
+            }
+
+            // Launch spambayes_manager.exe alongside the DLL.
+            {
+                let dll_dir = Self::get_dll_directory();
+                let manager_path = dll_dir.join("spambayes_manager.exe");
+
+                if manager_path.is_file() {
+                    match std::process::Command::new(&manager_path)
+                        .current_dir(&dll_dir)
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            log::info!("Launched SpamBayes Manager (PID {})", child.id());
+                            addin.gtk_runtime = Some(child);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to launch manager: {e}");
+                            Self::show_win32_error(&format!(
+                                "Failed to launch SpamBayes Manager:\n{e}\n\n\
+                                 Expected at: {}",
+                                manager_path.display()
+                            ));
+                        }
+                    }
+                } else {
+                    log::error!("Manager EXE not found at: {}", manager_path.display());
+                    Self::show_win32_error(&format!(
+                        "SpamBayes Manager not found.\n\n\
+                         Expected at: {}\n\n\
+                         Please reinstall SpamBayes.",
+                        manager_path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // ─── Show Clues ────────────────────────────────────────────────────
+
+    /// Score the currently selected message and show the Clues dialog.
+    ///
+    /// Gets the selected MailItem from the active Explorer, extracts its
+    /// Subject and Body, tokenizes + scores it with evidence, formats the
+    /// clues as text, and dispatches to the GTK4 CluesDialog.
+    ///
+    /// Falls back to Win32 MessageBox if GTK4 is unavailable.
+    ///
+    /// **Validates: Requirements 14.2, 14.3**
+    pub fn show_clues_for_selected() {
+        unsafe {
+            use crate::com_invoke::{dispatch_get, dispatch_get_string};
+
+            if GLOBAL_ADDIN_PTR.is_null() { return; }
+            let addin = &*GLOBAL_ADDIN_PTR;
+
+            // Get Application pointer.
+            let app_ptr = if !POLL_APP_PTR.is_null() {
+                POLL_APP_PTR
+            } else {
+                match addin.application {
+                    Some(p) if !p.is_null() => p,
+                    _ => return,
+                }
+            };
+
+            // Application.ActiveExplorer
+            let explorer = match dispatch_get(app_ptr, "ActiveExplorer") {
+                Ok(p) if !p.is_null() => p,
+                _ => return,
+            };
+
+            // Explorer.Selection
+            let selection = match dispatch_get(explorer, "Selection") {
+                Ok(p) if !p.is_null() => p,
+                _ => {
+                    Self::release_dispatch(explorer);
+                    return;
+                }
+            };
+
+            // Selection.Item(1) — get the first selected message.
+            // If Selection is empty or Item(1) fails, inform the user.
+            let item = match crate::com_invoke::dispatch_invoke_method(
+                selection, "Item", &[crate::com_invoke::VariantArg::I4(1)]
+            ) {
+                Ok(p) if !p.is_null() => p,
+                _ => {
+                    Self::release_dispatch(selection);
+                    Self::release_dispatch(explorer);
+                    Self::show_win32_error(
+                        "Please select a message to show clues for.",
+                    );
+                    return;
+                }
+            };
+
+            // Get Subject
+            let subject = dispatch_get_string(item, "Subject")
+                .unwrap_or_else(|| "(no subject)".to_string());
+
+            // Get Body text for scoring
+            let body = dispatch_get_string(item, "Body")
+                .unwrap_or_default();
+
+            // Also try to get headers for more accurate scoring
+            let headers = Self::get_message_headers(item);
+
+            Self::release_dispatch(item);
+            Self::release_dispatch(selection);
+            Self::release_dispatch(explorer);
+
+            // Build the RFC-822 like content for tokenization
+            let scoring_content = if let Some(hdrs) = headers {
+                format!("{}\r\n\r\n{}", hdrs, body)
+            } else {
+                // Construct minimal headers + body for tokenization
+                format!("Subject: {}\r\n\r\n{}", subject, body)
+            };
+
+            // Score the message with evidence using the classifier
+            let clues_text = match &addin.classifier {
+                Some(classifier_arc) => {
+                    match classifier_arc.lock() {
+                        Ok(classifier) => {
+                            let tokenizer = spambayes_core::tokenizer::Tokenizer::with_defaults();
+                            let tokens = tokenizer.tokenize(scoring_content.as_bytes());
+                            let result = classifier.spam_prob_with_evidence(tokens.into_iter());
+
+                            // Format the clues text similar to the Python show_clues_dialog
+                            Self::format_clues_text(&subject, result.probability, &result.clues)
+                        }
+                        Err(_) => {
+                            "Error: Could not access the classifier (lock poisoned).".to_string()
+                        }
+                    }
+                }
+                None => {
+                    "Error: Classifier not loaded. Train some messages first.".to_string()
+                }
+            };
+
+            // Show clues in a Win32 MessageBox (clues dialog is in the manager EXE)
+            {
+                let truncated: String = clues_text.chars().take(2000).collect();
+                Self::show_win32_error(
+                    &truncated,
+                );
+            }
+        }
+    }
+
+    /// Get transport message headers from an Outlook MailItem.
+    ///
+    /// Attempts to read the PR_TRANSPORT_MESSAGE_HEADERS property via
+    /// PropertyAccessor. Returns None if unavailable.
+    ///
+    /// Note: The headers are accessed via the PropertyAccessor.GetProperty
+    /// method. If the accessor or property is unavailable, returns None
+    /// gracefully and the caller uses Subject + Body for scoring.
+    unsafe fn get_message_headers(item: *mut c_void) -> Option<String> {
+        use crate::com_invoke::dispatch_get;
+
+        // MailItem.PropertyAccessor
+        let prop_accessor = dispatch_get(item, "PropertyAccessor").ok()?;
+        if prop_accessor.is_null() { return None; }
+
+        // Try to read PR_TRANSPORT_MESSAGE_HEADERS (0x007D001F) as a string
+        // property. We use a raw IDispatch::Invoke with PROPERTYGET on the
+        // "GetProperty" method, extracting the BSTR result manually.
+        let schema = "http://schemas.microsoft.com/mapi/proptag/0x007D001F";
+        let result = Self::invoke_get_property_string(prop_accessor, schema);
+
+        Self::release_dispatch(prop_accessor);
+        result
+    }
+
+    /// Call PropertyAccessor.GetProperty(schema) and extract a string result.
+    ///
+    /// This is a specialized helper because `dispatch_invoke_method` only
+    /// returns VT_DISPATCH results. We need to handle VT_BSTR returns directly.
+    unsafe fn invoke_get_property_string(prop_accessor: *mut c_void, schema: &str) -> Option<String> {
+        use std::ptr;
+
+        // Resolve "GetProperty" DISPID via IDispatch::GetIDsOfNames
+        let method_name = "GetProperty";
+        let wide_name: Vec<u16> = method_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut name_ptr = wide_name.as_ptr() as *mut u16;
+        let mut dispid: i32 = 0;
+
+        let vtbl = *(prop_accessor as *const *const usize);
+        let get_ids_fn: unsafe extern "system" fn(
+            *mut c_void, *const GUID, *mut *mut u16, u32, u32, *mut i32
+        ) -> HRESULT = std::mem::transmute(*vtbl.add(5));
+
+        let hr = get_ids_fn(
+            prop_accessor,
+            &GUID::from_u128(0),
+            &mut name_ptr,
+            1,
+            0,
+            &mut dispid,
+        );
+        if hr.0 != 0 { return None; }
+
+        // Build the BSTR argument for the schema URL
+        extern "system" { fn SysAllocString(psz: *const u16) -> *mut u16; }
+        extern "system" { fn SysFreeString(bstr_string: *mut u16); }
+
+        let wide_schema: Vec<u16> = schema.encode_utf16().chain(std::iter::once(0)).collect();
+        let bstr = SysAllocString(wide_schema.as_ptr());
+        if bstr.is_null() { return None; }
+
+        // Build a VARIANT holding the BSTR
+        #[repr(C)]
+        struct RawVariant { vt: u16, _pad: [u16; 3], data: [u8; 8] }
+        let mut arg_variant = RawVariant { vt: 8, _pad: [0; 3], data: [0; 8] }; // VT_BSTR = 8
+        *(arg_variant.data.as_mut_ptr() as *mut *mut u16) = bstr;
+
+        // DISPPARAMS with one arg
+        #[repr(C)]
+        struct RawDispParams {
+            rgvarg: *mut RawVariant,
+            rgdispid_named: *mut i32,
+            c_args: u32,
+            c_named_args: u32,
+        }
+        let mut params = RawDispParams {
+            rgvarg: &mut arg_variant,
+            rgdispid_named: ptr::null_mut(),
+            c_args: 1,
+            c_named_args: 0,
         };
 
-        let _ = std::process::Command::new(path).spawn();
+        let mut result_variant = RawVariant { vt: 0, _pad: [0; 3], data: [0; 8] };
+
+        // Invoke GetProperty(schema) — slot 6 in IDispatch vtable
+        let invoke_fn: unsafe extern "system" fn(
+            *mut c_void, i32, *const GUID, u32, u16,
+            *mut RawDispParams, *mut RawVariant, *mut c_void, *mut u32
+        ) -> HRESULT = std::mem::transmute(*vtbl.add(6));
+
+        let hr = invoke_fn(
+            prop_accessor,
+            dispid,
+            &GUID::from_u128(0),
+            0,
+            1, // DISPATCH_METHOD
+            &mut params,
+            &mut result_variant,
+            ptr::null_mut(),
+            ptr::null_mut() as *mut u32,
+        );
+
+        SysFreeString(bstr);
+
+        if hr.0 != 0 { return None; }
+
+        // Extract BSTR from result
+        if result_variant.vt == 8 { // VT_BSTR
+            let result_bstr = *(result_variant.data.as_ptr() as *const *const u16);
+            if result_bstr.is_null() { return Some(String::new()); }
+            // Read BSTR length from prefix
+            let len_ptr = (result_bstr as *const u8).sub(4) as *const u32;
+            let byte_len = *len_ptr as usize;
+            let char_len = byte_len / 2;
+            let slice = std::slice::from_raw_parts(result_bstr, char_len);
+            let s = String::from_utf16_lossy(slice);
+            SysFreeString(result_bstr as *mut u16);
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    /// Format clues text for display, matching the Python show_clues_dialog format.
+    ///
+    /// Produces a human-readable summary with overall score and per-token probabilities
+    /// sorted by distance from 0.5 (most discriminative first).
+    fn format_clues_text(
+        subject: &str,
+        probability: f64,
+        clues: &Option<Vec<(String, f64)>>,
+    ) -> String {
+        let mut text = String::with_capacity(4096);
+
+        let score_pct = probability * 100.0;
+        text.push_str(&format!("Spam Score: {:.1}%\n", score_pct));
+        text.push_str(&format!("Subject: {}\n", subject));
+        text.push_str(&format!("{}\n\n", "=".repeat(60)));
+
+        match clues {
+            Some(clue_list) if !clue_list.is_empty() => {
+                text.push_str(&format!("{:<50} {:>10}\n", "Token", "Probability"));
+                text.push_str(&format!("{}\n", "-".repeat(60)));
+
+                // Sort by distance from 0.5 (most discriminative first)
+                let mut sorted_clues = clue_list.clone();
+                sorted_clues.sort_by(|a, b| {
+                    let dist_a = (a.1 - 0.5).abs();
+                    let dist_b = (b.1 - 0.5).abs();
+                    dist_b.partial_cmp(&dist_a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                for (token, prob) in &sorted_clues {
+                    // Truncate long tokens for display
+                    let display_token: String = token.chars().take(48).collect();
+                    text.push_str(&format!("{:<50} {:>10.6}\n", display_token, prob));
+                }
+
+                text.push_str(&format!("\n{} clues total", sorted_clues.len()));
+            }
+            _ => {
+                text.push_str("No significant clues found.\n");
+                text.push_str("The classifier may need more training data.");
+            }
+        }
+
+        text
+    }
+
+    /// Check if the classifier is loaded and has training data.
+    ///
+    /// Used by the ribbon's `GetShowCluesEnabled` callback to enable/disable
+    /// the "Show Clues" button.
+    pub fn is_classifier_loaded() -> bool {
+        unsafe {
+            if GLOBAL_ADDIN_PTR.is_null() { return false; }
+            let addin = &*GLOBAL_ADDIN_PTR;
+            addin.classifier.is_some()
+        }
+    }
+
+    // ─── Ribbon Visibility Helpers ───────────────────────────────────────
+
+    /// Check if the current Explorer folder is the configured spam folder.
+    ///
+    /// Returns `true` if the user is viewing the spam folder (but NOT the unsure folder).
+    /// Used by `GetSpamVisible` — the Spam button should be hidden when in the spam folder.
+    ///
+    /// Logic matches the Python version's `OnFolderSwitch`:
+    /// - Spam folder: hide "Spam", show "Not Spam"
+    /// - Unsure folder: show both
+    /// - Normal folder: show "Spam", hide "Not Spam"
+    pub fn is_in_spam_folder_only() -> bool {
+        unsafe {
+            let addin = GLOBAL_ADDIN_PTR;
+            if addin.is_null() { return false; }
+            let addin = &*addin;
+
+            let config = match &addin.config {
+                Some(c) => c,
+                None => return false,
+            };
+
+            let spam_folder_id = match &config.filter.spam_folder_id {
+                Some(id) => id,
+                None => return false,
+            };
+
+            let current = match Self::get_current_folder_id(addin) {
+                Some(id) => id,
+                None => return false,
+            };
+
+            // Case-insensitive comparison (Outlook may return different case than INI)
+            Self::folder_ids_equal(&current, spam_folder_id)
+        }
+    }
+
+    /// Check if the current Explorer folder is the spam folder OR unsure folder.
+    ///
+    /// Returns `true` if viewing spam or unsure folder.
+    /// Used by `GetNotSpamVisible` — the "Not Spam" button should be visible
+    /// when in spam folder or unsure folder.
+    pub fn is_in_spam_or_unsure_folder() -> bool {
+        unsafe {
+            let addin = GLOBAL_ADDIN_PTR;
+            if addin.is_null() { return false; }
+            let addin = &*addin;
+
+            let config = match &addin.config {
+                Some(c) => c,
+                None => return false,
+            };
+
+            let current = match Self::get_current_folder_id(addin) {
+                Some(id) => id,
+                None => return false,
+            };
+
+            // Check spam folder (case-insensitive)
+            if let Some(spam_id) = &config.filter.spam_folder_id {
+                if Self::folder_ids_equal(&current, spam_id) {
+                    return true;
+                }
+            }
+
+            // Check unsure folder (case-insensitive)
+            if let Some(unsure_id) = &config.filter.unsure_folder_id {
+                if Self::folder_ids_equal(&current, unsure_id) {
+                    return true;
+                }
+            }
+
+            false
+        }
+    }
+
+    /// Compare two FolderIds case-insensitively.
+    ///
+    /// Outlook returns hex entry IDs in varying case, and the INI file may
+    /// store them differently. The Python version uses `CompareEntryIDs` which
+    /// compares binary data; we compare hex strings case-insensitively.
+    fn folder_ids_equal(a: &spambayes_config::FolderId, b: &spambayes_config::FolderId) -> bool {
+        a.store_id.0.eq_ignore_ascii_case(&b.store_id.0)
+            && a.entry_id.0.eq_ignore_ascii_case(&b.entry_id.0)
+    }
+
+    /// Get the FolderId of the currently displayed folder in the active Explorer.
+    ///
+    /// Uses Outlook Object Model:
+    ///   Application.ActiveExplorer.CurrentFolder → get StoreID and EntryID
+    unsafe fn get_current_folder_id(addin: &AddinCore) -> Option<spambayes_config::FolderId> {
+        use crate::com_invoke::{dispatch_get, dispatch_get_string};
+
+        // Prefer POLL_APP_PTR (obtained via CoCreateInstance, more reliable)
+        // Fall back to the stored application pointer from OnConnection
+        let app_ptr = if !POLL_APP_PTR.is_null() {
+            POLL_APP_PTR
+        } else {
+            addin.application?
+        };
+        if app_ptr.is_null() { return None; }
+
+        // Application.ActiveExplorer
+        let explorer = dispatch_get(app_ptr, "ActiveExplorer").ok()?;
+        if explorer.is_null() { return None; }
+
+        // Explorer.CurrentFolder
+        let folder = dispatch_get(explorer, "CurrentFolder").ok()?;
+        if folder.is_null() {
+            Self::release_dispatch(explorer);
+            return None;
+        }
+
+        // Folder.StoreID
+        let store_id_str = dispatch_get_string(folder, "StoreID");
+        // Folder.EntryID
+        let entry_id_str = dispatch_get_string(folder, "EntryID");
+
+        Self::release_dispatch(folder);
+        Self::release_dispatch(explorer);
+
+        match (store_id_str, entry_id_str) {
+            (Some(store), Some(entry)) if !store.is_empty() && !entry.is_empty() => {
+                Some(spambayes_config::FolderId::new(
+                    spambayes_config::StoreId::new(&store),
+                    spambayes_config::EntryId::new(&entry),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Release an IDispatch pointer (call IUnknown::Release).
+    unsafe fn release_dispatch(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            let vtbl = *(ptr as *const *const usize);
+            let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*vtbl.add(2));
+            release_fn(ptr);
+        }
+    }
+
+    /// Invalidate the ribbon UI, causing Outlook to re-query all getVisible/getEnabled callbacks.
+    ///
+    /// Should be called when the folder changes so button visibility updates.
+    pub unsafe fn invalidate_ribbon() {
+        let ribbon = GLOBAL_RIBBON_UI;
+        if ribbon.is_null() { return; }
+
+        // Call IRibbonUI::Invalidate() via IDispatch::Invoke
+        // IRibbonUI exposes Invalidate as a method; we call it via its IDispatch interface.
+        use crate::com_invoke::dispatch_invoke_method;
+        let _ = dispatch_invoke_method(ribbon, "Invalidate", &[]);
     }
 
     // ─── Helper Methods ──────────────────────────────────────────────────
 
-    /// Load application configuration from INI files.
+    /// Load application configuration using the ConfigChain layered approach.
+    ///
+    /// Resolution order:
+    /// 1. Check `BAYESCUSTOMIZE` env var — if set, use `ConfigChain::load_from_env()`
+    /// 2. Otherwise, get profile name from MAPI session (or "default" if unavailable)
+    /// 3. Call `ConfigChain::load(profile_name)` for layered INI loading
+    ///
+    /// Stores results in both `self.config_chain` and `self.config` for
+    /// backward compatibility with existing code that reads `self.config`.
+    ///
+    /// **Validates: Requirements 1.1, 1.6, 3.1, 3.2, 4.4**
+    fn load_config_chain(&mut self) {
+        // Check BAYESCUSTOMIZE environment variable first.
+        if let Ok(env_value) = std::env::var("BAYESCUSTOMIZE") {
+            if !env_value.is_empty() {
+                self.log_info(&format!(
+                    "BAYESCUSTOMIZE env var set: \"{}\", using env-based config loading",
+                    env_value
+                ));
+                match ConfigChain::load_from_env(&env_value) {
+                    Ok(chain) => {
+                        self.log_info("Config loaded via BAYESCUSTOMIZE");
+                        self.config = Some(chain.config().clone());
+                        self.config_chain = Some(chain);
+                        return;
+                    }
+                    Err(e) => {
+                        self.log_error(&format!(
+                            "Failed to load config from BAYESCUSTOMIZE: {e}, falling back to defaults"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Determine profile name from MAPI session (if available).
+        let profile_name = self.get_mapi_profile_name().unwrap_or_else(|| {
+            self.log_info("MAPI profile name not available, using \"default\"");
+            "default".to_string()
+        });
+
+        self.log_info(&format!("Loading config chain for profile: \"{}\"", profile_name));
+
+        // Load via ConfigChain (layered: defaults → default.ini → profile.ini).
+        match ConfigChain::load(&profile_name) {
+            Ok(chain) => {
+                self.log_info(&format!(
+                    "Config chain loaded for profile \"{}\" (data_dir: {})",
+                    chain.profile_name(),
+                    chain.data_directory().display()
+                ));
+                let mut config = chain.config().clone();
+
+                // If the chain didn't find folder IDs, try migrating from the
+                // Python Outlook.ini which stores them in a different location.
+                if config.filter.spam_folder_id.is_none() {
+                    self.log_info("No spam_folder_id in chain config, trying Python migration...");
+                    if let Some(migrated) = spambayes_config::try_migrate(
+                        chain.data_directory(),
+                        &profile_name,
+                    ) {
+                        self.log_info("Python config migrated successfully");
+                        // Merge the folder IDs from the migrated config
+                        if config.filter.spam_folder_id.is_none() {
+                            config.filter.spam_folder_id = migrated.filter.spam_folder_id;
+                        }
+                        if config.filter.unsure_folder_id.is_none() {
+                            config.filter.unsure_folder_id = migrated.filter.unsure_folder_id;
+                        }
+                        if config.filter.watch_folder_ids.is_empty() {
+                            config.filter.watch_folder_ids = migrated.filter.watch_folder_ids;
+                        }
+                        if config.training.ham_folder_ids.is_empty() {
+                            config.training.ham_folder_ids = migrated.training.ham_folder_ids;
+                        }
+                        if config.training.spam_folder_ids.is_empty() {
+                            config.training.spam_folder_ids = migrated.training.spam_folder_ids;
+                        }
+                    } else {
+                        self.log_info("No Python config found for migration");
+                    }
+                }
+
+                self.config = Some(config);
+                self.config_chain = Some(chain);
+            }
+            Err(e) => {
+                self.log_error(&format!(
+                    "Failed to load config chain for profile \"{}\": {e}, using defaults",
+                    profile_name
+                ));
+                self.config = Some(AppConfig::default());
+            }
+        }
+    }
+
+    /// Get the profile name from the MAPI session, if available.
+    ///
+    /// Returns `None` if the MAPI session hasn't been initialized or
+    /// the profile name couldn't be retrieved.
+    fn get_mapi_profile_name(&self) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(session) = &self.mapi_session {
+                match session.get_profile_name() {
+                    Ok(name) => {
+                        self.log_info(&format!("MAPI profile name: \"{}\"", name));
+                        return Some(name);
+                    }
+                    Err(e) => {
+                        self.log_error(&format!("Failed to get MAPI profile name: {e}"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Load application configuration from INI files (legacy method).
     ///
     /// Falls back to defaults if the config file cannot be loaded.
+    /// Retained for potential use as a fallback in non-standard scenarios.
+    #[allow(dead_code)]
     fn load_config(&self) -> AppConfig {
         // Determine data directory (use %LOCALAPPDATA%\SpamBayes or fallback).
         let data_dir = Self::get_data_directory();
@@ -1431,6 +2289,7 @@ impl AddinCore {
             Arc::clone(&classifier),
             Arc::clone(&storage),
             Arc::clone(&message_db),
+            self.statistics.clone(),
         );
         self.filter_engine = Some(filter);
 
@@ -1449,6 +2308,7 @@ impl AddinCore {
                 Arc::clone(&storage),
                 Arc::clone(&message_db),
                 Arc::clone(logger),
+                self.statistics.clone(),
             );
             self.training_engine = Some(training_engine);
         }
@@ -1514,6 +2374,7 @@ impl AddinCore {
             classifier,
             storage,
             message_db,
+            None,
         );
         let filter_engine = Arc::new(Mutex::new(hook_filter));
 
@@ -1632,6 +2493,40 @@ impl AddinCore {
     fn log_info(&self, message: &str) {
         if let Some(logger) = &self.logger {
             logger.info("addin_core", message);
+        }
+    }
+
+    /// Get the directory containing this DLL.
+    ///
+    /// Used to locate `spambayes_manager.exe` which is installed alongside the DLL.
+    fn get_dll_directory() -> PathBuf {
+        use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+        let hmodule = crate::get_dll_module();
+        let mut buf = vec![0u16; 1024];
+        let len = unsafe { GetModuleFileNameW(hmodule, &mut buf) } as usize;
+        if len > 0 && len < buf.len() {
+            let path = String::from_utf16_lossy(&buf[..len]);
+            if let Some(parent) = PathBuf::from(path).parent() {
+                return parent.to_path_buf();
+            }
+        }
+        // Fallback: assume installed in Program Files
+        PathBuf::from(r"C:\Program Files\SpamBayes\x64")
+    }
+
+    /// Show a Win32 MessageBox error (no GTK4 dependency).
+    fn show_win32_error(message: &str) {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let title: Vec<u16> = "SpamBayes\0".encode_utf16().collect();
+        let msg: Vec<u16> = format!("{message}\0").encode_utf16().collect();
+        unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(msg.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
         }
     }
 

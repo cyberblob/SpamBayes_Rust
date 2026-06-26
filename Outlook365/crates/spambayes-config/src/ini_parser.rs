@@ -21,6 +21,47 @@ pub type SectionData = IndexMap<String, String>;
 /// Ordered map of section names to their key-value pairs.
 pub type IniData = IndexMap<String, SectionData>;
 
+/// Merge another INI data set into the base.
+///
+/// Values from `other` override values in `base` for matching section+key
+/// (case-insensitive). Sections and keys in `base` that don't appear in
+/// `other` are preserved unchanged.
+pub fn merge_ini_data(base: &mut IniData, other: &IniData) {
+    for (other_section_name, other_section_data) in other {
+        // Find existing section in base using case-insensitive match
+        let existing_section_key = base
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(other_section_name))
+            .cloned();
+
+        let section = if let Some(key) = existing_section_key {
+            // Section exists in base — get a mutable reference to it
+            base.get_mut(&key).expect("key was found via keys()")
+        } else {
+            // New section — insert it into base with the name from `other`
+            base.entry(other_section_name.clone()).or_default()
+        };
+
+        // Merge keys from other's section into the base section
+        for (other_key, other_value) in other_section_data {
+            // Find existing key in section using case-insensitive match
+            let existing_key = section
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(other_key))
+                .cloned();
+
+            if let Some(key) = existing_key {
+                // Key exists — overwrite with value from `other`
+                *section.get_mut(&key).expect("key was found via keys()") =
+                    other_value.clone();
+            } else {
+                // New key — insert it
+                section.insert(other_key.clone(), other_value.clone());
+            }
+        }
+    }
+}
+
 /// INI file reader/writer compatible with Python `ConfigParser` output.
 pub struct IniFile;
 
@@ -503,5 +544,89 @@ unsure_threshold = 15.0
         assert_eq!(data["Section"]["key2"], "value2");
         assert_eq!(data["Section"]["key3"], "value3");
         assert_eq!(data["Section"]["key4"], "value4");
+    }
+
+    #[test]
+    fn test_merge_overrides_existing_keys() {
+        let mut base = IniData::new();
+        let mut section = SectionData::new();
+        section.insert("verbose".to_string(), "True".to_string());
+        base.insert("General".to_string(), section);
+
+        let mut other = IniData::new();
+        let mut other_section = SectionData::new();
+        other_section.insert("verbose".to_string(), "False".to_string());
+        other.insert("General".to_string(), other_section);
+
+        merge_ini_data(&mut base, &other);
+
+        assert_eq!(base["General"]["verbose"], "False");
+    }
+
+    #[test]
+    fn test_merge_preserves_non_overlapping_keys() {
+        let mut base = IniData::new();
+        let mut section = SectionData::new();
+        section.insert("key_a".to_string(), "value_a".to_string());
+        section.insert("key_b".to_string(), "value_b".to_string());
+        base.insert("General".to_string(), section);
+
+        let mut other = IniData::new();
+        let mut other_section = SectionData::new();
+        other_section.insert("key_c".to_string(), "value_c".to_string());
+        other.insert("General".to_string(), other_section);
+
+        merge_ini_data(&mut base, &other);
+
+        assert_eq!(base["General"]["key_a"], "value_a");
+        assert_eq!(base["General"]["key_b"], "value_b");
+        assert_eq!(base["General"]["key_c"], "value_c");
+    }
+
+    #[test]
+    fn test_merge_adds_new_sections() {
+        let mut base = IniData::new();
+        let mut section = SectionData::new();
+        section.insert("key".to_string(), "value".to_string());
+        base.insert("Existing".to_string(), section);
+
+        let mut other = IniData::new();
+        let mut other_section = SectionData::new();
+        other_section.insert("new_key".to_string(), "new_value".to_string());
+        other.insert("NewSection".to_string(), other_section);
+
+        merge_ini_data(&mut base, &other);
+
+        assert_eq!(base.len(), 2);
+        assert_eq!(base["Existing"]["key"], "value");
+        assert_eq!(base["NewSection"]["new_key"], "new_value");
+    }
+
+    #[test]
+    fn test_merge_case_insensitive_matching() {
+        let mut base = IniData::new();
+        let mut section = SectionData::new();
+        section.insert("verbose".to_string(), "True".to_string());
+        section.insert("log_file".to_string(), "spam.log".to_string());
+        base.insert("General".to_string(), section);
+
+        // Use different case for both section and key
+        let mut other = IniData::new();
+        let mut other_section = SectionData::new();
+        other_section.insert("Verbose".to_string(), "False".to_string());
+        other.insert("general".to_string(), other_section);
+
+        merge_ini_data(&mut base, &other);
+
+        // The value should be overridden
+        assert_eq!(base["General"]["verbose"], "False");
+        // The original key name is preserved (not replaced with "Verbose")
+        assert!(base["General"].contains_key("verbose"));
+        assert!(!base["General"].contains_key("Verbose"));
+        // Non-overlapping key preserved
+        assert_eq!(base["General"]["log_file"], "spam.log");
+        // Original section name preserved (not replaced with "general")
+        assert!(base.contains_key("General"));
+        assert!(!base.contains_key("general"));
     }
 }

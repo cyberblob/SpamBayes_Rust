@@ -464,11 +464,17 @@ impl MapiSession {
         let flags = MAPI_NO_MAIL | MAPI_EXTENDED | MAPI_USE_DEFAULT;
         let mut session_ptr: *mut c_void = ptr::null_mut();
 
+        // Pass empty strings for profile name and password (not null pointers).
+        // The Python MAPI bindings pass "" which translates to a pointer to a
+        // null terminator. Some MAPI providers behave differently with null vs
+        // empty string — matching the Python behavior ensures compatibility.
+        let empty_str: [u8; 1] = [0];
+
         let hr = unsafe {
             MAPILogonEx(
                 0,                       // no parent window
-                ptr::null(),             // no profile name (use default)
-                ptr::null(),             // no password
+                empty_str.as_ptr(),      // empty profile name (use default)
+                empty_str.as_ptr(),      // empty password
                 flags,
                 &raw mut session_ptr,
             )
@@ -665,10 +671,12 @@ impl MapiSession {
             let vtbl = &*(*session_obj).vtbl;
 
             // Get the message stores table
+            // Flags: 0 (no flags) — MAPI_DEFERRED_ERRORS is not valid for
+            // GetMsgStoresTable, only 0 or MAPI_UNICODE are accepted.
             let mut table_ptr: *mut c_void = ptr::null_mut();
             let hr = (vtbl.get_msg_stores_table)(
                 self.session,
-                MAPI_DEFERRED_ERRORS,
+                0,
                 &raw mut table_ptr,
             );
             if hr != S_OK || table_ptr.is_null() {

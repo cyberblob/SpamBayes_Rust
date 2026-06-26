@@ -47,19 +47,24 @@
 //! assert_eq!(folder.store_id, StoreId::new("0123ABCD"));
 //! ```
 
+pub mod config_chain;
 pub mod errors;
 pub mod folder_id;
 pub mod ini_parser;
 pub mod migration;
 pub mod options;
+pub mod profile;
 
 // Re-export primary types for convenience.
 pub use errors::ConfigError;
 pub use folder_id::{EntryId, FolderId, StoreId};
 pub use folder_id::{format_folder_id_list, parse_folder_id_list};
-pub use ini_parser::{IniData, IniFile, SectionData};
+pub use ini_parser::{IniData, IniFile, SectionData, merge_ini_data};
 pub use options::{
-    AppConfig, ExperimentalConfig, FilterAction, FilterConfig, FilterNowConfig, GeneralConfig,
-    MessageReadState, NotificationConfig, TrainingConfig,
+    AppConfig, CalendarConfig, CalendarSpamAction, ExperimentalConfig, FilterAction, FilterConfig,
+    FilterNowConfig, GeneralConfig, MessageReadState, NotificationConfig, TrainingConfig,
 };
 pub use migration::{detect_python_config, migrate_python_config, rust_config_exists, try_migrate};
+pub use profile::sanitize_profile_name;
+pub use profile::resolve_data_directory;
+pub use config_chain::ConfigChain;
