@@ -537,7 +537,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
 ///
 /// Uses the MAPI property PR_MIME_CONTENT (schema:
 /// "http://schemas.microsoft.com/mapi/proptag/0x10090102").
-unsafe fn get_mime_content(mail_item: *mut c_void) -> Option<Vec<u8>> {
+pub unsafe fn get_mime_content(mail_item: *mut c_void) -> Option<Vec<u8>> {
     // Get PropertyAccessor
     let prop_accessor = dispatch_get(mail_item, "PropertyAccessor").ok()?;
     if prop_accessor.is_null() {
@@ -711,7 +711,7 @@ unsafe fn save_score_to_item(
 /// Move a MailItem to a destination folder identified by FolderId.
 ///
 /// Resolves the folder via Namespace.GetFolderFromID and calls MailItem.Move.
-unsafe fn move_item_to_folder(
+pub unsafe fn move_item_to_folder(
     mail_item: *mut c_void,
     dest: &FolderId,
     debug_path: &str,

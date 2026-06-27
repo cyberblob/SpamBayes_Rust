@@ -221,7 +221,8 @@ impl ProgressDialog {
         if let Some(source_id) = self.inner.pulse_source.borrow_mut().take() {
             source_id.remove();
         }
-        self.inner.window.close();
+        // Use destroy() to bypass the close-request handler which inhibits close
+        self.inner.window.destroy();
     }
 
     /// Check if enough time has passed since the last visual update.

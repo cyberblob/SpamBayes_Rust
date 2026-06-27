@@ -528,12 +528,56 @@ impl AdvancedTab {
     }
 
     /// Open the log file with the system's default application.
+    ///
+    /// Shows an informational dialog if the log file does not yet exist.
     fn open_log_file(path: &Path) {
+        if !path.exists() {
+            let dialog = Window::new();
+            dialog.set_title(Some("Log File"));
+            dialog.set_default_size(400, 150);
+            dialog.set_modal(true);
+
+            let vbox = GtkBox::new(Orientation::Vertical, 12);
+            vbox.set_margin_top(20);
+            vbox.set_margin_bottom(20);
+            vbox.set_margin_start(20);
+            vbox.set_margin_end(20);
+
+            let msg = format!(
+                "Log file not found.\n\nExpected location:\n{}\n\n\
+                 The log file is created when SpamBayes performs operations \
+                 with verbosity > 0.",
+                path.display()
+            );
+            let label = Label::new(Some(&msg));
+            label.set_wrap(true);
+            label.set_halign(Align::Start);
+            vbox.append(&label);
+
+            let ok_btn = Button::with_label("OK");
+            ok_btn.set_halign(Align::End);
+            let dialog_clone = dialog.clone();
+            ok_btn.connect_clicked(move |_| {
+                dialog_clone.close();
+            });
+            vbox.append(&ok_btn);
+
+            dialog.set_child(Some(&vbox));
+            dialog.present();
+            return;
+        }
+
         let path_str = path.to_string_lossy().to_string();
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", "start", "", &path_str])
+            // Use the full path to notepad — .log files often have no default
+            // handler on Windows, causing `start` to silently fail.
+            let notepad = format!(
+                "{}\\notepad.exe",
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
+            );
+            let _ = std::process::Command::new(&notepad)
+                .arg(&path_str)
                 .spawn();
         }
         #[cfg(not(target_os = "windows"))]

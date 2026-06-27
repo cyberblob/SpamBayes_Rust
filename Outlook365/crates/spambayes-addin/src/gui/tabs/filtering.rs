@@ -150,9 +150,10 @@ impl FilteringTab {
         let watched_row = GtkBox::new(Orientation::Horizontal, 8);
         watched_row.set_valign(Align::Center);
 
-        let watched_folders_label = Label::new(Some(&Self::format_watched_folders(state)));
+        let watched_folders_label = Label::new(Some(&Self::format_watched_folders(state, folder_provider.as_ref())));
         watched_folders_label.set_halign(Align::Start);
         watched_folders_label.set_hexpand(true);
+        watched_folders_label.set_wrap(true);
 
         let watched_folders_browse_btn = Button::with_label("Browse...");
 
@@ -225,8 +226,10 @@ impl FilteringTab {
         let spam_folder_entry = Entry::new();
         spam_folder_entry.set_hexpand(true);
         spam_folder_entry.set_placeholder_text(Some("Select a folder..."));
-        if state.spam_folder_id.is_some() {
-            spam_folder_entry.set_text("(configured)");
+        if let Some(ref fid) = state.spam_folder_id {
+            let names = FolderBrowserDialog::resolve_folder_names(folder_provider.as_ref(), &[fid.clone()]);
+            let name = names.into_iter().next().unwrap_or_else(|| "(configured)".to_string());
+            spam_folder_entry.set_text(&name);
         }
 
         let spam_folder_browse_btn = Button::with_label("Browse...");
@@ -321,8 +324,10 @@ impl FilteringTab {
         let unsure_folder_entry = Entry::new();
         unsure_folder_entry.set_hexpand(true);
         unsure_folder_entry.set_placeholder_text(Some("Select a folder..."));
-        if state.unsure_folder_id.is_some() {
-            unsure_folder_entry.set_text("(configured)");
+        if let Some(ref fid) = state.unsure_folder_id {
+            let names = FolderBrowserDialog::resolve_folder_names(folder_provider.as_ref(), &[fid.clone()]);
+            let name = names.into_iter().next().unwrap_or_else(|| "(configured)".to_string());
+            unsure_folder_entry.set_text(&name);
         }
 
         let unsure_folder_browse_btn = Button::with_label("Browse...");
@@ -487,17 +492,15 @@ impl FilteringTab {
                     let new_ids: Vec<FolderId> = selections.iter()
                         .map(|(id, _name)| id.clone())
                         .collect();
-                    let count = new_ids.len();
+                    let names: Vec<&str> = selections.iter()
+                        .map(|(_id, name)| name.as_str())
+                        .collect();
                     *ids.borrow_mut() = new_ids;
-                    // Update the label display
-                    if count == 0 {
+                    // Update the label with folder names separated by "; "
+                    if names.is_empty() {
                         label.set_text("(no folders selected)");
                     } else {
-                        label.set_text(&format!(
-                            "{} folder{} selected",
-                            count,
-                            if count == 1 { "" } else { "s" }
-                        ));
+                        label.set_text(&names.join("; "));
                     }
                 }
                 // On Cancel: do nothing (keep existing selection)
@@ -835,15 +838,31 @@ impl FilteringTab {
     // ─── Private helpers ─────────────────────────────────────────────────
 
     /// Format watched folder display text from state.
-    fn format_watched_folders(state: &ManagerState) -> String {
+    /// Shows folder names separated by "; " or "(no folders selected)" if empty.
+    fn format_watched_folders(state: &ManagerState, provider: &dyn FolderProvider) -> String {
         if state.watch_folder_ids.is_empty() {
+            log::info!("format_watched_folders: no folder IDs configured");
             "(no folders selected)".to_string()
         } else {
-            format!(
-                "{} folder{} selected",
-                state.watch_folder_ids.len(),
-                if state.watch_folder_ids.len() == 1 { "" } else { "s" }
-            )
+            log::info!("format_watched_folders: resolving {} folder ID(s)", state.watch_folder_ids.len());
+            let names = FolderBrowserDialog::resolve_folder_names(provider, &state.watch_folder_ids);
+            let result = names.join("; ");
+            log::info!("format_watched_folders: resolved to '{}'", result);
+            result
         }
+    }
+
+    /// Resolve watched folder IDs to display names using the folder provider
+    /// and update the label. Call after construction when the provider is ready.
+    pub fn resolve_folder_names(&self, provider: &dyn FolderProvider) {
+        let ids = self.watched_folder_ids.borrow();
+        if ids.is_empty() {
+            self.watched_folders_label.set_text("(no folders selected)");
+            return;
+        }
+
+        let names = FolderBrowserDialog::resolve_folder_names(provider, &ids);
+        let display = names.join("; ");
+        self.watched_folders_label.set_text(&display);
     }
 }

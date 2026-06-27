@@ -44,6 +44,10 @@ Source: "..\target\x86_64-pc-windows-msvc\release\spambayes_addin.dll"; \
 Source: "..\target\x86_64-pc-windows-msvc\release\spambayes_manager.exe"; \
     DestDir: "{app}"; DestName: "spambayes_manager.exe"; \
     Flags: ignoreversion
+; 64-bit Clues Viewer
+Source: "..\target\x86_64-pc-windows-msvc\release\spambayes_clues.exe"; \
+    DestDir: "{app}"; DestName: "spambayes_clues.exe"; \
+    Flags: ignoreversion
 ; GTK4 bundle (flat — DLLs next to the add-in DLL for load-time linking)
 Source: "..\gtk4-bundle\x64\*.dll"; \
     DestDir: "{app}"; \

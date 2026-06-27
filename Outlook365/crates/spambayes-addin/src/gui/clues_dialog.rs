@@ -174,4 +174,16 @@ impl CluesDialog {
     pub fn present(&self) {
         self.inner.window.present();
     }
+
+    /// Connect a callback that fires when the dialog window is closed.
+    pub fn connect_close(&self, callback: impl FnOnce() + 'static) {
+        use std::cell::Cell;
+        let cb = Rc::new(Cell::new(Some(callback)));
+        self.inner.window.connect_close_request(move |_| {
+            if let Some(f) = cb.take() {
+                f();
+            }
+            glib::Propagation::Proceed
+        });
+    }
 }

@@ -17,6 +17,7 @@ use crate::profile::{sanitize_profile_name, resolve_data_directory};
 /// 1. Built-in defaults (hardcoded in `AppConfig::default()`)
 /// 2. `default_bayes_customize.ini` (if exists in data directory)
 /// 3. `<profile>_bayes_customize.ini` (if exists in data directory)
+/// 4. `<profile>.ini` (if exists — written by `AppConfig::save` / wizard)
 ///
 /// # Backward Compatibility
 ///
@@ -27,6 +28,10 @@ use crate::profile::{sanitize_profile_name, resolve_data_directory};
 /// in the chain, and since missing files are silently skipped, the absence
 /// of a `default_bayes_customize.ini` is perfectly normal. Users do not
 /// need to take any action — their existing config is picked up automatically.
+///
+/// The `<profile>.ini` file (layer 4) is produced by `AppConfig::save()` and
+/// the configuration wizard. It takes highest priority so that wizard-saved
+/// settings (like `filter.enabled = true`) are always respected.
 pub struct ConfigChain {
     /// The resolved data directory for this profile.
     data_directory: PathBuf,
@@ -43,6 +48,7 @@ impl ConfigChain {
     /// 1. Built-in defaults (`AppConfig::default()`)
     /// 2. `default_bayes_customize.ini` (if exists in data directory)
     /// 3. `<profile>_bayes_customize.ini` (if exists in data directory)
+    /// 4. `<profile>.ini` (if exists — written by `AppConfig::save` / wizard)
     ///
     /// Missing files are silently skipped (not an error).
     /// Parse errors produce a warning on stderr and the file is skipped.
@@ -89,6 +95,25 @@ impl ConfigChain {
             }
             Err(e) => {
                 eprintln!("Warning: error reading {}: {e}, skipping file", profile_path.display());
+            }
+        }
+
+        // Layer 3: <sanitized_profile>.ini (written by AppConfig::save and the wizard)
+        let simple_profile_path = data_dir.join(format!("{sanitized}.ini"));
+        match IniFile::read(&simple_profile_path) {
+            Ok(data) => merge_ini_data(&mut merged, &data),
+            Err(ConfigError::FileNotFound(_)) => { /* normal — silently skip */ }
+            Err(ConfigError::ParseError { path, line, message }) => {
+                eprintln!(
+                    "Warning: parse error in {} at line {}: {}, skipping file",
+                    path.display(), line, message
+                );
+            }
+            Err(ConfigError::IoError { path, source }) => {
+                eprintln!("Warning: I/O error reading {}: {}, skipping file", path.display(), source);
+            }
+            Err(e) => {
+                eprintln!("Warning: error reading {}: {e}, skipping file", simple_profile_path.display());
             }
         }
 

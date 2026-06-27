@@ -13,6 +13,11 @@ path = "src/bin/spambayes_manager.rs"
 required-features = ["gui"]
 
 [[bin]]
+name = "spambayes_clues"
+path = "src/bin/spambayes_clues.rs"
+required-features = ["gui"]
+
+[[bin]]
 name = "mapi_test"
 path = "src/bin/mapi_test.rs"
 

@@ -17,6 +17,7 @@ use gtk4::{
 
 use spambayes_config::AppConfig;
 
+use crate::gui::folder_browser::{FolderBrowserDialog, FolderProvider};
 use crate::gui::wizard_window::WizardWindow;
 use crate::manager_dlg::{ManagerState, ManagerStats};
 
@@ -138,10 +139,11 @@ impl GeneralTab {
     /// * `state` – Current manager state (filter enabled, folder IDs, etc.)
     /// * `stats` – Classifier statistics (ham/spam trained counts)
     /// * `config` – Application configuration (used for launching the wizard)
+    /// * `folder_provider` – Provider for resolving folder IDs to display names
     ///
     /// **Validates: Requirements 1.2–1.8**
     #[must_use]
-    pub fn new(state: &ManagerState, stats: &ManagerStats, config: &AppConfig) -> Self {
+    pub fn new(state: &ManagerState, stats: &ManagerStats, config: &AppConfig, folder_provider: &dyn FolderProvider) -> Self {
         // ─── Main vertical layout ────────────────────────────────────────
         let content_box = GtkBox::new(Orientation::Vertical, 12);
         content_box.set_margin_top(16);
@@ -230,16 +232,16 @@ impl GeneralTab {
         filter_box.append(&status_row);
 
         // Folder name labels
-        let watched_folder_label = Label::new(Some(&Self::format_watched_folders(state)));
+        let watched_folder_label = Label::new(Some(&Self::format_watched_folders(state, folder_provider)));
         watched_folder_label.set_halign(Align::Start);
         watched_folder_label.set_wrap(true);
         filter_box.append(&watched_folder_label);
 
-        let spam_folder_label = Label::new(Some(&Self::format_spam_folder(state)));
+        let spam_folder_label = Label::new(Some(&Self::format_spam_folder(state, folder_provider)));
         spam_folder_label.set_halign(Align::Start);
         filter_box.append(&spam_folder_label);
 
-        let unsure_folder_label = Label::new(Some(&Self::format_unsure_folder(state)));
+        let unsure_folder_label = Label::new(Some(&Self::format_unsure_folder(state, folder_provider)));
         unsure_folder_label.set_halign(Align::Start);
         filter_box.append(&unsure_folder_label);
 
@@ -452,31 +454,34 @@ impl GeneralTab {
     }
 
     /// Format watched folder display text from state.
-    fn format_watched_folders(state: &ManagerState) -> String {
+    /// Shows "Watching 'account/folder'; 'account/folder2'." with resolved names.
+    fn format_watched_folders(state: &ManagerState, provider: &dyn FolderProvider) -> String {
         if state.watch_folder_ids.is_empty() {
             "Watching: (not configured)".to_string()
         } else {
-            format!(
-                "Watching {} folder{}.",
-                state.watch_folder_ids.len(),
-                if state.watch_folder_ids.len() == 1 { "" } else { "s" }
-            )
+            let names = FolderBrowserDialog::resolve_folder_names(provider, &state.watch_folder_ids);
+            let display = names.join("; ");
+            format!("Watching '{}'.", display)
         }
     }
 
     /// Format spam folder display text from state.
-    fn format_spam_folder(state: &ManagerState) -> String {
-        if state.spam_folder_id.is_some() {
-            "Spam managed in configured folder.".to_string()
+    fn format_spam_folder(state: &ManagerState, provider: &dyn FolderProvider) -> String {
+        if let Some(ref folder_id) = state.spam_folder_id {
+            let names = FolderBrowserDialog::resolve_folder_names(provider, &[folder_id.clone()]);
+            let name = names.into_iter().next().unwrap_or_else(|| "(configured)".to_string());
+            format!("Spam managed in '{}'.", name)
         } else {
             "Spam folder: (not configured)".to_string()
         }
     }
 
     /// Format unsure folder display text from state.
-    fn format_unsure_folder(state: &ManagerState) -> String {
-        if state.unsure_folder_id.is_some() {
-            "Unsure managed in configured folder.".to_string()
+    fn format_unsure_folder(state: &ManagerState, provider: &dyn FolderProvider) -> String {
+        if let Some(ref folder_id) = state.unsure_folder_id {
+            let names = FolderBrowserDialog::resolve_folder_names(provider, &[folder_id.clone()]);
+            let name = names.into_iter().next().unwrap_or_else(|| "(configured)".to_string());
+            format!("Unsure managed in '{}'.", name)
         } else {
             "Unsure folder: (not configured)".to_string()
         }

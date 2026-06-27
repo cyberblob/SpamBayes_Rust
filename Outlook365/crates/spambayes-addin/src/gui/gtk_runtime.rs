@@ -34,6 +34,11 @@ pub enum GuiCommand {
         /// Pre-loaded folder tree (loaded on COM thread, passed to GTK thread).
         /// If None, the folder browser will show an empty tree.
         folder_tree: Option<Vec<FolderNode>>,
+        /// Optional training executor for the Training tab's "Start Training" button.
+        /// If None, the button will show an error when clicked.
+        training_executor: Option<Arc<dyn super::tabs::training::TrainingExecutor>>,
+        /// Optional stats (ham/spam trained counts). If None, defaults to zeros.
+        stats: Option<crate::manager_dlg::ManagerStats>,
     },
     /// Show the Configuration Wizard.
     ShowWizard {
@@ -59,6 +64,8 @@ pub enum GuiCommand {
     ShowClues {
         subject: String,
         clues_text: String,
+        /// Optional callback invoked when the dialog is closed.
+        on_close: Option<Box<dyn FnOnce() + Send>>,
     },
     /// Shut down the GTK4 runtime.
     Shutdown,
@@ -186,14 +193,14 @@ impl GtkRuntime {
                         config,
                         on_close,
                         folder_tree,
+                        training_executor,
+                        stats,
                     } => {
                         // Mark the manager as open.
                         is_open.store(true, Ordering::SeqCst);
 
                         // Create and present the manager window.
-                        // Stats are not yet passed via the command; use defaults
-                        // until a later task wires the full statistics pipeline.
-                        let stats = crate::manager_dlg::ManagerStats::new();
+                        let stats = stats.unwrap_or_else(crate::manager_dlg::ManagerStats::new);
                         let folder_provider: std::rc::Rc<dyn FolderProvider> = match folder_tree {
                             Some(tree) => std::rc::Rc::new(
                                 super::mapi_folder_provider::MapiFolderProvider::from_tree(tree),
@@ -201,6 +208,11 @@ impl GtkRuntime {
                             None => std::rc::Rc::new(NullFolderProvider),
                         };
                         let manager = ManagerWindow::new(&state, &stats, &config, folder_provider);
+
+                        // Wire up the training executor if provided.
+                        if let Some(executor) = training_executor {
+                            manager.set_training_executor(executor);
+                        }
 
                         // Wire the on_close callback so that when the window
                         // closes, we clear the is_open flag and notify the COM thread.
@@ -246,11 +258,24 @@ impl GtkRuntime {
                     GuiCommand::ShowClues {
                         subject,
                         clues_text,
+                        on_close,
                     } => {
                         // Show the Clues dialog (Requirement 14.2, 14.3).
                         let dialog = super::clues_dialog::CluesDialog::new(
                             None, &subject, &clues_text,
                         );
+                        // If a close callback was provided, wire it to the
+                        // window's close-request signal so the caller knows
+                        // when the dialog has been dismissed.
+                        if let Some(callback) = on_close {
+                            use std::cell::Cell;
+                            let cb = std::rc::Rc::new(Cell::new(Some(callback)));
+                            dialog.connect_close(move || {
+                                if let Some(f) = cb.take() {
+                                    f();
+                                }
+                            });
+                        }
                         dialog.present();
                     }
                     GuiCommand::ShowMessageBox {
@@ -304,6 +329,36 @@ impl GtkRuntime {
             config,
             on_close: Some(Box::new(on_close)),
             folder_tree,
+            training_executor: None,
+            stats: None,
+        });
+    }
+
+    /// Show the Manager window with a training executor attached.
+    ///
+    /// Same as `show_manager` but also provides a training executor so the
+    /// Training tab's "Start Training" button is functional.
+    ///
+    /// **Validates: Requirements 3.4, 14.2, 14.5**
+    pub fn show_manager_with_training(
+        &self,
+        state: ManagerState,
+        config: AppConfig,
+        folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
+        training_executor: Arc<dyn super::tabs::training::TrainingExecutor>,
+        stats: Option<crate::manager_dlg::ManagerStats>,
+        on_close: impl FnOnce() + Send + 'static,
+    ) {
+        if self.is_open.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.sender.send(GuiCommand::ShowManager {
+            state,
+            config,
+            on_close: Some(Box::new(on_close)),
+            folder_tree,
+            training_executor: Some(training_executor),
+            stats,
         });
     }
 
@@ -343,6 +398,23 @@ impl GtkRuntime {
         let _ = self.sender.send(GuiCommand::ShowClues {
             subject: subject.to_owned(),
             clues_text: clues_text.to_owned(),
+            on_close: None,
+        });
+    }
+
+    /// Show the Clues dialog and invoke a callback when it closes.
+    ///
+    /// Used by the standalone `spambayes_clues` binary to know when to exit.
+    pub fn show_clues_and_wait(
+        &self,
+        subject: &str,
+        clues_text: &str,
+        on_close: impl FnOnce() + Send + 'static,
+    ) {
+        let _ = self.sender.send(GuiCommand::ShowClues {
+            subject: subject.to_owned(),
+            clues_text: clues_text.to_owned(),
+            on_close: Some(Box::new(on_close)),
         });
     }
 
@@ -361,6 +433,45 @@ impl GtkRuntime {
         folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
         on_close: impl FnOnce() + Send + 'static,
     ) {
+        self.show_manager_or_wizard_inner(
+            state, config, data_dir, profile_name, folder_tree, None, None, on_close,
+        );
+    }
+
+    /// Show the wizard (if first-run) or manager, with a training executor attached.
+    ///
+    /// Same as `show_manager_or_wizard_if_first_run` but also provides a
+    /// training executor so the Training tab is functional.
+    ///
+    /// **Validates: Requirements 3.4, 9.9**
+    pub fn show_manager_or_wizard_with_training(
+        &self,
+        state: ManagerState,
+        config: AppConfig,
+        data_dir: &Path,
+        profile_name: &str,
+        folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
+        training_executor: Arc<dyn super::tabs::training::TrainingExecutor>,
+        stats: Option<crate::manager_dlg::ManagerStats>,
+        on_close: impl FnOnce() + Send + 'static,
+    ) {
+        self.show_manager_or_wizard_inner(
+            state, config, data_dir, profile_name, folder_tree, Some(training_executor), stats, on_close,
+        );
+    }
+
+    /// Internal implementation for show_manager_or_wizard variants.
+    fn show_manager_or_wizard_inner(
+        &self,
+        state: ManagerState,
+        config: AppConfig,
+        data_dir: &Path,
+        profile_name: &str,
+        folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
+        training_executor: Option<Arc<dyn super::tabs::training::TrainingExecutor>>,
+        stats: Option<crate::manager_dlg::ManagerStats>,
+        on_close: impl FnOnce() + Send + 'static,
+    ) {
         if ConfigWizard::needs_wizard(data_dir, profile_name) {
             // First-run: show wizard, then show manager on completion.
             let sender = self.sender.clone();
@@ -376,6 +487,8 @@ impl GtkRuntime {
                             config: config_for_manager,
                             on_close: Some(Box::new(on_close)),
                             folder_tree,
+                            training_executor,
+                            stats,
                         });
                     }
                     WizardResult::Cancelled => {
@@ -385,6 +498,8 @@ impl GtkRuntime {
                     }
                 }
             });
+        } else if let Some(executor) = training_executor {
+            self.show_manager_with_training(state, config, folder_tree, executor, stats, on_close);
         } else {
             self.show_manager(state, config, folder_tree, on_close);
         }
@@ -665,6 +780,8 @@ mod tests {
             config,
             on_close: Some(Box::new(|| {})),
             folder_tree: None,
+            training_executor: None,
+            stats: None,
         };
     }
 
@@ -766,10 +883,11 @@ mod tests {
         tx.send(GuiCommand::ShowClues {
             subject: "Test Email Subject".to_string(),
             clues_text: "Token: 0.99\nAnother: 0.01".to_string(),
+            on_close: None,
         }).unwrap();
 
         match rx.try_recv() {
-            Ok(GuiCommand::ShowClues { subject, clues_text }) => {
+            Ok(GuiCommand::ShowClues { subject, clues_text, .. }) => {
                 assert_eq!(subject, "Test Email Subject");
                 assert!(clues_text.contains("Token"));
             }

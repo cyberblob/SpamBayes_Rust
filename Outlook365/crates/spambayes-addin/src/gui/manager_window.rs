@@ -19,6 +19,7 @@ use gtk4::gdk;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use spambayes_config::AppConfig;
 
@@ -215,9 +216,9 @@ impl ManagerWindow {
         };
 
         // ─── Build all tabs ──────────────────────────────────────────────
-        let general = GeneralTab::new(state, stats, config);
+        let general = GeneralTab::new(state, stats, config, folder_provider.as_ref());
         let filtering = FilteringTab::new(state, Rc::clone(&folder_provider));
-        let training = TrainingTab::new(state, config, folder_provider);
+        let training = TrainingTab::new(state, config, Rc::clone(&folder_provider));
         let statistics = StatisticsTab::new(stats, None);
         let notifications = NotificationsTab::new(&config.notification);
         let calendar = CalendarTab::new(&config.calendar);
@@ -355,6 +356,14 @@ impl ManagerWindow {
     /// Set the on-close callback that sends completion back to the COM thread.
     pub fn set_on_close(&self, callback: Box<dyn FnOnce() + 'static>) {
         *self.on_close.borrow_mut() = Some(callback);
+    }
+
+    /// Set the training executor on the training tab.
+    ///
+    /// This must be called after construction to enable the "Start Training"
+    /// button. Without this, clicking the button shows an error message.
+    pub fn set_training_executor(&self, executor: Arc<dyn super::tabs::training::TrainingExecutor>) {
+        self.training.set_training_executor(executor);
     }
 
     /// Present (show and bring to front) the window.
@@ -538,8 +547,8 @@ impl ManagerWindow {
         let about = gtk4::AboutDialog::new();
         about.set_transient_for(Some(&self.window));
         about.set_modal(true);
-        about.set_program_name(Some("SpamBayes"));
-        about.set_version(Some("1.5a1"));
+        about.set_program_name(Some("SpamBayes X64"));
+        about.set_version(Some("0.3.0a1"));
         about.set_comments(Some(
             "Anti-spam Classifier for Microsoft Outlook\n\n\
              A Bayesian anti-spam filter integrated with Microsoft Outlook.\n\
@@ -547,18 +556,17 @@ impl ManagerWindow {
              statistical analysis of message content.",
         ));
         about.set_copyright(Some(
-            "Copyright © 2002-2024 Python Software Foundation\n\
-             SpamBayes Project Contributors",
+            "Copyright © 2026 Doug Farrell\n\
+             Based on SpamBayes but a complete rewrite in Rust",
         ));
-        about.set_website(Some("https://github.com/spambayes"));
+        about.set_website(Some("https://github.com/cyberblob/SpamBayes_Rust"));
         about.set_website_label("SpamBayes on GitHub");
         about.set_authors(&[
-            "SpamBayes Project Contributors",
-            "Python Software Foundation",
+            "Doug Farrell and Kiro.dev",
         ]);
         about.set_license_type(gtk4::License::Custom);
         about.set_license(Some(
-            "Licensed under the Python Software Foundation License (PSF License).",
+            "Licensed under the MIT License.",
         ));
         about.present();
     }

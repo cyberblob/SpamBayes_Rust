@@ -170,15 +170,21 @@ impl RibbonExtensibility {
 
         match disp_id {
             101 => {
-                // OnSpamClick
+                // OnSpamClick — train selected message(s) as spam
                 let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
                     .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: OnSpamClick!") });
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::addin_core::AddinCore::train_selected_as_spam();
+                }));
                 S_OK
             }
             102 => {
-                // OnNotSpamClick  
+                // OnNotSpamClick — train selected message(s) as ham
                 let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
                     .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: OnNotSpamClick!") });
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::addin_core::AddinCore::train_selected_as_ham();
+                }));
                 S_OK
             }
             103 => {
@@ -304,7 +310,20 @@ impl RibbonExtensibility {
                 // OnShowCluesClick — score the selected message and show clues
                 let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
                     .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: OnShowCluesClick!") });
-                crate::addin_core::AddinCore::show_clues_for_selected();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::addin_core::AddinCore::show_clues_for_selected();
+                }));
+                if let Err(e) = result {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    let _ = std::fs::OpenOptions::new().append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "RIBBON: OnShowCluesClick PANIC: {}", msg) });
+                }
                 S_OK
             }
             111 => {

@@ -89,6 +89,8 @@ pub mod statistics;
 pub mod timer;
 pub mod toolbar;
 pub mod train;
+#[cfg(feature = "gui")]
+pub mod training_bridge;
 pub mod wizard;
 
 use std::ffi::c_void;

@@ -195,14 +195,13 @@ impl TrainingTab {
         ham_folder_entry.set_hexpand(true);
         ham_folder_entry.set_editable(false);
         ham_folder_entry.set_placeholder_text(Some("Select folder(s)..."));
-        // Show current selection
-        let ham_count = state.ham_training_folder_ids.len();
-        if ham_count > 0 {
-            ham_folder_entry.set_text(&format!(
-                "{} folder{} selected",
-                ham_count,
-                if ham_count == 1 { "" } else { "s" }
-            ));
+        // Resolve current selection to display names immediately
+        if !state.ham_training_folder_ids.is_empty() {
+            let names = FolderBrowserDialog::resolve_folder_names(
+                folder_provider.as_ref(),
+                &state.ham_training_folder_ids,
+            );
+            ham_folder_entry.set_text(&names.join("; "));
         }
 
         let ham_folder_browse_btn = Button::with_label("Browse...");
@@ -225,14 +224,13 @@ impl TrainingTab {
         spam_folder_entry.set_hexpand(true);
         spam_folder_entry.set_editable(false);
         spam_folder_entry.set_placeholder_text(Some("Select folder(s)..."));
-        // Show current selection
-        let spam_count = state.spam_training_folder_ids.len();
-        if spam_count > 0 {
-            spam_folder_entry.set_text(&format!(
-                "{} folder{} selected",
-                spam_count,
-                if spam_count == 1 { "" } else { "s" }
-            ));
+        // Resolve current selection to display names immediately
+        if !state.spam_training_folder_ids.is_empty() {
+            let names = FolderBrowserDialog::resolve_folder_names(
+                folder_provider.as_ref(),
+                &state.spam_training_folder_ids,
+            );
+            spam_folder_entry.set_text(&names.join("; "));
         }
 
         let spam_folder_browse_btn = Button::with_label("Browse...");
@@ -364,17 +362,14 @@ impl TrainingTab {
                 if let Some(selections) = dialog.run() {
                     let new_ids: Vec<FolderId> =
                         selections.iter().map(|(id, _name)| id.clone()).collect();
-                    let count = new_ids.len();
+                    let names: Vec<&str> =
+                        selections.iter().map(|(_id, name)| name.as_str()).collect();
                     *ids.borrow_mut() = new_ids;
-                    // Update the entry display
-                    if count == 0 {
+                    // Update the entry with folder names separated by "; "
+                    if names.is_empty() {
                         entry.set_text("");
                     } else {
-                        entry.set_text(&format!(
-                            "{} folder{} selected",
-                            count,
-                            if count == 1 { "" } else { "s" }
-                        ));
+                        entry.set_text(&names.join("; "));
                     }
                 }
                 // On Cancel: do nothing (keep existing selection)
@@ -400,17 +395,14 @@ impl TrainingTab {
                 if let Some(selections) = dialog.run() {
                     let new_ids: Vec<FolderId> =
                         selections.iter().map(|(id, _name)| id.clone()).collect();
-                    let count = new_ids.len();
+                    let names: Vec<&str> =
+                        selections.iter().map(|(_id, name)| name.as_str()).collect();
                     *ids.borrow_mut() = new_ids;
-                    // Update the entry display
-                    if count == 0 {
+                    // Update the entry with folder names separated by "; "
+                    if names.is_empty() {
                         entry.set_text("");
                     } else {
-                        entry.set_text(&format!(
-                            "{} folder{} selected",
-                            count,
-                            if count == 1 { "" } else { "s" }
-                        ));
+                        entry.set_text(&names.join("; "));
                     }
                 }
                 // On Cancel: do nothing (keep existing selection)
@@ -501,23 +493,30 @@ impl TrainingTab {
                             });
                         });
 
-                    // Execute training
-                    let result = executor_arc.train_batch(
-                        ham,
-                        spam,
-                        do_rescore,
-                        do_rebuild,
-                        progress_fn,
-                        worker_cancelled,
-                    );
+                    // Execute training (catch panics to ensure Complete/Error is sent)
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        executor_arc.train_batch(
+                            ham,
+                            spam,
+                            do_rescore,
+                            do_rebuild,
+                            progress_fn,
+                            worker_cancelled,
+                        )
+                    }));
 
                     // Send completion/error to GTK thread
                     match result {
-                        Ok(train_result) => {
+                        Ok(Ok(train_result)) => {
                             let _ = sender.send(TrainingMessage::Complete(train_result));
                         }
-                        Err(err_msg) => {
+                        Ok(Err(err_msg)) => {
                             let _ = sender.send(TrainingMessage::Error(err_msg));
+                        }
+                        Err(_panic) => {
+                            let _ = sender.send(TrainingMessage::Error(
+                                "Training thread panicked unexpectedly".to_string(),
+                            ));
                         }
                     }
                 });
@@ -528,25 +527,24 @@ impl TrainingTab {
                     std::time::Duration::from_millis(50),
                     move || {
                         // Drain all available messages from the channel
-                        while let Ok(msg) = receiver.try_recv() {
-                            match msg {
-                                TrainingMessage::Progress {
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(TrainingMessage::Progress {
                                     folder_name,
                                     current,
                                     total,
-                                } => {
-                                    dialog_for_poll.set_status(&format!(
-                                        "Training: {} ({}/{})",
-                                        folder_name, current, total
-                                    ));
+                                }) => {
                                     if total > 0 {
                                         dialog_for_poll.set_progress(
                                             f64::from(current) / f64::from(total),
                                         );
                                     }
+                                    dialog_for_poll.set_status(&format!(
+                                        "Training: {} ({}/{})",
+                                        folder_name, current, total
+                                    ));
                                 }
-                                TrainingMessage::Complete(result) => {
-                                    dialog_for_poll.close();
+                                Ok(TrainingMessage::Complete(result)) => {
                                     let msg = format!(
                                         "Training complete!\n\n\
                                          Messages processed: {}\n\
@@ -561,15 +559,31 @@ impl TrainingTab {
                                         "SpamBayes",
                                         &msg,
                                     );
+                                    dialog_for_poll.close();
                                     return glib::ControlFlow::Break;
                                 }
-                                TrainingMessage::Error(err) => {
-                                    dialog_for_poll.close();
+                                Ok(TrainingMessage::Error(err)) => {
+                                    let err_msg = format!("Training failed:\n\n{}", err);
                                     message_boxes::report_error(
                                         None,
                                         "SpamBayes",
-                                        &format!("Training failed:\n\n{}", err),
+                                        &err_msg,
                                     );
+                                    dialog_for_poll.close();
+                                    return glib::ControlFlow::Break;
+                                }
+                                Err(crossbeam_channel::TryRecvError::Empty) => {
+                                    // No messages yet — continue polling
+                                    break;
+                                }
+                                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                    // Worker thread dropped sender without Complete/Error
+                                    message_boxes::report_error(
+                                        None,
+                                        "SpamBayes",
+                                        "Training ended unexpectedly (worker disconnected).",
+                                    );
+                                    dialog_for_poll.close();
                                     return glib::ControlFlow::Break;
                                 }
                             }
@@ -606,5 +620,24 @@ impl TrainingTab {
     /// backend. If not set, clicking Start Training will show an error.
     pub fn set_training_executor(&self, executor: Arc<dyn TrainingExecutor>) {
         *self.training_executor.borrow_mut() = Some(executor);
+    }
+
+    /// Resolve stored folder IDs to display names using the folder provider
+    /// and update the entry fields. Call after construction when the provider is ready.
+    pub fn resolve_folder_names(&self, provider: &dyn FolderProvider) {
+        // Resolve ham training folder names
+        let ham_ids = self.ham_folder_ids.borrow();
+        if !ham_ids.is_empty() {
+            let names = FolderBrowserDialog::resolve_folder_names(provider, &ham_ids);
+            self.ham_folder_entry.set_text(&names.join("; "));
+        }
+        drop(ham_ids);
+
+        // Resolve spam training folder names
+        let spam_ids = self.spam_folder_ids.borrow();
+        if !spam_ids.is_empty() {
+            let names = FolderBrowserDialog::resolve_folder_names(provider, &spam_ids);
+            self.spam_folder_entry.set_text(&names.join("; "));
+        }
     }
 }

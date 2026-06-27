@@ -16,25 +16,25 @@ use windows::core::{GUID, HRESULT, PCWSTR};
 
 /// Minimal IDispatch vtable for raw invocation.
 #[repr(C)]
-struct IDispatchVtbl {
+pub struct IDispatchVtbl {
     // IUnknown (3 slots)
-    query_interface: unsafe extern "system" fn(
+    pub query_interface: unsafe extern "system" fn(
         *mut c_void,
         *const GUID,
         *mut *mut c_void,
     ) -> HRESULT,
-    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub release: unsafe extern "system" fn(*mut c_void) -> u32,
     // IDispatch (4 slots)
-    get_type_info_count:
+    pub get_type_info_count:
         unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
-    get_type_info: unsafe extern "system" fn(
+    pub get_type_info: unsafe extern "system" fn(
         *mut c_void,
         u32,
         u32,
         *mut *mut c_void,
     ) -> HRESULT,
-    get_ids_of_names: unsafe extern "system" fn(
+    pub get_ids_of_names: unsafe extern "system" fn(
         *mut c_void,
         *const GUID,
         *mut PCWSTR,
@@ -42,7 +42,7 @@ struct IDispatchVtbl {
         u32,
         *mut i32,
     ) -> HRESULT,
-    invoke: unsafe extern "system" fn(
+    pub invoke: unsafe extern "system" fn(
         *mut c_void,
         i32,         // dispIdMember
         *const GUID, // riid
@@ -83,11 +83,11 @@ impl Default for VARIANT {
 
 /// DISPPARAMS structure for IDispatch::Invoke.
 #[repr(C)]
-struct DISPPARAMS {
-    rgvarg: *mut VARIANT,
-    rgdispid_named_args: *mut i32,
-    c_args: u32,
-    c_named_args: u32,
+pub struct DISPPARAMS {
+    pub rgvarg: *mut VARIANT,
+    pub rgdispid_named_args: *mut i32,
+    pub c_args: u32,
+    pub c_named_args: u32,
 }
 
 // ─── VARIANT Type Constants ──────────────────────────────────────────────────
@@ -108,7 +108,7 @@ const DISPATCH_PROPERTYPUT: u16 = 4;
 const DISPID_PROPERTYPUT: i32 = -3;
 
 /// IID_NULL for IDispatch calls.
-static IID_NULL: GUID = GUID::from_u128(0);
+pub static IID_NULL: GUID = GUID::from_u128(0);
 
 // ─── VariantArg ──────────────────────────────────────────────────────────────
 
@@ -178,7 +178,7 @@ unsafe fn variant_clear(v: &mut VARIANT) {
 // ─── GetIDsOfNames Helper ────────────────────────────────────────────────────
 
 /// Resolve a property/method name to a DISPID on an IDispatch object.
-unsafe fn get_dispid(disp: *mut c_void, name: &str) -> Result<i32, HRESULT> {
+pub unsafe fn get_dispid(disp: *mut c_void, name: &str) -> Result<i32, HRESULT> {
     if disp.is_null() {
         return Err(HRESULT(0x80004003_u32 as i32)); // E_POINTER
     }

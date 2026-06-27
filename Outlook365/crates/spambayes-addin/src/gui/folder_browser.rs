@@ -334,6 +334,80 @@ impl FolderBrowserDialog {
         self.inner.result.borrow().clone().unwrap_or(None)
     }
 
+    /// Resolve a list of folder IDs into display names using the folder provider.
+    ///
+    /// Walks the provider's folder tree and returns "StoreName/FolderName"
+    /// for each matched ID. Unmatched IDs are returned as "(unknown folder)".
+    ///
+    /// This is useful for displaying folder names at load time when only
+    /// IDs are available from the config.
+    pub fn resolve_folder_names(
+        provider: &dyn FolderProvider,
+        folder_ids: &[FolderId],
+    ) -> Vec<String> {
+        if folder_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let tree = match provider.load_folder_tree() {
+            Ok(tree) => {
+                log::info!("resolve_folder_names: loaded tree with {} store(s)", tree.len());
+                tree
+            }
+            Err(e) => {
+                log::warn!("resolve_folder_names: failed to load tree: {}", e);
+                return folder_ids.iter().map(|_| "(unknown folder)".to_string()).collect();
+            }
+        };
+
+        let mut results: Vec<String> = Vec::with_capacity(folder_ids.len());
+        for fid in folder_ids {
+            log::info!("resolve_folder_names: looking for store_id='{}' entry_id='{}'",
+                       &fid.store_id.0[..fid.store_id.0.len().min(20)],
+                       &fid.entry_id.0[..fid.entry_id.0.len().min(20)]);
+            let name = Self::find_folder_name_in_tree(&tree, fid, "");
+            log::info!("resolve_folder_names: result = {:?}", name);
+            results.push(name.unwrap_or_else(|| "(unknown folder)".to_string()));
+        }
+        results
+    }
+
+    /// Recursively search the folder tree for a matching FolderId.
+    /// Returns "StoreName/FolderName" format.
+    fn find_folder_name_in_tree(
+        nodes: &[FolderNode],
+        target: &FolderId,
+        store_name: &str,
+    ) -> Option<String> {
+        for node in nodes {
+            // Check if this node matches
+            if node.store_id.eq_ignore_ascii_case(&target.store_id.0)
+                && node.entry_id.eq_ignore_ascii_case(&target.entry_id.0)
+            {
+                if store_name.is_empty() {
+                    return Some(node.name.clone());
+                } else {
+                    return Some(format!("{}/{}", store_name, node.name));
+                }
+            }
+
+            // Recurse into children — propagate store name from top-level node
+            let child_store_name = if store_name.is_empty() {
+                &node.name
+            } else {
+                store_name
+            };
+            if let Some(found) = Self::find_folder_name_in_tree(
+                &node.children,
+                target,
+                child_store_name,
+            ) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     // ─── Internal Helpers ────────────────────────────────────────────────
 
     /// Create an error-state dialog that returns None immediately.
@@ -457,6 +531,9 @@ impl FolderBrowserDialog {
 
     /// Read the current selection from the TreeView and return folder IDs.
     ///
+    /// The display name is built as "StoreName/FolderName" so the user can
+    /// identify which account a folder belongs to.
+    ///
     /// **Validates: Requirement 11.4**
     fn read_selection(inner: &FolderBrowserInner) -> Vec<(FolderId, String)> {
         let selection = inner.tree_view.selection();
@@ -476,14 +553,45 @@ impl FolderBrowserDialog {
                     continue;
                 }
 
+                // Build full display path: walk up to the store root
+                let display_name = Self::build_display_path(&model, path, &name);
+
                 let folder_id = FolderId::new(
                     StoreId::new(store_id),
                     EntryId::new(entry_id),
                 );
-                results.push((folder_id, name));
+                results.push((folder_id, display_name));
             }
         }
 
         results
+    }
+
+    /// Build a display path like "StoreName/FolderName" by walking up the
+    /// tree from the selected node to the top-level store root.
+    fn build_display_path(
+        model: &impl gtk4::prelude::TreeModelExt,
+        path: &gtk4::TreePath,
+        leaf_name: &str,
+    ) -> String {
+        // Walk up to find the top-level store name
+        let mut current_path = path.clone();
+        let mut ancestors: Vec<String> = Vec::new();
+
+        // Collect ancestor names from leaf up to the top-level store
+        while current_path.up() && current_path.depth() > 0 {
+            if let Some(parent_iter) = model.iter(&current_path) {
+                let parent_name: String = model.get(&parent_iter, COL_NAME as i32);
+                ancestors.push(parent_name);
+            }
+        }
+
+        if let Some(store_name) = ancestors.last() {
+            // Format as "StoreName/FolderName"
+            format!("{}/{}", store_name, leaf_name)
+        } else {
+            // No parent found (top-level node itself) — just use the name
+            leaf_name.to_string()
+        }
     }
 }

@@ -1438,6 +1438,185 @@ impl AddinCore {
 
     // ─── Show Clues ────────────────────────────────────────────────────
 
+    // ─── Train as Spam / Ham ─────────────────────────────────────────────
+
+    /// Train the selected message(s) as spam and move to the spam folder.
+    pub fn train_selected_as_spam() {
+        unsafe { Self::train_selected(true); }
+    }
+
+    /// Train the selected message(s) as ham (not spam) and move back to inbox.
+    pub fn train_selected_as_ham() {
+        unsafe { Self::train_selected(false); }
+    }
+
+    /// Core implementation for training selected messages.
+    unsafe fn train_selected(is_spam: bool) {
+        use crate::com_invoke::{dispatch_get, dispatch_get_string};
+
+        let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+        let label = if is_spam { "spam" } else { "ham" };
+
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+            .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: entering", label) });
+
+        if GLOBAL_ADDIN_PTR.is_null() {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: GLOBAL_ADDIN_PTR is null", label) });
+            return;
+        }
+        let addin = &*GLOBAL_ADDIN_PTR;
+
+        let app_ptr = if !POLL_APP_PTR.is_null() {
+            POLL_APP_PTR
+        } else {
+            match addin.application {
+                Some(p) if !p.is_null() => p,
+                _ => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: no application ptr", label) });
+                    return;
+                }
+            }
+        };
+
+        // Get Explorer and Selection
+        let explorer = match dispatch_get(app_ptr, "ActiveExplorer") {
+            Ok(p) if !p.is_null() => p,
+            _ => {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: no ActiveExplorer", label) });
+                return;
+            }
+        };
+        let selection = match dispatch_get(explorer, "Selection") {
+            Ok(p) if !p.is_null() => p,
+            _ => {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: no Selection", label) });
+                Self::release_dispatch(explorer); return;
+            }
+        };
+
+        // Get Selection.Count via direct VARIANT inspection (it's an integer, not a string)
+        let count = Self::get_selection_count(selection);
+
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+            .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: selection count={}", label, count) });
+
+        if count == 0 {
+            Self::release_dispatch(selection);
+            Self::release_dispatch(explorer);
+            return;
+        }
+
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+            .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: {} message(s)", label, count) });
+
+        // Get the destination folder ID from config
+        let dest_folder_id = {
+            let config = match &addin.config {
+                Some(c) => c,
+                None => {
+                    Self::release_dispatch(selection);
+                    Self::release_dispatch(explorer);
+                    return;
+                }
+            };
+            if is_spam {
+                config.filter.spam_folder_id.clone()
+            } else {
+                // For ham (Not Spam), move back to the first watch folder (inbox)
+                config.filter.watch_folder_ids.first().cloned()
+            }
+        };
+
+        // Process each selected item
+        let mut trained_count = 0u32;
+        for i in 1..=count {
+            let item = match crate::com_invoke::dispatch_invoke_method(
+                selection, "Item", &[crate::com_invoke::VariantArg::I4(i)]
+            ) {
+                Ok(p) if !p.is_null() => p,
+                _ => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: Item({}) failed", label, i) });
+                    continue;
+                }
+            };
+
+            // Get MIME content for tokenization
+            let content = crate::folder_sink::get_mime_content(item);
+            let message_bytes = match content {
+                Some(bytes) if !bytes.is_empty() => {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: MIME content {} bytes", label, bytes.len()) });
+                    bytes
+                }
+                _ => {
+                    // Fallback to headers + body
+                    let body = dispatch_get_string(item, "Body").unwrap_or_default();
+                    let headers = Self::get_message_headers(item);
+                    let mut c = String::new();
+                    if let Some(hdrs) = headers {
+                        c.push_str(&hdrs);
+                        c.push_str("\r\n\r\n");
+                    } else {
+                        let subj = dispatch_get_string(item, "Subject").unwrap_or_default();
+                        c.push_str(&format!("Subject: {}\r\n\r\n", subj));
+                    }
+                    c.push_str(&body);
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: fallback content {} bytes", label, c.len()) });
+                    c.into_bytes()
+                }
+            };
+
+            // Tokenize and train
+            if let Some(classifier_arc) = &addin.classifier {
+                if let Ok(mut classifier) = classifier_arc.lock() {
+                    let tokenizer = spambayes_core::tokenizer::Tokenizer::with_defaults();
+                    let tokens = tokenizer.tokenize(&message_bytes);
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: {} tokens, training...", label, tokens.len()) });
+                    classifier.learn(tokens.into_iter(), is_spam);
+                    trained_count += 1;
+                } else {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: classifier lock failed", label) });
+                }
+            } else {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: no classifier", label) });
+            }
+
+            // Move to destination folder (spam folder for spam, watch folder for ham)
+            if let Some(ref folder_id) = dest_folder_id {
+                crate::folder_sink::move_item_to_folder(
+                    item, folder_id, &debug_path,
+                );
+            }
+
+            Self::release_dispatch(item);
+        }
+
+        Self::release_dispatch(selection);
+        Self::release_dispatch(explorer);
+
+        // Save the classifier to disk
+        if trained_count > 0 {
+            addin.save_dirty_data();
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "train_as_{}: trained {} message(s), saved", label, trained_count) });
+        }
+
+        // Invalidate ribbon so button visibility updates
+        Self::invalidate_ribbon();
+    }
+
+    // ─── Show Clues ────────────────────────────────────────────────────
+
     /// Score the currently selected message and show the Clues dialog.
     ///
     /// Gets the selected MailItem from the active Explorer, extracts its
@@ -1450,6 +1629,12 @@ impl AddinCore {
     pub fn show_clues_for_selected() {
         unsafe {
             use crate::com_invoke::{dispatch_get, dispatch_get_string};
+
+            let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "show_clues: start") });
 
             if GLOBAL_ADDIN_PTR.is_null() { return; }
             let addin = &*GLOBAL_ADDIN_PTR;
@@ -1495,28 +1680,43 @@ impl AddinCore {
                 }
             };
 
-            // Get Subject
+            // Get Subject (for display in the dialog title)
             let subject = dispatch_get_string(item, "Subject")
                 .unwrap_or_else(|| "(no subject)".to_string());
 
-            // Get Body text for scoring
-            let body = dispatch_get_string(item, "Body")
-                .unwrap_or_default();
-
-            // Also try to get headers for more accurate scoring
-            let headers = Self::get_message_headers(item);
+            // Get message content using the SAME approach as the filter:
+            // 1. Try full MIME content (PR_MIME_CONTENT) — this is what the filter uses
+            // 2. Fall back to transport headers + body
+            // 3. Last resort: Subject + body
+            let scoring_bytes = {
+                let mime = crate::folder_sink::get_mime_content(item);
+                match mime {
+                    Some(bytes) if !bytes.is_empty() => bytes,
+                    _ => {
+                        // Fallback: headers + body (same as folder_sink fallback)
+                        let body = dispatch_get_string(item, "Body")
+                            .unwrap_or_default();
+                        let headers = Self::get_message_headers(item);
+                        let mut content = String::new();
+                        if let Some(hdrs) = headers {
+                            content.push_str(&hdrs);
+                            content.push_str("\r\n\r\n");
+                        } else {
+                            content.push_str(&format!("Subject: {}\r\n\r\n", subject));
+                        }
+                        content.push_str(&body);
+                        content.into_bytes()
+                    }
+                }
+            };
 
             Self::release_dispatch(item);
             Self::release_dispatch(selection);
             Self::release_dispatch(explorer);
 
-            // Build the RFC-822 like content for tokenization
-            let scoring_content = if let Some(hdrs) = headers {
-                format!("{}\r\n\r\n{}", hdrs, body)
-            } else {
-                // Construct minimal headers + body for tokenization
-                format!("Subject: {}\r\n\r\n{}", subject, body)
-            };
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "show_clues: got subject='{}', content_len={}",
+                    subject.chars().take(40).collect::<String>(), scoring_bytes.len()) });
 
             // Score the message with evidence using the classifier
             let clues_text = match &addin.classifier {
@@ -1524,11 +1724,115 @@ impl AddinCore {
                     match classifier_arc.lock() {
                         Ok(classifier) => {
                             let tokenizer = spambayes_core::tokenizer::Tokenizer::with_defaults();
-                            let tokens = tokenizer.tokenize(scoring_content.as_bytes());
-                            let result = classifier.spam_prob_with_evidence(tokens.into_iter());
+                            let tokens_vec = tokenizer.tokenize(&scoring_bytes);
 
-                            // Format the clues text similar to the Python show_clues_dialog
-                            Self::format_clues_text(&subject, result.probability, &result.clues)
+                            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                    "show_clues: tokenized {} tokens, classifier nham={} nspam={} word_info_size={}",
+                                    tokens_vec.len(), classifier.nham(), classifier.nspam(), classifier.word_info().len()
+                                ) });
+
+                            // Check how many message tokens exist in the classifier's word_info
+                            let word_info = classifier.word_info();
+                            {
+                                use std::collections::HashSet;
+                                let unique: HashSet<&Vec<u8>> = tokens_vec.iter().collect();
+                                let matched = unique.iter().filter(|t| word_info.contains_key(**t)).count();
+                                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                        "show_clues: {} unique tokens, {} matched in word_info",
+                                        unique.len(), matched
+                                    ) });
+
+                                // Log first 5 message tokens and whether they're in word_info
+                                for (i, tok) in unique.iter().take(5).enumerate() {
+                                    let tok_str = String::from_utf8_lossy(tok);
+                                    let in_db = word_info.contains_key(*tok);
+                                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                        .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                            "show_clues:   token[{}]: '{}' in_db={}",
+                                            i, tok_str.chars().take(60).collect::<String>(), in_db
+                                        ) });
+                                }
+
+                                // Log first 5 word_info keys for comparison
+                                for (i, key) in word_info.keys().take(5).enumerate() {
+                                    let key_str = String::from_utf8_lossy(key);
+                                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                        .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                            "show_clues:   db_key[{}]: '{}'",
+                                            i, key_str.chars().take(60).collect::<String>()
+                                        ) });
+                                }
+
+                                // Log probability for first 5 matched tokens
+                                let mut prob_logged = 0;
+                                for tok in unique.iter() {
+                                    if prob_logged >= 5 { break; }
+                                    if let Some(wi) = word_info.get(*tok) {
+                                        let prob = classifier.probability(wi);
+                                        let dist = (prob - 0.5).abs();
+                                        let tok_str = String::from_utf8_lossy(tok);
+                                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                                "show_clues:   prob('{}') = {:.6} (ham={}, spam={}, dist={:.4})",
+                                                tok_str.chars().take(40).collect::<String>(),
+                                                prob, wi.ham_count, wi.spam_count, dist
+                                            ) });
+                                        prob_logged += 1;
+                                    }
+                                }
+
+                                // Check: how many tokens have dist > 0 at all?
+                                let nonzero_dist = unique.iter().filter(|tok| {
+                                    if let Some(wi) = word_info.get(**tok) {
+                                        let prob = classifier.probability(wi);
+                                        (prob - 0.5).abs() > 0.0001
+                                    } else { false }
+                                }).count();
+                                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                        "show_clues: tokens with dist>0.0001: {}, min_prob_strength threshold: {}",
+                                        nonzero_dist, classifier.config().minimum_prob_strength
+                                    ) });
+                            }
+
+                            let result = classifier.spam_prob_with_evidence(tokens_vec.iter().cloned());
+
+                            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                    "show_clues: score={:.6}, clues_count={}",
+                                    result.probability,
+                                    result.clues.as_ref().map_or(0, |c| c.len())
+                                ) });
+
+                            // Gather per-token ham/spam counts from classifier
+                            let nham = classifier.nham();
+                            let nspam = classifier.nspam();
+
+                            // Build enriched clue data with ham/spam counts
+                            let enriched_clues: Option<Vec<(String, f64, u32, u32)>> = result.clues.as_ref().map(|clue_list| {
+                                clue_list.iter().map(|(token_str, prob)| {
+                                    let token_bytes = token_str.as_bytes().to_vec();
+                                    let (hc, sc) = match word_info.get(&token_bytes) {
+                                        Some(wi) => (wi.ham_count, wi.spam_count),
+                                        None => (0, 0),
+                                    };
+                                    (token_str.clone(), *prob, hc, sc)
+                                }).collect()
+                            });
+
+                            // Count total unique tokens in the message
+                            let total_tokens = {
+                                use std::collections::HashSet;
+                                let unique: HashSet<&Vec<u8>> = tokens_vec.iter().collect();
+                                unique.len()
+                            };
+
+                            Self::format_clues_text(
+                                &subject, result.probability, &enriched_clues,
+                                nham, nspam, total_tokens,
+                            )
                         }
                         Err(_) => {
                             "Error: Could not access the classifier (lock poisoned).".to_string()
@@ -1540,12 +1844,53 @@ impl AddinCore {
                 }
             };
 
-            // Show clues in a Win32 MessageBox (clues dialog is in the manager EXE)
+            // Show clues via the GTK4 clues viewer subprocess.
+            // This mirrors the Python approach of spawning a subprocess to
+            // avoid COM threading issues with modal dialogs.
             {
-                let truncated: String = clues_text.chars().take(2000).collect();
-                Self::show_win32_error(
-                    &truncated,
-                );
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "show_clues: launching clues viewer ({} chars)", clues_text.len()) });
+
+                let dll_dir = Self::get_dll_directory();
+                let clues_exe = dll_dir.join("spambayes_clues.exe");
+
+                if clues_exe.is_file() {
+                    use std::process::{Command, Stdio};
+                    use std::io::Write;
+                    use std::os::windows::process::CommandExt;
+
+                    match Command::new(&clues_exe)
+                        .arg(&subject)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                        .spawn()
+                    {
+                        Ok(mut child) => {
+                            // Write clues text to the child's stdin.
+                            if let Some(mut stdin) = child.stdin.take() {
+                                let _ = stdin.write_all(clues_text.as_bytes());
+                                // stdin is dropped here, closing the pipe.
+                            }
+                            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f, "show_clues: launched PID {}", child.id()) });
+                        }
+                        Err(e) => {
+                            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f, "show_clues: spawn failed: {}", e) });
+                            // Fallback to MessageBox if the subprocess can't be launched.
+                            let truncated: String = clues_text.chars().take(2000).collect();
+                            Self::show_win32_info(&truncated);
+                        }
+                    }
+                } else {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "show_clues: clues exe not found at {:?}", clues_exe) });
+                    // Fallback to MessageBox
+                    let truncated: String = clues_text.chars().take(2000).collect();
+                    Self::show_win32_info(&truncated);
+                }
             }
         }
     }
@@ -1611,10 +1956,12 @@ impl AddinCore {
         let bstr = SysAllocString(wide_schema.as_ptr());
         if bstr.is_null() { return None; }
 
-        // Build a VARIANT holding the BSTR
+        // Use the same VARIANT layout as com_invoke.rs (24 bytes total on 64-bit).
+        // Previous code used only 16 bytes which caused a stack buffer overflow
+        // when IDispatch::Invoke wrote the 24-byte result VARIANT.
         #[repr(C)]
-        struct RawVariant { vt: u16, _pad: [u16; 3], data: [u8; 8] }
-        let mut arg_variant = RawVariant { vt: 8, _pad: [0; 3], data: [0; 8] }; // VT_BSTR = 8
+        struct RawVariant { vt: u16, _pad: [u16; 3], data: [u8; 16] }
+        let mut arg_variant = RawVariant { vt: 8, _pad: [0; 3], data: [0; 16] }; // VT_BSTR = 8
         *(arg_variant.data.as_mut_ptr() as *mut *mut u16) = bstr;
 
         // DISPPARAMS with one arg
@@ -1632,7 +1979,7 @@ impl AddinCore {
             c_named_args: 0,
         };
 
-        let mut result_variant = RawVariant { vt: 0, _pad: [0; 3], data: [0; 8] };
+        let mut result_variant = RawVariant { vt: 0, _pad: [0; 3], data: [0; 16] };
 
         // Invoke GetProperty(schema) — slot 6 in IDispatch vtable
         let invoke_fn: unsafe extern "system" fn(
@@ -1645,7 +1992,7 @@ impl AddinCore {
             dispid,
             &GUID::from_u128(0),
             0,
-            1, // DISPATCH_METHOD
+            1 | 2, // DISPATCH_METHOD | DISPATCH_PROPERTYGET
             &mut params,
             &mut result_variant,
             ptr::null_mut(),
@@ -1675,24 +2022,51 @@ impl AddinCore {
 
     /// Format clues text for display, matching the Python show_clues_dialog format.
     ///
-    /// Produces a human-readable summary with overall score and per-token probabilities
-    /// sorted by distance from 0.5 (most discriminative first).
+    /// Produces output similar to the Python `GetClues()` function:
+    /// - Combined score (percentage and raw probability)
+    /// - Training statistics (# ham, # spam trained on)
+    /// - Significant tokens table with token, spamprob, #ham, #spam columns
+    /// - Total unique tokens in the message
     fn format_clues_text(
         subject: &str,
         probability: f64,
-        clues: &Option<Vec<(String, f64)>>,
+        clues: &Option<Vec<(String, f64, u32, u32)>>,
+        nham: u64,
+        nspam: u64,
+        total_tokens: usize,
     ) -> String {
-        let mut text = String::with_capacity(4096);
+        let mut text = String::with_capacity(8192);
 
         let score_pct = probability * 100.0;
-        text.push_str(&format!("Spam Score: {:.1}%\n", score_pct));
-        text.push_str(&format!("Subject: {}\n", subject));
-        text.push_str(&format!("{}\n\n", "=".repeat(60)));
 
+        // Classification label based on thresholds
+        let classification = if score_pct >= 90.0 {
+            "spam"
+        } else if score_pct <= 15.0 {
+            "good"
+        } else {
+            "unsure"
+        };
+
+        // Header — matches Python's "Combined Score: X% (raw)"
+        text.push_str(&format!("Subject: {}\n", subject));
+        text.push_str(&format!("=== Combined Score: {}% ({:.6}) ===\n\n",
+            Self::format_score_pct(score_pct), probability));
+
+        text.push_str(&format!("Classification: {}\n", classification));
+        text.push_str(&format!("# ham trained on: {}\n", nham));
+        text.push_str(&format!("# spam trained on: {}\n\n", nspam));
+
+        // Significant tokens table — matches Python's column format:
+        // "token                               spamprob         #ham  #spam"
         match clues {
             Some(clue_list) if !clue_list.is_empty() => {
-                text.push_str(&format!("{:<50} {:>10}\n", "Token", "Probability"));
-                text.push_str(&format!("{}\n", "-".repeat(60)));
+                text.push_str(&format!("=== {} Significant Tokens ===\n\n", clue_list.len()));
+                text.push_str(&format!(
+                    "{:<35} {:>12} {:>6} {:>6}\n",
+                    "token", "spamprob", "#ham", "#spam"
+                ));
+                text.push_str(&format!("{}\n", "-".repeat(65)));
 
                 // Sort by distance from 0.5 (most discriminative first)
                 let mut sorted_clues = clue_list.clone();
@@ -1702,21 +2076,56 @@ impl AddinCore {
                     dist_b.partial_cmp(&dist_a).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                for (token, prob) in &sorted_clues {
+                for (token, prob, ham_count, spam_count) in &sorted_clues {
                     // Truncate long tokens for display
-                    let display_token: String = token.chars().take(48).collect();
-                    text.push_str(&format!("{:<50} {:>10.6}\n", display_token, prob));
+                    let display_token: String = token.chars().take(34).collect();
+                    text.push_str(&format!(
+                        "{:<35} {:>12} {:>6} {:>6}\n",
+                        display_token,
+                        Self::format_internal_score(*prob),
+                        ham_count,
+                        spam_count,
+                    ));
                 }
-
-                text.push_str(&format!("\n{} clues total", sorted_clues.len()));
             }
             _ => {
                 text.push_str("No significant clues found.\n");
-                text.push_str("The classifier may need more training data.");
+                text.push_str("The classifier may need more training data.\n");
             }
         }
 
+        // Total tokens in message
+        text.push_str(&format!("\n{} unique tokens in message\n", total_tokens));
+
         text
+    }
+
+    /// Format a spam score percentage with appropriate precision,
+    /// matching the Python `FormatScorePercent`.
+    fn format_score_pct(score_pct: f64) -> String {
+        if score_pct < 0.01 {
+            format!("{:.4}", score_pct)
+        } else if score_pct < 1.0 {
+            format!("{:.2}", score_pct)
+        } else {
+            format!("{}", score_pct.round() as i64)
+        }
+    }
+
+    /// Format an internal probability score with appropriate precision,
+    /// matching the Python `FormatInternalScore`.
+    fn format_internal_score(score: f64) -> String {
+        if score < 1e-9 {
+            format!("{:.2e}", score)
+        } else if score < 0.000001 {
+            format!("{:.9}", score)
+        } else if score < 0.0001 {
+            format!("{:.6}", score)
+        } else if score > 0.9999 {
+            format!("{:.6}", score)
+        } else {
+            format!("{:.4}", score)
+        }
     }
 
     /// Check if the classifier is loaded and has training data.
@@ -1870,6 +2279,61 @@ impl AddinCore {
             let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
                 std::mem::transmute(*vtbl.add(2));
             release_fn(ptr);
+        }
+    }
+
+    /// Get the Count property from a Selection object as an integer.
+    ///
+    /// Selection.Count returns VT_I4, so dispatch_get_string won't work.
+    /// This reads the VARIANT result directly.
+    unsafe fn get_selection_count(selection: *mut c_void) -> i32 {
+        use crate::com_invoke::dispatch_get_string;
+
+        // First try: Some versions return Count as a string
+        if let Some(s) = dispatch_get_string(selection, "Count") {
+            if let Ok(n) = s.trim().parse::<i32>() {
+                return n;
+            }
+        }
+
+        // Direct approach: invoke Count and read VT_I4 from the VARIANT
+        let dispid = match crate::com_invoke::get_dispid(selection, "Count") {
+            Ok(id) => id,
+            Err(_) => return 0,
+        };
+
+        let vtbl = *(selection as *const *const crate::com_invoke::IDispatchVtbl);
+
+        let mut params = crate::com_invoke::DISPPARAMS {
+            rgvarg: std::ptr::null_mut(),
+            rgdispid_named_args: std::ptr::null_mut(),
+            c_args: 0,
+            c_named_args: 0,
+        };
+
+        let mut result = crate::com_invoke::VARIANT::default();
+
+        let hr = ((*vtbl).invoke)(
+            selection,
+            dispid,
+            &crate::com_invoke::IID_NULL,
+            0,
+            2 | 1, // DISPATCH_PROPERTYGET | DISPATCH_METHOD
+            &raw mut params,
+            &raw mut result,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        if hr.is_err() {
+            return 0;
+        }
+
+        // VT_I4 = 3
+        if result.vt == 3 {
+            *(result.data.as_ptr().cast::<i32>())
+        } else {
+            0
         }
     }
 
@@ -2530,10 +2994,320 @@ impl AddinCore {
         }
     }
 
+    /// Show a Win32 MessageBox with information icon.
+    fn show_win32_info(message: &str) {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+        let title: Vec<u16> = "SpamBayes - Clues\0".encode_utf16().collect();
+        let msg: Vec<u16> = format!("{message}\0").encode_utf16().collect();
+        unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(msg.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+
     /// Log an error message if the logger is available.
     fn log_error(&self, message: &str) {
         if let Some(logger) = &self.logger {
             logger.error("addin_core", message);
+        }
+    }
+}
+
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::AddinCore;
+    use spambayes_core::classifier::Classifier;
+    use spambayes_core::tokenizer::Tokenizer;
+    use spambayes_core::ClassifierConfig;
+
+    // ─── format_score_pct ────────────────────────────────────────────────
+
+    #[test]
+    fn format_score_pct_very_small() {
+        assert_eq!(AddinCore::format_score_pct(0.005), "0.0050");
+    }
+
+    #[test]
+    fn format_score_pct_small() {
+        assert_eq!(AddinCore::format_score_pct(0.75), "0.75");
+    }
+
+    #[test]
+    fn format_score_pct_normal() {
+        assert_eq!(AddinCore::format_score_pct(42.7), "43");
+    }
+
+    #[test]
+    fn format_score_pct_high() {
+        assert_eq!(AddinCore::format_score_pct(99.9), "100");
+    }
+
+    // ─── format_internal_score ───────────────────────────────────────────
+
+    #[test]
+    fn format_internal_score_very_small() {
+        let s = AddinCore::format_internal_score(1e-12);
+        assert!(s.contains("e"), "Expected scientific notation, got: {}", s);
+    }
+
+    #[test]
+    fn format_internal_score_small() {
+        let s = AddinCore::format_internal_score(0.00005);
+        assert_eq!(s, "0.000050");
+    }
+
+    #[test]
+    fn format_internal_score_near_one() {
+        let s = AddinCore::format_internal_score(0.99999);
+        assert_eq!(s, "0.999990");
+    }
+
+    #[test]
+    fn format_internal_score_normal() {
+        let s = AddinCore::format_internal_score(0.85);
+        assert_eq!(s, "0.8500");
+    }
+
+    // ─── format_clues_text ───────────────────────────────────────────────
+
+    #[test]
+    fn format_clues_text_with_clues() {
+        let clues = Some(vec![
+            ("viagra".to_string(), 0.99, 0u32, 15u32),
+            ("hello".to_string(), 0.1, 20, 1),
+        ]);
+        let text = AddinCore::format_clues_text(
+            "Test Subject", 0.95, &clues, 100, 200, 50,
+        );
+        assert!(text.contains("Subject: Test Subject"));
+        assert!(text.contains("95%"));
+        assert!(text.contains("spam"));
+        assert!(text.contains("# ham trained on: 100"));
+        assert!(text.contains("# spam trained on: 200"));
+        assert!(text.contains("2 Significant Tokens"));
+        assert!(text.contains("viagra"));
+        assert!(text.contains("hello"));
+        assert!(text.contains("50 unique tokens"));
+    }
+
+    #[test]
+    fn format_clues_text_no_clues() {
+        let text = AddinCore::format_clues_text(
+            "Empty", 0.5, &Some(vec![]), 10, 20, 30,
+        );
+        assert!(text.contains("No significant clues found"));
+        assert!(text.contains("30 unique tokens"));
+    }
+
+    #[test]
+    fn format_clues_text_classification_good() {
+        let text = AddinCore::format_clues_text(
+            "Ham", 0.05, &None, 10, 10, 10,
+        );
+        assert!(text.contains("Classification: good"));
+    }
+
+    #[test]
+    fn format_clues_text_classification_unsure() {
+        let text = AddinCore::format_clues_text(
+            "Maybe", 0.5, &None, 10, 10, 10,
+        );
+        assert!(text.contains("Classification: unsure"));
+    }
+
+    // ─── Training + Scoring integration ──────────────────────────────────
+
+    /// Helper: build a simple RFC-822 message for tokenization.
+    fn make_message(subject: &str, body: &str) -> Vec<u8> {
+        format!(
+            "From: sender@example.com\r\n\
+             To: recipient@example.com\r\n\
+             Subject: {}\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             {}",
+            subject, body
+        ).into_bytes()
+    }
+
+    #[test]
+    fn train_and_score_produces_clues() {
+        let config = ClassifierConfig::default();
+        let mut classifier = Classifier::new(config);
+        let tokenizer = Tokenizer::with_defaults();
+
+        // Train several distinct spam messages
+        let spam_msgs = vec![
+            make_message("Buy cheap viagra now!", "Click here to buy viagra pills cheap price"),
+            make_message("You won the lottery!", "Claim your million dollar prize money now"),
+            make_message("Free pills online", "Order cheap pharmacy drugs online free shipping"),
+        ];
+        for msg in &spam_msgs {
+            let tokens = tokenizer.tokenize(msg);
+            classifier.learn(tokens.into_iter(), true);
+        }
+
+        // Train several distinct ham messages
+        let ham_msgs = vec![
+            make_message("Meeting tomorrow", "Hi team, reminder about the 10am meeting tomorrow"),
+            make_message("Project update", "The deployment went well, all tests passing"),
+            make_message("Lunch plans", "Want to grab lunch at the new place downtown?"),
+        ];
+        for msg in &ham_msgs {
+            let tokens = tokenizer.tokenize(msg);
+            classifier.learn(tokens.into_iter(), false);
+        }
+
+        // Now score a spam-like message
+        let test_msg = make_message(
+            "Amazing deals on viagra",
+            "Buy cheap viagra pills online free shipping",
+        );
+        let test_tokens = tokenizer.tokenize(&test_msg);
+        let result = classifier.spam_prob_with_evidence(test_tokens.into_iter());
+
+        // Should have clues (tokens that are discriminative)
+        let clues = result.clues.unwrap();
+        assert!(!clues.is_empty(), "Expected clues but got none");
+
+        // Score should lean toward spam (> 0.5)
+        assert!(
+            result.probability > 0.6,
+            "Expected spam probability > 0.6, got {}",
+            result.probability
+        );
+
+        // Verify that discriminative tokens appear in clues
+        let clue_names: Vec<&str> = clues.iter().map(|(name, _)| name.as_str()).collect();
+        // At least some spam-associated tokens should appear
+        let has_spam_token = clue_names.iter().any(|t| {
+            t.contains("viagra") || t.contains("cheap") || t.contains("pills")
+                || t.contains("free") || t.contains("buy")
+        });
+        assert!(has_spam_token, "Expected spam tokens in clues, got: {:?}", clue_names);
+    }
+
+    #[test]
+    fn train_and_score_ham_message() {
+        let config = ClassifierConfig::default();
+        let mut classifier = Classifier::new(config);
+        let tokenizer = Tokenizer::with_defaults();
+
+        // Train spam
+        for msg in &[
+            make_message("Buy now!", "Cheap viagra pills online pharmacy"),
+            make_message("You won!", "Claim million dollar prize lottery winner"),
+        ] {
+            let tokens = tokenizer.tokenize(msg);
+            classifier.learn(tokens.into_iter(), true);
+        }
+
+        // Train ham
+        for msg in &[
+            make_message("Meeting", "Team meeting tomorrow at 10am in conference room"),
+            make_message("Code review", "Please review the pull request for the auth module"),
+        ] {
+            let tokens = tokenizer.tokenize(msg);
+            classifier.learn(tokens.into_iter(), false);
+        }
+
+        // Score a ham-like message
+        let test_msg = make_message(
+            "Sprint planning",
+            "Team standup and sprint planning tomorrow morning conference room",
+        );
+        let test_tokens = tokenizer.tokenize(&test_msg);
+        let result = classifier.spam_prob_with_evidence(test_tokens.into_iter());
+
+        // Score should lean toward ham (< 0.5)
+        assert!(
+            result.probability < 0.4,
+            "Expected ham probability < 0.4, got {}",
+            result.probability
+        );
+    }
+
+    #[test]
+    fn untrained_classifier_returns_neutral_score() {
+        let config = ClassifierConfig::default();
+        let classifier = Classifier::new(config);
+        let tokenizer = Tokenizer::with_defaults();
+
+        let msg = make_message("Hello", "This is a test message body");
+        let tokens = tokenizer.tokenize(&msg);
+        let result = classifier.spam_prob_with_evidence(tokens.into_iter());
+
+        // Untrained classifier gives 0.5 (neutral)
+        assert!(
+            (result.probability - 0.5).abs() < 1e-10,
+            "Expected 0.5, got {}",
+            result.probability
+        );
+        // No clues because all tokens are unknown (prob = 0.5, dist = 0)
+        assert_eq!(result.clues.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn training_same_messages_as_both_ham_and_spam_gives_neutral() {
+        // This reproduces the bug we saw: if ham:spam ratio is constant across all tokens
+        let config = ClassifierConfig::default();
+        let mut classifier = Classifier::new(config);
+        let tokenizer = Tokenizer::with_defaults();
+
+        let msg = make_message("Test", "Some common words here");
+        let tokens = tokenizer.tokenize(&msg);
+
+        // Train the exact same message as both ham and spam
+        classifier.learn(tokens.clone().into_iter(), false); // ham
+        classifier.learn(tokens.clone().into_iter(), true);  // spam
+
+        // Score should be neutral
+        let result = classifier.spam_prob_with_evidence(tokens.into_iter());
+        // With nham=1, nspam=1, and equal counts: prob should be ~0.5 for all tokens
+        assert!(
+            (result.probability - 0.5).abs() < 0.1,
+            "Expected near 0.5, got {}",
+            result.probability
+        );
+    }
+
+    #[test]
+    fn word_info_lookup_matches_clue_tokens() {
+        // Verify that token strings from clues can be looked up in word_info
+        let config = ClassifierConfig::default();
+        let mut classifier = Classifier::new(config);
+        let tokenizer = Tokenizer::with_defaults();
+
+        // Train with distinct content
+        let spam = make_message("SPAM", "viagra viagra viagra cheap pills");
+        let ham = make_message("HAM", "meeting project code review deploy");
+        classifier.learn(tokenizer.tokenize(&spam).into_iter(), true);
+        classifier.learn(tokenizer.tokenize(&ham).into_iter(), false);
+
+        // Score
+        let test = make_message("Test", "viagra meeting");
+        let tokens = tokenizer.tokenize(&test);
+        let result = classifier.spam_prob_with_evidence(tokens.into_iter());
+
+        let clues = result.clues.unwrap();
+        let word_info = classifier.word_info();
+
+        // Every clue token's bytes should be findable in word_info
+        for (token_str, _prob) in &clues {
+            let token_bytes = token_str.as_bytes().to_vec();
+            assert!(
+                word_info.contains_key(&token_bytes),
+                "Clue token '{}' not found in word_info",
+                token_str
+            );
         }
     }
 }
