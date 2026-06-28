@@ -64,6 +64,9 @@ const FOLDER_HOOK_TIMER_ID: usize = 0x5B03;
 /// Timer ID for folder-switch ribbon invalidation polling.
 const FOLDER_SWITCH_TIMER_ID: usize = 0x5B04;
 
+/// Timer ID for manager process exit detection and config reload.
+const MANAGER_WATCH_TIMER_ID: usize = 0x5B05;
+
 /// Last known folder EntryID for change detection.
 /// SAFETY: Only accessed from the COM STA thread.
 static mut LAST_FOLDER_ENTRY_ID: Option<String> = None;
@@ -228,7 +231,7 @@ unsafe extern "system" fn folder_hook_timer_proc(
     };
 
     let _ = std::fs::OpenOptions::new().append(true).create(true).open(&debug_path)
-        .and_then(|mut f| { use std::io::Write; writeln!(f, "folder_hook_timer_proc: FIRED") });
+        .and_then(|mut f| { use std::io::Write; writeln!(f, "folder_hook_timer_proc: FIRED (build: {})", env!("SPAMBAYES_BUILD_ID")) });
 
     let addin = GLOBAL_ADDIN_PTR;
     if addin.is_null() {
@@ -302,6 +305,56 @@ unsafe extern "system" fn folder_switch_timer_proc(
         // Invalidate ribbon so getVisible callbacks fire again
         AddinCore::invalidate_ribbon();
     }
+}
+
+/// Timer callback that checks if the manager subprocess has exited.
+/// When it exits, we reload the config from disk so that any changes made in
+/// the GUI take effect immediately without restarting Outlook.
+///
+/// Fires every 1s while the manager is running. Self-kills when no manager is active.
+unsafe extern "system" fn manager_watch_timer_proc(
+    _hwnd: windows::Win32::Foundation::HWND,
+    _msg: u32,
+    _id_event: usize,
+    _dw_time: u32,
+) {
+    let addin = GLOBAL_ADDIN_PTR;
+    if addin.is_null() {
+        return;
+    }
+    let addin = &mut *addin;
+
+    let manager_exited = match &mut addin.gtk_runtime {
+        Some(child) => {
+            match child.try_wait() {
+                Ok(Some(_status)) => true,  // Process exited
+                Ok(None) => false,          // Still running
+                Err(_) => true,             // Error — treat as exited
+            }
+        }
+        None => {
+            // No manager process — kill this timer
+            use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+            use windows::Win32::Foundation::HWND;
+            KillTimer(HWND::default(), MANAGER_WATCH_TIMER_ID).ok();
+            return;
+        }
+    };
+
+    if !manager_exited {
+        return; // Still running, check again on next tick
+    }
+
+    // Manager has exited — clear the handle and reload config
+    addin.gtk_runtime = None;
+
+    // Kill this timer since the manager is gone
+    use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+    use windows::Win32::Foundation::HWND;
+    KillTimer(HWND::default(), MANAGER_WATCH_TIMER_ID).ok();
+
+    // Reload configuration from disk
+    addin.reload_config_from_disk();
 }
 
 // ─── ext_ConnectMode ─────────────────────────────────────────────────────────
@@ -1225,6 +1278,12 @@ impl AddinCore {
                         Ok(child) => {
                             log::info!("Launched SpamBayes Manager for first-run (PID {})", child.id());
                             self.gtk_runtime = Some(child);
+                            // Start timer to detect manager exit and reload config
+                            unsafe {
+                                use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                                use windows::Win32::Foundation::HWND;
+                                SetTimer(HWND::default(), MANAGER_WATCH_TIMER_ID, 1000, Some(manager_watch_timer_proc));
+                            }
                         }
                         Err(e) => {
                             log::error!("Failed to launch manager for first-run: {e}");
@@ -1338,7 +1397,7 @@ impl AddinCore {
                   onAction="OnShowCluesClick"
                   getEnabled="GetShowCluesEnabled" />
           <button id="btnManager"
-                  label="Manager"
+                  label="SpamBayes Manager"
                   size="normal"
                   imageMso="DatabaseProperties"
                   onAction="OnManagerClick" />
@@ -1346,6 +1405,21 @@ impl AddinCore {
       </tab>
     </tabs>
   </ribbon>
+  <contextMenus>
+    <contextMenu idMso="ContextMenuMailItem">
+      <menuSeparator id="sepSpamBayes" />
+      <button id="ctxBtnSpam"
+              label="Spam"
+              image="delete_as_spam"
+              onAction="OnSpamClick"
+              getVisible="GetSpamVisible" />
+      <button id="ctxBtnNotSpam"
+              label="Not Spam"
+              image="recover_ham"
+              onAction="OnNotSpamClick"
+              getVisible="GetNotSpamVisible" />
+    </contextMenu>
+  </contextMenus>
 </customUI>"#.to_string()
     }
 
@@ -1413,6 +1487,10 @@ impl AddinCore {
                         Ok(child) => {
                             log::info!("Launched SpamBayes Manager (PID {})", child.id());
                             addin.gtk_runtime = Some(child);
+                            // Start timer to detect manager exit and reload config
+                            use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                            use windows::Win32::Foundation::HWND;
+                            SetTimer(HWND::default(), MANAGER_WATCH_TIMER_ID, 1000, Some(manager_watch_timer_proc));
                         }
                         Err(e) => {
                             log::error!("Failed to launch manager: {e}");
@@ -2198,32 +2276,137 @@ impl AddinCore {
                 None => return false,
             };
 
+            let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                    "is_in_spam_or_unsure_folder: current=({}, {})",
+                    current.store_id.0, current.entry_id.0) });
+
             // Check spam folder (case-insensitive)
             if let Some(spam_id) = &config.filter.spam_folder_id {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "  spam_folder=({}, {})",
+                        spam_id.store_id.0, spam_id.entry_id.0) });
                 if Self::folder_ids_equal(&current, spam_id) {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "  -> MATCH spam folder") });
                     return true;
                 }
             }
 
             // Check unsure folder (case-insensitive)
             if let Some(unsure_id) = &config.filter.unsure_folder_id {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "  unsure_folder=({}, {})",
+                        unsure_id.store_id.0, unsure_id.entry_id.0) });
                 if Self::folder_ids_equal(&current, unsure_id) {
+                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                        .and_then(|mut f| { use std::io::Write; writeln!(f, "  -> MATCH unsure folder") });
                     return true;
                 }
             }
+
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "  -> NO MATCH") });
 
             false
         }
     }
 
-    /// Compare two FolderIds case-insensitively.
+    /// Compare two FolderIds using MAPI CompareEntryIDs.
     ///
-    /// Outlook returns hex entry IDs in varying case, and the INI file may
-    /// store them differently. The Python version uses `CompareEntryIDs` which
-    /// compares binary data; we compare hex strings case-insensitively.
+    /// Outlook uses different entry ID formats (short-term vs long-term).
+    /// Simple string comparison fails because the INI may store short-term IDs
+    /// while the Object Model returns long-term IDs. MAPI's CompareEntryIDs
+    /// handles this correctly by comparing the underlying binary data.
+    ///
+    /// Falls back to case-insensitive hex string comparison if MAPI is unavailable.
     fn folder_ids_equal(a: &spambayes_config::FolderId, b: &spambayes_config::FolderId) -> bool {
-        a.store_id.0.eq_ignore_ascii_case(&b.store_id.0)
-            && a.entry_id.0.eq_ignore_ascii_case(&b.entry_id.0)
+        // Store IDs must match first (case-insensitive hex comparison is fine for store IDs)
+        if !a.store_id.0.eq_ignore_ascii_case(&b.store_id.0) {
+            return false;
+        }
+
+        // Try MAPI CompareEntryIDs for the entry IDs
+        unsafe {
+            let addin = GLOBAL_ADDIN_PTR;
+            if !addin.is_null() {
+                let addin = &mut *addin;
+                if let Some(ref mut session) = addin.mapi_session {
+                    // Decode both entry IDs from hex to bytes
+                    if let (Some(eid_a), Some(eid_b)) = (
+                        Self::hex_to_bytes(&a.entry_id.0),
+                        Self::hex_to_bytes(&b.entry_id.0),
+                    ) {
+                        // Decode store ID to open the store
+                        if let Some(store_eid) = Self::hex_to_bytes(&a.store_id.0) {
+                            if let Ok(store_ptr) = session.open_store(&store_eid) {
+                                return Self::mapi_compare_entry_ids(
+                                    store_ptr, &eid_a, &eid_b,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: case-insensitive hex comparison
+        a.entry_id.0.eq_ignore_ascii_case(&b.entry_id.0)
+    }
+
+    /// Decode a hex string to bytes.
+    fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+        let hex = hex.trim();
+        if hex.len() % 2 != 0 { return None; }
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    /// Call IMsgStore::CompareEntryIDs (vtable slot 16).
+    ///
+    /// Returns `true` if the two entry IDs refer to the same MAPI object.
+    unsafe fn mapi_compare_entry_ids(
+        store_ptr: *mut std::ffi::c_void,
+        eid_a: &[u8],
+        eid_b: &[u8],
+    ) -> bool {
+        // IMsgStore vtable layout:
+        //   IUnknown (0-2), IMAPIProp (3-13), IMsgStore (14+)
+        //   Slot 14: Advise, 15: Unadvise, 16: CompareEntryIDs, 17: OpenEntry
+        //
+        // We just read the function pointer at slot 16 from the vtable.
+        let vtbl_ptr = *(store_ptr as *const *const *const std::ffi::c_void);
+
+        // CompareEntryIDs is at slot 16
+        let compare_fn_ptr = *vtbl_ptr.add(16);
+        let compare_fn: unsafe extern "system" fn(
+            *mut std::ffi::c_void, u32, *const u8, u32, *const u8, u32, *mut u32,
+        ) -> i32 = std::mem::transmute(compare_fn_ptr);
+
+        let mut result: u32 = 0;
+        let hr = compare_fn(
+            store_ptr,
+            eid_a.len() as u32,
+            eid_a.as_ptr(),
+            eid_b.len() as u32,
+            eid_b.as_ptr(),
+            0, // flags
+            &mut result,
+        );
+
+        let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                "  CompareEntryIDs: hr=0x{:08X}, result={}", hr as u32, result) });
+
+        hr == 0 && result != 0
     }
 
     /// Get the FolderId of the currently displayed folder in the active Explorer.
@@ -2517,6 +2700,57 @@ impl AddinCore {
         }
     }
 
+    /// Reload configuration from disk after the manager subprocess exits.
+    ///
+    /// Re-reads the INI file and updates both the in-memory `self.config` and
+    /// the `FolderHookState` config so that filter settings (thresholds, actions,
+    /// calendar config, etc.) take effect immediately without restarting Outlook.
+    fn reload_config_from_disk(&mut self) {
+        let data_dir = Self::get_data_directory();
+        let profile_name = self.get_mapi_profile_name()
+            .unwrap_or_else(|| "default".to_string());
+
+        self.log_info(&format!(
+            "reload_config_from_disk: reloading from {}/{}.ini",
+            data_dir.display(), profile_name
+        ));
+
+        let new_config = match AppConfig::load(&data_dir, &profile_name) {
+            Ok(config) => config,
+            Err(e) => {
+                self.log_error(&format!(
+                    "reload_config_from_disk: failed to load config: {e}"
+                ));
+                return;
+            }
+        };
+
+        // Update the in-memory config
+        self.config = Some(new_config.clone());
+
+        // Update the config chain if we have one
+        if let Some(chain) = &mut self.config_chain {
+            *chain.config_mut() = new_config.clone();
+        }
+
+        // Update the FolderHookState so the live event handler picks up changes
+        if let Some(state_arc) = &self.folder_hook_state {
+            if let Ok(mut state) = state_arc.lock() {
+                state.config = new_config.clone();
+                self.log_info("reload_config_from_disk: FolderHookState updated");
+            } else {
+                self.log_error("reload_config_from_disk: FolderHookState lock poisoned");
+            }
+        }
+
+        self.log_info(&format!(
+            "reload_config_from_disk: complete (filter.enabled={}, calendar.enabled={}, spam_threshold={:.1})",
+            new_config.filter.enabled,
+            new_config.calendar.calendar_filtering_enabled,
+            new_config.filter.spam_threshold
+        ));
+    }
+
     /// Initialize the MAPI session.
     ///
     /// Returns `true` if MAPI initialized successfully, `false` otherwise.
@@ -2788,7 +3022,10 @@ impl AddinCore {
     fn setup_folder_hooks(&mut self) {
         let config = match &self.config {
             Some(c) => c.clone(),
-            None => return,
+            None => {
+                self.log_info("setup_folder_hooks: config is None, skipping");
+                return;
+            }
         };
 
         if !config.filter.enabled {

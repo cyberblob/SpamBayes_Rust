@@ -335,8 +335,15 @@ impl AdvancedTab {
         )));
         arch_label.set_halign(Align::Start);
 
+        let build_date_label = Label::new(Some(&format!(
+            "Build date: {}",
+            env!("SPAMBAYES_BUILD_ID")
+        )));
+        build_date_label.set_halign(Align::Start);
+
         env_box.append(&version_label);
         env_box.append(&arch_label);
+        env_box.append(&build_date_label);
         env_frame.set_child(Some(&env_box));
         content_box.append(&env_frame);
 

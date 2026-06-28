@@ -52,34 +52,38 @@ pub fn sanitize_profile_name(name: &str) -> String {
 
 /// Resolve the data directory for a given profile name.
 ///
-/// Default: `%APPDATA%\SpamBayes\<sanitized_profile_name>\`
+/// Default: `%LOCALAPPDATA%\SpamBayes\`
 /// Override: if `data_directory_override` is `Some` and non-empty, that path is used directly.
 ///
 /// The directory is created if it doesn't already exist.
 ///
+/// Note: Uses `%LOCALAPPDATA%` (not `%APPDATA%`) to match the addin's data directory.
+/// Profile name is no longer used as a subdirectory — all config lives in the
+/// single `%LOCALAPPDATA%\SpamBayes\` directory with profile-named INI files.
+///
 /// # Panics
 ///
-/// Panics if `APPDATA` is not set and no override is provided.
+/// Panics if `LOCALAPPDATA` is not set and no override is provided.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use spambayes_config::resolve_data_directory;
 ///
-/// // Uses %APPDATA%\SpamBayes\my_profile\
+/// // Uses %LOCALAPPDATA%\SpamBayes\
 /// let dir = resolve_data_directory("My Profile", None);
 ///
 /// // Uses the override path directly
 /// let dir = resolve_data_directory("My Profile", Some(r"C:\Custom\Path"));
 /// ```
 pub fn resolve_data_directory(profile_name: &str, data_directory_override: Option<&str>) -> PathBuf {
+    let _ = profile_name; // Profile name no longer used for subdirectory
     let path = match data_directory_override {
         Some(override_dir) if !override_dir.is_empty() => PathBuf::from(override_dir),
         _ => {
-            let appdata = std::env::var("APPDATA")
-                .expect("APPDATA environment variable is not set");
-            let sanitized = sanitize_profile_name(profile_name);
-            PathBuf::from(appdata).join("SpamBayes").join(sanitized)
+            let local_appdata = std::env::var("LOCALAPPDATA")
+                .expect("LOCALAPPDATA environment variable is not set");
+            PathBuf::from(local_appdata).join("SpamBayes")
         }
     };
 
@@ -96,7 +100,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Mutex to serialize tests that modify the APPDATA environment variable.
+    /// Mutex to serialize tests that modify the LOCALAPPDATA environment variable.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -169,28 +173,27 @@ mod tests {
     // ─── resolve_data_directory tests ───────────────────────────────────
 
     #[test]
-    fn resolve_data_directory_default_uses_appdata_and_profile_name() {
+    fn resolve_data_directory_default_uses_localappdata() {
         // Validates: Requirements 5.1
         let _lock = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let fake_appdata = tmp.path().to_str().unwrap().to_string();
+        let fake_localappdata = tmp.path().to_str().unwrap().to_string();
 
-        // Temporarily override APPDATA
-        let original = std::env::var("APPDATA").ok();
-        std::env::set_var("APPDATA", &fake_appdata);
+        // Temporarily override LOCALAPPDATA
+        let original = std::env::var("LOCALAPPDATA").ok();
+        std::env::set_var("LOCALAPPDATA", &fake_localappdata);
 
         let result = resolve_data_directory("My Profile", None);
 
-        // Restore APPDATA
+        // Restore LOCALAPPDATA
         match original {
-            Some(val) => std::env::set_var("APPDATA", val),
-            None => std::env::remove_var("APPDATA"),
+            Some(val) => std::env::set_var("LOCALAPPDATA", val),
+            None => std::env::remove_var("LOCALAPPDATA"),
         }
 
-        // Should be <APPDATA>/SpamBayes/<sanitized_profile_name>
-        let expected = PathBuf::from(&fake_appdata)
-            .join("SpamBayes")
-            .join("my_profile");
+        // Should be <LOCALAPPDATA>/SpamBayes (flat, no profile subdirectory)
+        let expected = PathBuf::from(&fake_localappdata)
+            .join("SpamBayes");
         assert_eq!(result, expected);
     }
 
@@ -227,22 +230,21 @@ mod tests {
         // Validates: Requirements 5.1
         let _lock = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let fake_appdata = tmp.path().to_str().unwrap().to_string();
+        let fake_localappdata = tmp.path().to_str().unwrap().to_string();
 
-        let original = std::env::var("APPDATA").ok();
-        std::env::set_var("APPDATA", &fake_appdata);
+        let original = std::env::var("LOCALAPPDATA").ok();
+        std::env::set_var("LOCALAPPDATA", &fake_localappdata);
 
         // Empty string override should behave as if no override was provided
         let result = resolve_data_directory("TestProfile", Some(""));
 
         match original {
-            Some(val) => std::env::set_var("APPDATA", val),
-            None => std::env::remove_var("APPDATA"),
+            Some(val) => std::env::set_var("LOCALAPPDATA", val),
+            None => std::env::remove_var("LOCALAPPDATA"),
         }
 
-        let expected = PathBuf::from(&fake_appdata)
-            .join("SpamBayes")
-            .join("testprofile");
+        let expected = PathBuf::from(&fake_localappdata)
+            .join("SpamBayes");
         assert_eq!(result, expected);
     }
 }

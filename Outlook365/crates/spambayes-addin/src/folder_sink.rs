@@ -10,8 +10,12 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Reentrancy guard: prevents processing a new event while a dialog is open.
+/// Only one calendar prompt (or filter action) runs at a time on the STA thread.
+static PROCESSING_EVENT: AtomicBool = AtomicBool::new(false);
 
 use windows::core::{GUID, HRESULT, PCWSTR};
 
@@ -19,7 +23,7 @@ use crate::com_invoke::{dispatch_get, dispatch_get_string, VariantArg};
 use crate::filter::{FilterEngine};
 use crate::notification::NotificationManager;
 
-use spambayes_config::{AppConfig, FolderId, GeneralConfig};
+use spambayes_config::{AppConfig, CalendarSpamAction, FolderId, GeneralConfig};
 use spambayes_core::Classification;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -148,6 +152,8 @@ pub struct FolderHook {
     cookie: u32,
     /// The folder name (for logging).
     pub folder_name: String,
+    /// If true, this hook only processes calendar items (no startup scan).
+    pub calendar_only: bool,
 }
 
 // SAFETY: FolderHook is only accessed from the COM STA thread.
@@ -199,6 +205,9 @@ struct FolderItemsSink {
     state: Arc<Mutex<FolderHookState>>,
     /// Name of the folder being watched (for logging).
     folder_name: String,
+    /// If true, only process calendar items (skip regular mail).
+    /// Used for the Inbox hook that exists solely for calendar filtering.
+    calendar_only: bool,
 }
 
 // SAFETY: FolderItemsSink is allocated on the heap and accessed via COM
@@ -289,31 +298,49 @@ unsafe extern "system" fn folder_sink_invoke(
     _excep: *mut c_void,
     _arg_err: *mut u32,
 ) -> HRESULT {
+    let debug_path = debug_log_path();
+
     if disp_id != DISPID_ITEM_ADD {
+        log_debug(&debug_path, &format!(
+            "[folder_sink_invoke] Non-ItemAdd event received: DISPID=0x{:X}", disp_id
+        ));
         return HRESULT(0); // S_OK — ignore other events
     }
+
+    log_debug(&debug_path, "[folder_sink_invoke] ItemAdd event received");
 
     let sink = &*(this as *const FolderItemsSink);
 
     // Extract the MailItem IDispatch pointer from the event arguments.
     // ItemAdd passes one argument: the new Item (VT_DISPATCH).
     if params.is_null() {
+        log_debug(&debug_path, "[folder_sink_invoke] params is NULL, ignoring");
         return HRESULT(0);
     }
     let dp = &*params;
     if dp.c_args == 0 || dp.rgvarg.is_null() {
+        log_debug(&debug_path, &format!(
+            "[folder_sink_invoke] No args: c_args={}, rgvarg_null={}",
+            dp.c_args, dp.rgvarg.is_null()
+        ));
         return HRESULT(0);
     }
 
     let arg = &*dp.rgvarg;
     if arg.vt != VT_DISPATCH {
+        log_debug(&debug_path, &format!(
+            "[folder_sink_invoke] Arg is not VT_DISPATCH: vt={}", arg.vt
+        ));
         return HRESULT(0);
     }
 
     let mail_item = *(arg.data.as_ptr().cast::<*mut c_void>());
     if mail_item.is_null() {
+        log_debug(&debug_path, "[folder_sink_invoke] mail_item pointer is NULL");
         return HRESULT(0);
     }
+
+    log_debug(&debug_path, "[folder_sink_invoke] Dispatching to handle_item_add");
 
     // Process the new item
     handle_item_add(sink, mail_item);
@@ -330,13 +357,53 @@ unsafe extern "system" fn folder_sink_invoke(
 unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
     let debug_path = debug_log_path();
 
+    // Reentrancy guard: if we're already processing an event (e.g., showing a
+    // dialog), skip this one. COM can pump messages while a MessageBox is open,
+    // causing new ItemAdd events to fire.
+    if PROCESSING_EVENT.swap(true, Ordering::SeqCst) {
+        log_debug(&debug_path, "  [SKIPPED] Already processing an event (reentrancy guard)");
+        return;
+    }
+    // Ensure the flag is cleared when we exit, even on early returns.
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PROCESSING_EVENT.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = Guard;
+
     // Get message properties for logging
-    let subject = dispatch_get_string(mail_item, "Subject")
+    let raw_subject = dispatch_get_string(mail_item, "Subject");
+    let raw_conv_topic = dispatch_get_string(mail_item, "ConversationTopic");
+    let subject = raw_subject.clone()
+        .or_else(|| raw_conv_topic.clone())
         .unwrap_or_else(|| "<no subject>".to_string());
     let sender = dispatch_get_string(mail_item, "SenderName")
+        .or_else(|| dispatch_get_string(mail_item, "Organizer"))
         .unwrap_or_else(|| "<unknown>".to_string());
     let msg_class = dispatch_get_string(mail_item, "MessageClass")
         .unwrap_or_else(|| "IPM.Note".to_string());
+
+    log_debug(&debug_path, &format!(
+        "  [DEBUG] raw Subject={:?}, ConversationTopic={:?}, resolved='{}'",
+        raw_subject, raw_conv_topic, subject
+    ));
+
+    // If this sink is calendar-only (Inbox hook), skip non-calendar items immediately
+    if sink.calendar_only {
+        let upper = msg_class.to_uppercase();
+        if !upper.starts_with("IPM.SCHEDULE.MEETING")
+            && !upper.starts_with("IPM.SCHEDULE.CANCELED")
+            && !upper.starts_with("IPM.APPOINTMENT")
+        {
+            // Not a calendar item — ignore silently (don't filter regular Inbox mail)
+            return;
+        }
+        log_debug(&debug_path, &format!(
+            "========== ItemAdd FIRED in '{}' (calendar-only hook) ==========", sink.folder_name
+        ));
+    }
 
     log_debug(&debug_path, &format!(
         "========== ItemAdd FIRED in '{}' ==========", sink.folder_name
@@ -344,6 +411,124 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
     log_debug(&debug_path, &format!("  Subject: {}", subject));
     log_debug(&debug_path, &format!("  Sender: {}", sender));
     log_debug(&debug_path, &format!("  MessageClass: {}", msg_class));
+
+    // ── Message class gate ──────────────────────────────────────────────────
+    // Only IPM.Note.* and IPM.Anti-Virus.* are regular mail. Anything else
+    // (calendar invites, delivery receipts, posts, etc.) needs special handling.
+    let upper_class = msg_class.to_uppercase();
+
+    log_debug(&debug_path, &format!("  MessageClass (raw): '{}'", msg_class));
+    log_debug(&debug_path, &format!("  MessageClass (upper): '{}'", upper_class));
+
+    let is_calendar_item = upper_class.starts_with("IPM.SCHEDULE.MEETING")
+        || upper_class.starts_with("IPM.SCHEDULE.CANCELED")
+        || upper_class.starts_with("IPM.APPOINTMENT");
+
+    log_debug(&debug_path, &format!("  is_calendar_item: {}", is_calendar_item));
+    log_debug(&debug_path, &format!(
+        "  starts_with IPM.SCHEDULE.MEETING: {}",
+        upper_class.starts_with("IPM.SCHEDULE.MEETING")
+    ));
+    log_debug(&debug_path, &format!(
+        "  starts_with IPM.SCHEDULE.CANCELED: {}",
+        upper_class.starts_with("IPM.SCHEDULE.CANCELED")
+    ));
+    log_debug(&debug_path, &format!(
+        "  starts_with IPM.APPOINTMENT: {}",
+        upper_class.starts_with("IPM.APPOINTMENT")
+    ));
+    log_debug(&debug_path, &format!(
+        "  starts_with IPM.NOTE: {}",
+        upper_class.starts_with("IPM.NOTE")
+    ));
+
+    if is_calendar_item {
+        log_debug(&debug_path, "  >> CALENDAR PATH: entering calendar handling");
+        // Re-read the CalendarConfig from the INI file on disk, because the
+        // in-memory config may be stale (the manager subprocess writes config
+        // changes to disk but the COM addin doesn't reload automatically).
+        let calendar_config = {
+            let data_dir = {
+                let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+                std::path::PathBuf::from(local_app_data).join("SpamBayes")
+            };
+
+            // Determine profile name from the state's config (general.data_directory
+            // is empty when using the default profile name)
+            let profile_name = {
+                let state = match sink.state.lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        log_debug(&debug_path, "ERROR: FolderHookState lock poisoned");
+                        return;
+                    }
+                };
+                // Use the profile name from the config chain or default
+                if state.config.general.data_directory.is_empty() {
+                    "default".to_string()
+                } else {
+                    state.config.general.data_directory.clone()
+                }
+            };
+
+            log_debug(&debug_path, &format!(
+                "  Reloading CalendarConfig from disk: dir={}, profile={}",
+                data_dir.display(), profile_name
+            ));
+
+            match spambayes_config::AppConfig::load(&data_dir, &profile_name) {
+                Ok(fresh_config) => {
+                    log_debug(&debug_path, &format!(
+                        "  Fresh CalendarConfig from disk: enabled={}, action={:?}",
+                        fresh_config.calendar.calendar_filtering_enabled,
+                        fresh_config.calendar.calendar_spam_action
+                    ));
+                    fresh_config.calendar
+                }
+                Err(e) => {
+                    log_debug(&debug_path, &format!(
+                        "  Failed to reload config from disk: {:?}, falling back to in-memory",
+                        e
+                    ));
+                    // Fall back to in-memory config
+                    let state = match sink.state.lock() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            log_debug(&debug_path, "ERROR: FolderHookState lock poisoned");
+                            return;
+                        }
+                    };
+                    state.config.calendar.clone()
+                }
+            }
+        };
+
+        log_debug(&debug_path, &format!(
+            "  CalendarConfig: enabled={}, action={:?}",
+            calendar_config.calendar_filtering_enabled,
+            calendar_config.calendar_spam_action
+        ));
+
+        if !calendar_config.calendar_filtering_enabled {
+            log_debug(&debug_path, "  Calendar item detected but calendar filtering is DISABLED, skipping");
+            return;
+        }
+
+        log_debug(&debug_path, &format!(
+            "  Calendar item detected, calendar filtering ENABLED (action: {:?})",
+            calendar_config.calendar_spam_action
+        ));
+        // Calendar filtering is enabled — fall through to classify the item
+        // and apply the calendar-specific action below.
+    } else if !upper_class.starts_with("IPM.NOTE") && !upper_class.starts_with("IPM.ANTI-VIRUS") {
+        // Non-mail, non-calendar item (e.g. delivery receipt, post, task)
+        log_debug(&debug_path, &format!(
+            "  >> NON-MAIL PATH: message class '{}' not recognized, skipping", msg_class
+        ));
+        return;
+    } else {
+        log_debug(&debug_path, "  >> MAIL PATH: proceeding with normal mail filtering");
+    }
 
     // Lock shared state — extract what we need quickly, then release
     let (filter_enabled, save_spam_info, general_config, filter_config) = {
@@ -456,6 +641,88 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
     }
 
     // Determine action based on classification (using local config copy)
+    // For calendar items with calendar filtering enabled, use the calendar-specific
+    // action instead of the normal filter action.
+    if is_calendar_item {
+        // Calendar-specific handling — re-read from disk (same logic as above)
+        let calendar_config = {
+            let data_dir = {
+                let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+                std::path::PathBuf::from(local_app_data).join("SpamBayes")
+            };
+            let profile_name = {
+                let state = match sink.state.lock() {
+                    Ok(s) => s,
+                    Err(_) => { return; }
+                };
+                if state.config.general.data_directory.is_empty() {
+                    "default".to_string()
+                } else {
+                    state.config.general.data_directory.clone()
+                }
+            };
+            spambayes_config::AppConfig::load(&data_dir, &profile_name)
+                .map(|c| c.calendar)
+                .unwrap_or_else(|_| {
+                    let state = sink.state.lock().unwrap();
+                    state.config.calendar.clone()
+                })
+        };
+
+        log_debug(&debug_path, &format!(
+            "  Calendar action phase: action={:?}", calendar_config.calendar_spam_action
+        ));
+
+        match result.classification {
+            Classification::Ham => {
+                log_debug(&debug_path, "  Calendar item classified as Ham, leaving in place");
+            }
+            Classification::Spam | Classification::Unsure => {
+                match calendar_config.calendar_spam_action {
+                    CalendarSpamAction::Prompt => {
+                        log_debug(&debug_path, "  Calendar spam action: PROMPT — showing dialog");
+                        let user_action = show_calendar_prompt(&subject, &sender);
+                        match user_action {
+                            CalendarPromptResult::Ham => {
+                                log_debug(&debug_path, "  User chose: Train as Ham (leave in place)");
+                            }
+                            CalendarPromptResult::Delete => {
+                                log_debug(&debug_path, "  User chose: Delete");
+                                delete_item(mail_item, &debug_path);
+                            }
+                            CalendarPromptResult::MoveToSpam => {
+                                if let Some(dest_folder_id) = &filter_config.spam_folder_id {
+                                    log_debug(&debug_path, "  User chose: Move to Spam");
+                                    move_item_to_folder(mail_item, dest_folder_id, &debug_path);
+                                } else {
+                                    log_debug(&debug_path, "  User chose: Move to Spam, but no spam folder configured");
+                                }
+                            }
+                            CalendarPromptResult::DoNothing => {
+                                log_debug(&debug_path, "  User chose: Do Nothing (leaving in place)");
+                            }
+                        }
+                    }
+                    CalendarSpamAction::Trash => {
+                        log_debug(&debug_path, "  Calendar spam action: TRASH (deleting item)");
+                        delete_item(mail_item, &debug_path);
+                    }
+                    CalendarSpamAction::Move => {
+                        if let Some(dest_folder_id) = &filter_config.spam_folder_id {
+                            log_debug(&debug_path, &format!(
+                                "  Calendar spam action: MOVE to spam folder (entry={}...)",
+                                &dest_folder_id.entry_id.0[..16.min(dest_folder_id.entry_id.0.len())]
+                            ));
+                            move_item_to_folder(mail_item, dest_folder_id, &debug_path);
+                        } else {
+                            log_debug(&debug_path, "  Calendar spam action: MOVE but no spam folder configured, leaving in place");
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+    // Normal mail action determination
     let (action, folder_id, mark_as_read) = match result.classification {
         Classification::Spam => (
             &filter_config.spam_action,
@@ -516,6 +783,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
             log_debug(&debug_path, "  Action: UNTOUCHED (leave in place)");
         }
     }
+    } // end else (normal mail path)
 
     // Fire notification
     if let Ok(state) = sink.state.lock() {
@@ -789,6 +1057,77 @@ pub unsafe fn move_item_to_folder(
     release_dispatch(namespace);
 }
 
+/// Delete a MailItem by calling MailItem.Delete().
+unsafe fn delete_item(mail_item: *mut c_void, debug_path: &str) {
+    match crate::com_invoke::dispatch_invoke_method(mail_item, "Delete", &[]) {
+        Ok(_) => {
+            log_debug(debug_path, "  Item deleted successfully");
+        }
+        Err(e) => {
+            log_debug(debug_path, &format!("  Failed to delete item: {:?}", e));
+        }
+    }
+}
+
+// ─── Calendar Prompt Dialog ──────────────────────────────────────────────────
+
+/// Result of the calendar spam prompt dialog.
+enum CalendarPromptResult {
+    /// User chose to treat as ham (not spam).
+    Ham,
+    /// User chose to delete the item.
+    Delete,
+    /// User chose to move to the spam folder.
+    MoveToSpam,
+    /// User chose to do nothing (leave in place, no training).
+    DoNothing,
+}
+
+/// Show a Win32 MessageBox prompting the user about a calendar item classified
+/// as spam. Uses a single Yes/No/Cancel dialog:
+///   - Yes = Delete (it's spam, get rid of it)
+///   - No = Keep (it's not spam, train as ham)
+///   - Cancel = Do Nothing (leave in place, don't train)
+///
+/// This is safe to call from the COM STA thread.
+fn show_calendar_prompt(subject: &str, sender: &str) -> CalendarPromptResult {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, IDNO,
+        MB_ICONWARNING, MB_YESNOCANCEL,
+    };
+
+    let title = "SpamBayes - Spam Calendar Invitation";
+    let message = format!(
+        "A calendar invitation has been classified as spam.\n\n\
+         Subject: {}\n\
+         From: {}\n\n\
+         ─────────────────────────────────\n\
+         [Yes]       Delete this item\n\
+         [No]        Keep it (not spam)\n\
+         [Cancel]   Do nothing\n\
+         ─────────────────────────────────",
+        subject, sender
+    );
+
+    let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let msg_w: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let result = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(msg_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_YESNOCANCEL | MB_ICONWARNING,
+        )
+    };
+
+    match result {
+        r if r == IDYES => CalendarPromptResult::Delete,
+        r if r == IDNO => CalendarPromptResult::Ham,
+        _ => CalendarPromptResult::DoNothing, // Cancel or closed
+    }
+}
 /// Copy a MailItem to a destination folder identified by FolderId.
 unsafe fn copy_item_to_folder(
     mail_item: *mut c_void,
@@ -883,6 +1222,9 @@ pub unsafe fn setup_folder_hooks(
     let mut hooks = Vec::new();
 
     log_debug(&debug_path, &format!(
+        "setup_folder_hooks: build={}", env!("SPAMBAYES_BUILD_ID")
+    ));
+    log_debug(&debug_path, &format!(
         "setup_folder_hooks: {} folders to watch", watch_folder_ids.len()
     ));
 
@@ -923,6 +1265,32 @@ pub unsafe fn setup_folder_hooks(
                     &folder_id.entry_id.0[..8.min(folder_id.entry_id.0.len())]
                 ));
             }
+        }
+    }
+
+    // If calendar filtering is enabled, also hook the Inbox (olFolderInbox = 6)
+    // because calendar meeting requests arrive in the Inbox, not Junk Email.
+    {
+        let calendar_enabled = match state.lock() {
+            Ok(s) => s.config.calendar.calendar_filtering_enabled,
+            Err(_) => false,
+        };
+
+        if calendar_enabled {
+            log_debug(&debug_path, "setup_folder_hooks: calendar filtering enabled, hooking Inbox for meeting requests");
+            match hook_default_folder(namespace, 6, Arc::clone(&state)) {
+                Some(hook) => {
+                    log_debug(&debug_path, &format!(
+                        "Watching Inbox '{}' for calendar items", hook.folder_name
+                    ));
+                    hooks.push(hook);
+                }
+                None => {
+                    log_debug(&debug_path, "setup_folder_hooks: failed to hook Inbox for calendar items");
+                }
+            }
+        } else {
+            log_debug(&debug_path, "setup_folder_hooks: calendar filtering disabled, not hooking Inbox");
         }
     }
 
@@ -976,6 +1344,13 @@ pub unsafe fn scan_existing_items(
     };
 
     for hook in hooks {
+        // Skip calendar-only hooks (Inbox) — don't scan existing items there
+        if hook.calendar_only {
+            log_debug(&debug_path, &format!(
+                "scan_existing_items: skipping '{}' (calendar-only hook)", hook.folder_name
+            ));
+            continue;
+        }
         scan_folder_items(
             &hook.items_ptr,
             &hook.folder_name,
@@ -1052,6 +1427,7 @@ unsafe fn scan_folder_items(
             ref_count: AtomicU32::new(1),
             state: Arc::clone(state),
             folder_name: folder_name.to_string(),
+            calendar_only: false,
         };
 
         handle_item_add(&temp_sink, item);
@@ -1111,7 +1487,7 @@ unsafe fn hook_single_folder(
     release_dispatch(folder);
 
     // Connect our sink to the Items collection's ItemsEvents connection point
-    let (cp_ptr, cookie) = match advise_items_event(items, state, &folder_name) {
+    let (cp_ptr, cookie) = match advise_items_event(items, state, &folder_name, false) {
         Some(result) => result,
         None => {
             log_debug(&debug_path, "hook_single_folder: advise failed");
@@ -1125,6 +1501,70 @@ unsafe fn hook_single_folder(
         connection_point: cp_ptr,
         cookie,
         folder_name,
+        calendar_only: false,
+    })
+}
+
+/// Hook a default Outlook folder by type constant (e.g., olFolderInbox = 6).
+///
+/// Uses Namespace.GetDefaultFolder(folder_type) to resolve the folder.
+unsafe fn hook_default_folder(
+    namespace: *mut c_void,
+    folder_type: i32,
+    state: Arc<Mutex<FolderHookState>>,
+) -> Option<FolderHook> {
+    let debug_path = debug_log_path();
+
+    // Namespace.GetDefaultFolder(folder_type)
+    let folder = match crate::com_invoke::dispatch_invoke_method(
+        namespace, "GetDefaultFolder", &[VariantArg::I4(folder_type)]
+    ) {
+        Ok(p) if !p.is_null() => p,
+        _ => {
+            log_debug(&debug_path, &format!(
+                "hook_default_folder: GetDefaultFolder({}) failed", folder_type
+            ));
+            return None;
+        }
+    };
+
+    // Get folder name for logging
+    let folder_name = dispatch_get_string(folder, "Name")
+        .unwrap_or_else(|| format!("DefaultFolder({})", folder_type));
+
+    log_debug(&debug_path, &format!(
+        "hook_default_folder: resolved to '{}'", folder_name
+    ));
+
+    // Get folder.Items collection
+    let items = match dispatch_get(folder, "Items") {
+        Ok(p) if !p.is_null() => p,
+        _ => {
+            log_debug(&debug_path, "hook_default_folder: cannot get Items collection");
+            release_dispatch(folder);
+            return None;
+        }
+    };
+
+    // Release the folder (we keep Items alive)
+    release_dispatch(folder);
+
+    // Connect our sink (calendar-only for default folder hooks)
+    let (cp_ptr, cookie) = match advise_items_event(items, state, &folder_name, true) {
+        Some(result) => result,
+        None => {
+            log_debug(&debug_path, "hook_default_folder: advise failed");
+            release_dispatch(items);
+            return None;
+        }
+    };
+
+    Some(FolderHook {
+        items_ptr: items,
+        connection_point: cp_ptr,
+        cookie,
+        folder_name,
+        calendar_only: true,
     })
 }
 
@@ -1135,6 +1575,7 @@ unsafe fn advise_items_event(
     items_ptr: *mut c_void,
     state: Arc<Mutex<FolderHookState>>,
     folder_name: &str,
+    calendar_only: bool,
 ) -> Option<(*mut c_void, u32)> {
     // QI for IConnectionPointContainer on the Items collection
     let vtbl = *(items_ptr as *const *const [usize; 3]);
@@ -1167,6 +1608,7 @@ unsafe fn advise_items_event(
         ref_count: AtomicU32::new(1),
         state,
         folder_name: folder_name.to_string(),
+        calendar_only,
     });
     let sink_ptr = Box::into_raw(sink) as *mut c_void;
 

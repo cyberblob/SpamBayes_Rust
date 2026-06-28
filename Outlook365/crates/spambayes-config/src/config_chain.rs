@@ -102,7 +102,17 @@ impl ConfigChain {
         let simple_profile_path = data_dir.join(format!("{sanitized}.ini"));
         match IniFile::read(&simple_profile_path) {
             Ok(data) => merge_ini_data(&mut merged, &data),
-            Err(ConfigError::FileNotFound(_)) => { /* normal — silently skip */ }
+            Err(ConfigError::FileNotFound(_)) => {
+                // Profile-specific INI not found — try default.ini as fallback
+                let default_ini_path = data_dir.join("default.ini");
+                match IniFile::read(&default_ini_path) {
+                    Ok(data) => merge_ini_data(&mut merged, &data),
+                    Err(ConfigError::FileNotFound(_)) => { /* no config at all — use built-in defaults */ }
+                    Err(e) => {
+                        eprintln!("Warning: error reading {}: {e}, skipping file", default_ini_path.display());
+                    }
+                }
+            }
             Err(ConfigError::ParseError { path, line, message }) => {
                 eprintln!(
                     "Warning: parse error in {} at line {}: {}, skipping file",
@@ -266,24 +276,24 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    /// Mutex to serialize tests that modify the APPDATA environment variable,
+    /// Mutex to serialize tests that modify the LOCALAPPDATA environment variable,
     /// since env vars are process-global.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    /// Helper: set APPDATA to a tempdir, run closure, then restore.
+    /// Helper: set LOCALAPPDATA to a tempdir, run closure, then restore.
     fn with_fake_appdata<F, R>(tmp: &std::path::Path, f: F) -> R
     where
         F: FnOnce() -> R,
     {
         let _lock = ENV_MUTEX.lock().unwrap();
-        let original = std::env::var("APPDATA").ok();
-        std::env::set_var("APPDATA", tmp.to_str().unwrap());
+        let original = std::env::var("LOCALAPPDATA").ok();
+        std::env::set_var("LOCALAPPDATA", tmp.to_str().unwrap());
 
         let result = f();
 
         match original {
-            Some(val) => std::env::set_var("APPDATA", val),
-            None => std::env::remove_var("APPDATA"),
+            Some(val) => std::env::set_var("LOCALAPPDATA", val),
+            None => std::env::remove_var("LOCALAPPDATA"),
         }
         result
     }
