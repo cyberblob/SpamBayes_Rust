@@ -1671,9 +1671,26 @@ impl AddinCore {
 
             // Move to destination folder (spam folder for spam, watch folder for ham)
             if let Some(ref folder_id) = dest_folder_id {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "train_as_{}: moving to folder (store={}, entry={}...)",
+                        label,
+                        &folder_id.store_id.0[..20.min(folder_id.store_id.0.len())],
+                        &folder_id.entry_id.0[..20.min(folder_id.entry_id.0.len())]
+                    ) });
+                // Mark the message as user-moved BEFORE the move, so the
+                // ItemAdd event on the destination folder will skip it.
+                // This is the Rust equivalent of Python's "train first, move second"
+                // pattern that prevents re-filtering.
+                crate::folder_sink::mark_as_user_moved(item, !is_spam);
                 crate::folder_sink::move_item_to_folder(
                     item, folder_id, &debug_path,
                 );
+            } else {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "train_as_{}: NO destination folder configured, message stays in place", label
+                    ) });
             }
 
             Self::release_dispatch(item);

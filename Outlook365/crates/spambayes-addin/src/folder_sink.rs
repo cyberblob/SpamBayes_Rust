@@ -17,6 +17,78 @@ use std::sync::{Arc, Mutex};
 /// Only one calendar prompt (or filter action) runs at a time on the STA thread.
 static PROCESSING_EVENT: AtomicBool = AtomicBool::new(false);
 
+/// Set of message identifiers (Subject + SenderName hash) recently moved by
+/// user action (train as ham/spam). Messages in this set are skipped by
+/// `handle_item_add` to avoid re-filtering after a deliberate move.
+/// The Python version uses a message database keyed by PR_SEARCH_KEY;
+/// we use a simple in-memory set that's cleared periodically.
+///
+/// The value is `true` if moved as ham (Not Spam), `false` if moved as spam.
+/// Only ham moves should skip re-filtering; spam moves that bounce back
+/// need to be re-moved to the spam folder.
+static RECENTLY_MOVED: std::sync::LazyLock<Mutex<std::collections::HashMap<String, bool>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Record that a message was moved by user action (to skip re-filtering).
+/// `is_ham` = true means "Not Spam" (should stay in watch folder if it bounces back).
+/// `is_ham` = false means "Spam" (should be re-moved to spam if it bounces back).
+pub fn mark_as_user_moved(mail_item: *mut c_void, is_ham: bool) {
+    unsafe {
+        let key = get_message_identity(mail_item);
+        if let Some(k) = key {
+            if let Ok(mut map) = RECENTLY_MOVED.lock() {
+                let _ = map.insert(k, is_ham);
+            }
+        }
+    }
+}
+
+/// Check if a message was recently moved by user action as ham (Not Spam).
+/// Returns true only for ham moves — these should be skipped.
+/// Spam moves that bounce back are NOT skipped (they need re-moving).
+fn was_user_moved_as_ham(mail_item: *mut c_void) -> bool {
+    unsafe {
+        let key = get_message_identity(mail_item);
+        if let Some(k) = key {
+            if let Ok(map) = RECENTLY_MOVED.lock() {
+                return map.get(&k).copied() == Some(true);
+            }
+        }
+    }
+    false
+}
+
+/// Remove a message from the recently-moved map (after it's been handled).
+fn clear_user_moved(mail_item: *mut c_void) {
+    unsafe {
+        let key = get_message_identity(mail_item);
+        if let Some(k) = key {
+            if let Ok(mut map) = RECENTLY_MOVED.lock() {
+                map.remove(&k);
+            }
+        }
+    }
+}
+
+/// Get a stable identity for a message that survives moves.
+/// Uses InternetMessageId (Message-ID header) which is unique and immutable.
+/// Falls back to Subject + SenderName + Size as a composite key.
+unsafe fn get_message_identity(mail_item: *mut c_void) -> Option<String> {
+    // Try PR_INTERNET_MESSAGE_ID first (most reliable, doesn't change on move)
+    if let Some(msg_id) = dispatch_get_string(mail_item, "InternetMessageId") {
+        if !msg_id.is_empty() {
+            return Some(msg_id);
+        }
+    }
+    // Fallback: composite key from Subject + SenderName + Size
+    let subject = dispatch_get_string(mail_item, "Subject").unwrap_or_default();
+    let sender = dispatch_get_string(mail_item, "SenderName").unwrap_or_default();
+    if subject.is_empty() && sender.is_empty() {
+        return None;
+    }
+    Some(format!("{}|{}", subject, sender))
+}
+
 use windows::core::{GUID, HRESULT, PCWSTR};
 
 use crate::com_invoke::{dispatch_get, dispatch_get_string, VariantArg};
@@ -553,6 +625,65 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         return;
     }
 
+    // Skip messages that have already been scored/trained.
+    // When the user clicks "Not Spam" and the message is moved back to the
+    // watch folder, ItemAdd fires again. The message already has a score
+    // property set from its original classification, so we skip it to avoid
+    // duplicates or re-filtering trained messages.
+    //
+    // However, if the message was previously classified as spam/unsure but
+    // ended up back in the watch folder (Exchange server-side rules undid
+    // our move), we need to re-move it to the correct SpamBayes folder.
+    if check_has_score(mail_item, &general_config.field_score_name) {
+        // Check if this was a user-initiated ham move (Not Spam button)
+        if was_user_moved_as_ham(mail_item) {
+            log_debug(&debug_path, "  Message already scored AND was user-moved as ham, skipping");
+            clear_user_moved(mail_item);
+            return;
+        }
+
+        let existing_score = get_score_value(mail_item, &general_config.field_score_name);
+        if let Some(score) = existing_score {
+            if score >= filter_config.spam_threshold {
+                // Was spam — re-move to spam folder
+                log_debug(&debug_path, &format!(
+                    "  Bounce-back detected: score {:.1}% (spam), re-moving to spam folder",
+                    score
+                ));
+                if let Some(dest) = &filter_config.spam_folder_id {
+                    move_item_to_folder(mail_item, dest, &debug_path);
+                }
+                return;
+            } else if score >= filter_config.unsure_threshold {
+                // Was unsure — re-move to unsure folder
+                log_debug(&debug_path, &format!(
+                    "  Bounce-back detected: score {:.1}% (unsure), re-moving to unsure folder",
+                    score
+                ));
+                if let Some(dest) = &filter_config.unsure_folder_id {
+                    move_item_to_folder(mail_item, dest, &debug_path);
+                }
+                return;
+            }
+        }
+
+        // Score is ham or couldn't read score — just skip
+        log_debug(&debug_path, &format!(
+            "  Message already has score field '{}', classified as ham — skipping",
+            general_config.field_score_name
+        ));
+        return;
+    }
+
+    // Skip messages that were just moved by user as ham (Not Spam button).
+    // Spam moves that bounce back are handled by the score-check above
+    // which will re-move them to the correct folder.
+    if was_user_moved_as_ham(mail_item) {
+        log_debug(&debug_path, "  Message was recently moved by user as ham, skipping");
+        clear_user_moved(mail_item);
+        return;
+    }
+
     // Get the raw message content via MailItem MIME content.
     // Use PropertyAccessor to get the PR_TRANSPORT_MESSAGE_HEADERS + Body,
     // or use the MIME content property.
@@ -609,6 +740,15 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 return;
             }
         };
+        // Log classifier state for debugging score discrepancies
+        {
+            if let Ok(c) = filter_engine.classifier().lock() {
+                log_debug(&debug_path, &format!(
+                    "  Classifier state: nham={}, nspam={}, word_info_size={}",
+                    c.nham(), c.nspam(), c.word_info().len()
+                ));
+            }
+        }
         match filter_engine.classify_raw(&message_bytes) {
             Ok(r) => r,
             Err(e) => {
@@ -2032,4 +2172,26 @@ unsafe fn check_has_score(mail_item: *mut c_void, score_field: &str) -> bool {
     // Property exists — check if it has a value
     release_dispatch(prop);
     true
+}
+
+/// Get the numeric score value from a MailItem's UserProperties.
+/// Returns None if the property doesn't exist or can't be read as a number.
+unsafe fn get_score_value(mail_item: *mut c_void, score_field: &str) -> Option<f64> {
+    let user_props = match dispatch_get(mail_item, "UserProperties") {
+        Ok(p) if !p.is_null() => p,
+        _ => return None,
+    };
+
+    let prop = dispatch_invoke_with_bstr(user_props, "Find", score_field);
+    release_dispatch(user_props);
+
+    if prop.is_null() {
+        return None;
+    }
+
+    // Read the Value property as a string and parse as f64
+    let value_str = dispatch_get_string(prop, "Value");
+    release_dispatch(prop);
+
+    value_str.and_then(|s| s.parse::<f64>().ok())
 }

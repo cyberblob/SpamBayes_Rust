@@ -379,6 +379,11 @@ impl FilterEngine {
         self.config.enabled
     }
 
+    /// Returns a reference to the classifier Arc for inspection.
+    pub fn classifier(&self) -> &Arc<Mutex<Classifier>> {
+        &self.classifier
+    }
+
     /// Returns the current spam threshold (as a percentage).
     #[must_use]
     pub fn spam_threshold(&self) -> f64 {
