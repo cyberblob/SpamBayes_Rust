@@ -32,11 +32,18 @@ use std::path::Path;
 use spambayes_config::{AppConfig, FolderId};
 use spambayes_mapi::{Folder, MessageStoreOps, MsgStoreError};
 
+use crate::help_content::sections;
+use crate::help_content::tooltips::WIZARD_TOOLTIPS;
+use crate::help_content::HelpEntry;
+use crate::help_dialog::show_help;
+use crate::tooltip_manager::TooltipManager;
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EndDialog, MessageBoxW, MB_ICONERROR, MB_OK, WM_CLOSE, WM_COMMAND,
-    WM_INITDIALOG,
+    EndDialog, MessageBoxW, SetDlgItemTextW, MB_ICONERROR, MB_OK, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_INITDIALOG,
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -46,6 +53,9 @@ const DEFAULT_SPAM_FOLDER_NAME: &str = "Junk E-Mail";
 
 /// Default name for the unsure destination folder.
 const DEFAULT_UNSURE_FOLDER_NAME: &str = "Junk Suspects";
+
+/// WM_HELP message constant (sent when F1 is pressed in a dialog).
+const WM_HELP: u32 = 0x0053;
 
 // Dialog control IDs (will be defined in resource file; placeholders here).
 #[allow(dead_code)]
@@ -58,6 +68,18 @@ const IDC_NEXT: u16 = 2002;
 const IDC_CANCEL: u16 = 2003;
 #[allow(dead_code)]
 const IDC_FINISH: u16 = 2004;
+
+// ─── Wizard Inline Help Label Control ID ─────────────────────────────────────
+//
+// Static text control that displays page-specific explanatory text.
+// Content is updated from `help_content::sections::WIZARD_*` entries
+// during page transitions.
+//
+// **Validates: Requirements 2.2, 2.3**
+
+/// Inline help label for the current wizard page description.
+#[allow(dead_code)]
+const IDC_WIZARD_PAGE_DESCRIPTION: u16 = 2010;
 
 // ─── Wizard Page ─────────────────────────────────────────────────────────────
 
@@ -325,6 +347,10 @@ pub struct ConfigWizard {
     state: WizardState,
     /// Dialog handle (set when the dialog is created).
     hwnd: HWND,
+    /// Tooltip manager for wizard navigation controls.
+    ///
+    /// Created during WM_INITDIALOG, destroyed on WM_DESTROY.
+    tooltip_manager: Option<TooltipManager>,
 }
 
 impl ConfigWizard {
@@ -336,6 +362,7 @@ impl ConfigWizard {
         Self {
             state: WizardState::new_with_receive_folders(receive_folder_ids),
             hwnd: HWND::default(),
+            tooltip_manager: None,
         }
     }
 
@@ -619,6 +646,25 @@ impl ConfigWizard {
             WM_INITDIALOG => {
                 // Store the wizard pointer in the dialog's user data.
                 // In a real implementation we'd use SetWindowLongPtrW.
+
+                // Create tooltip manager and register wizard tooltips.
+                let instance = GetModuleHandleW(None).unwrap_or_default();
+                let tooltip_mgr = TooltipManager::new(hwnd, instance.into());
+                tooltip_mgr.register_tooltips(hwnd, WIZARD_TOOLTIPS);
+
+                // Store the tooltip manager on the ConfigWizard instance.
+                // In a full implementation, retrieve the wizard pointer from
+                // lparam (passed via CreateDialogParamW) and store the manager:
+                // let wizard = &mut *(_lparam.0 as *mut ConfigWizard);
+                // wizard.tooltip_manager = Some(tooltip_mgr);
+                //
+                // For now, the tooltip_mgr lives until the dialog closes
+                // because the ConfigWizard owns it via the struct field.
+                let wizard_ptr = _lparam.0 as *mut ConfigWizard;
+                if !wizard_ptr.is_null() {
+                    (*wizard_ptr).tooltip_manager = Some(tooltip_mgr);
+                }
+
                 1 // Return TRUE to accept default focus
             }
             WM_COMMAND => {
@@ -645,9 +691,36 @@ impl ConfigWizard {
                     _ => 0,
                 }
             }
+            WM_DESTROY => {
+                // Destroy tooltip manager to clean up the tooltip control window.
+                let wizard_ptr = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+                ) as *mut ConfigWizard;
+                if !wizard_ptr.is_null() {
+                    if let Some(ref tooltip_mgr) = (*wizard_ptr).tooltip_manager {
+                        tooltip_mgr.destroy();
+                    }
+                    (*wizard_ptr).tooltip_manager = None;
+                }
+                0
+            }
             WM_CLOSE => {
                 let _ = EndDialog(hwnd, 0);
                 0
+            }
+            WM_HELP => {
+                // Show page-specific help for the current wizard step.
+                // Retrieve the wizard pointer from user data to get the current page.
+                let wizard_ptr = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+                ) as *const ConfigWizard;
+                if !wizard_ptr.is_null() {
+                    let entry = Self::help_entry_for_page((*wizard_ptr).state.current_page);
+                    show_help(hwnd, entry);
+                }
+                1 // Handled
             }
             _ => 0,
         }
@@ -662,6 +735,56 @@ impl ConfigWizard {
     /// Returns a mutable reference to the wizard state.
     pub fn state_mut(&mut self) -> &mut WizardState {
         &mut self.state
+    }
+
+    // ─── Wizard Inline Help Label Infrastructure ─────────────────────────────
+
+    /// Return the `HelpEntry` for a given wizard page.
+    ///
+    /// Maps each wizard page to its corresponding help content constant
+    /// from `help_content::sections`. Used by the WM_HELP handler and
+    /// the inline page description updater.
+    ///
+    /// **Validates: Requirements 2.2, 3.5**
+    #[must_use]
+    fn help_entry_for_page(page: WizardPage) -> &'static HelpEntry {
+        match page {
+            WizardPage::Welcome => &sections::WIZARD_WELCOME,
+            WizardPage::WatchFolders => &sections::WIZARD_WATCH_FOLDERS,
+            WizardPage::SpamFolder => &sections::WIZARD_SPAM_FOLDER,
+            WizardPage::UnsureFolder => &sections::WIZARD_UNSURE_FOLDER,
+            WizardPage::TrainingFolders => &sections::WIZARD_TRAINING_FOLDERS,
+            WizardPage::Finish => &sections::WIZARD_FINISH,
+        }
+    }
+
+    /// Update the wizard page description label with help content for the
+    /// current page.
+    ///
+    /// Called during page transitions (when the user clicks Next or Back)
+    /// to display explanatory text about what the current wizard step
+    /// configures and why.
+    ///
+    /// **Validates: Requirements 2.2, 2.3**
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `hwnd` is a valid dialog window handle.
+    // TODO: Call this function from the page transition logic (IDC_NEXT / IDC_BACK
+    // handlers) once the full wizard dialog implementation is in place.
+    #[allow(dead_code)]
+    unsafe fn update_page_help_text(hwnd: HWND, page: WizardPage) {
+        let entry = Self::help_entry_for_page(page);
+        let wide: Vec<u16> = entry
+            .description
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = SetDlgItemTextW(
+            hwnd,
+            i32::from(IDC_WIZARD_PAGE_DESCRIPTION),
+            PCWSTR::from_raw(wide.as_ptr()),
+        );
     }
 }
 

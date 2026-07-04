@@ -29,6 +29,13 @@ static PROCESSING_EVENT: AtomicBool = AtomicBool::new(false);
 static RECENTLY_MOVED: std::sync::LazyLock<Mutex<std::collections::HashMap<String, bool>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Tracks messages recently moved by the filter engine (not user action).
+/// Used for bounce-back detection on Exchange/Outlook.com/Hotmail stores
+/// where we cannot persist the score to the message's UserProperties.
+/// Key: message identity, Value: score percentage at time of filtering.
+static RECENTLY_FILTERED: std::sync::LazyLock<Mutex<std::collections::HashMap<String, f64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 /// Record that a message was moved by user action (to skip re-filtering).
 /// `is_ham` = true means "Not Spam" (should stay in watch folder if it bounces back).
 /// `is_ham` = false means "Spam" (should be re-moved to spam if it bounces back).
@@ -68,6 +75,33 @@ fn clear_user_moved(mail_item: *mut c_void) {
             }
         }
     }
+}
+
+/// Record that a message was moved by the filter engine (for bounce-back detection
+/// on Exchange stores that don't support persisting scores to UserProperties).
+fn mark_as_filter_moved(mail_item: *mut c_void, score_pct: f64) {
+    unsafe {
+        let key = get_message_identity(mail_item);
+        if let Some(k) = key {
+            if let Ok(mut map) = RECENTLY_FILTERED.lock() {
+                let _ = map.insert(k, score_pct);
+            }
+        }
+    }
+}
+
+/// Check if a message was recently moved by the filter engine.
+/// Returns the score if found, None otherwise.
+fn get_filter_moved_score(mail_item: *mut c_void) -> Option<f64> {
+    unsafe {
+        let key = get_message_identity(mail_item);
+        if let Some(k) = key {
+            if let Ok(map) = RECENTLY_FILTERED.lock() {
+                return map.get(&k).copied();
+            }
+        }
+    }
+    None
 }
 
 /// Get a stable identity for a message that survives moves.
@@ -684,6 +718,34 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         return;
     }
 
+    // Bounce-back detection for Exchange/Outlook.com/Hotmail stores where
+    // the score couldn't be persisted to UserProperties. If we recently
+    // filter-moved this message, use the in-memory score to re-move it.
+    if let Some(score) = get_filter_moved_score(mail_item) {
+        if score >= filter_config.spam_threshold {
+            log_debug(&debug_path, &format!(
+                "  Bounce-back detected (in-memory): score {:.1}% (spam), re-moving to spam folder",
+                score
+            ));
+            if let Some(dest) = &filter_config.spam_folder_id {
+                move_item_to_folder(mail_item, dest, &debug_path);
+            }
+            return;
+        } else if score >= filter_config.unsure_threshold {
+            log_debug(&debug_path, &format!(
+                "  Bounce-back detected (in-memory): score {:.1}% (unsure), re-moving to unsure folder",
+                score
+            ));
+            if let Some(dest) = &filter_config.unsure_folder_id {
+                move_item_to_folder(mail_item, dest, &debug_path);
+            }
+            return;
+        }
+        // Score was ham — message should stay in watch folder
+        log_debug(&debug_path, "  Previously filtered as ham (in-memory), skipping");
+        return;
+    }
+
     // Get the raw message content via MailItem MIME content.
     // Use PropertyAccessor to get the PR_TRANSPORT_MESSAGE_HEADERS + Body,
     // or use the MIME content property.
@@ -775,9 +837,15 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         filter_config.spam_threshold, filter_config.unsure_threshold
     ));
 
-    // Save score to the message if configured
-    if save_spam_info {
-        save_score_to_item(mail_item, &general_config, result.score_pct);
+    // Detect whether the source store is Exchange/Outlook.com/Hotmail.
+    // These online stores don't support saving custom properties back, and
+    // modifying a message in the Exchange "Junk Email" folder can trigger
+    // server-side re-evaluation that bounces it back.
+    let is_online_store = is_exchange_or_online_store(mail_item);
+    let should_save_score = save_spam_info && !is_online_store;
+
+    if is_online_store && save_spam_info {
+        log_debug(&debug_path, "  Skipping score save: Exchange/Outlook.com/Hotmail store detected");
     }
 
     // Determine action based on classification (using local config copy)
@@ -899,6 +967,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                     classification_name,
                     &dest_folder_id.entry_id.0[..16.min(dest_folder_id.entry_id.0.len())]
                 ));
+                // Track in memory for bounce-back detection on Exchange stores
+                // where we can't persist the score to UserProperties.
+                if is_online_store {
+                    mark_as_filter_moved(mail_item, result.score_pct);
+                }
                 move_item_to_folder(mail_item, dest_folder_id, &debug_path);
             } else {
                 log_debug(&debug_path, &format!(
@@ -912,6 +985,9 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 log_debug(&debug_path, &format!(
                     "  Action: COPY to {} folder", classification_name
                 ));
+                if is_online_store {
+                    mark_as_filter_moved(mail_item, result.score_pct);
+                }
                 copy_item_to_folder(mail_item, dest_folder_id, &debug_path);
             } else {
                 log_debug(&debug_path, &format!(
@@ -923,6 +999,17 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
             log_debug(&debug_path, "  Action: UNTOUCHED (leave in place)");
         }
     }
+
+    // Save score AFTER the move, not before.
+    // Saving before the move modifies the message in the Exchange-managed
+    // source folder (e.g. "Junk Email"), which can trigger server-side
+    // re-evaluation and bounce the message back.
+    // For Exchange/Outlook.com/Hotmail stores, skip entirely — these
+    // platforms don't support saving custom UserProperties.
+    if should_save_score {
+        save_score_to_item(mail_item, &general_config, result.score_pct);
+    }
+
     } // end else (normal mail path)
 
     // Fire notification
@@ -1071,6 +1158,81 @@ unsafe fn get_transport_headers(mail_item: *mut c_void) -> Option<String> {
     let s = String::from_utf16_lossy(slice);
     SysFreeString(bstr_ptr as *mut u16);
     Some(s)
+}
+
+/// Detect whether the mail item resides in an Exchange, Outlook.com, or Hotmail store.
+///
+/// These online stores do not reliably support saving custom user properties
+/// back to messages. Additionally, modifying a message in an Exchange-managed
+/// folder (like "Junk Email") can trigger server-side rule re-evaluation and
+/// cause bounce-back loops.
+///
+/// Detection strategy: check `MailItem.Parent.Store.ExchangeStoreType`.
+/// If the property exists and is non-zero (olExchangeMailbox=1, olExchangePublicFolder=2,
+/// olPrimaryExchangeMailbox=3, olAdditionalExchangeMailbox=4), it's an Exchange store.
+/// Outlook.com and Hotmail accounts also present as Exchange stores in Outlook.
+unsafe fn is_exchange_or_online_store(mail_item: *mut c_void) -> bool {
+    // Navigate: MailItem → Parent (folder) → Store → ExchangeStoreType
+    let parent = match dispatch_get(mail_item, "Parent") {
+        Ok(p) if !p.is_null() => p,
+        _ => return false,
+    };
+
+    let store = match dispatch_get(parent, "Store") {
+        Ok(s) if !s.is_null() => {
+            release_dispatch(parent);
+            s
+        }
+        _ => {
+            release_dispatch(parent);
+            return false;
+        }
+    };
+
+    // ExchangeStoreType: 0 = olNotExchange, 1+ = some form of Exchange
+    let exchange_type = get_long_property(store, "ExchangeStoreType");
+    release_dispatch(store);
+
+    // Any non-zero value means Exchange/Outlook.com/Hotmail
+    exchange_type.unwrap_or(0) != 0
+}
+
+/// Get a Long (i32) property from an IDispatch object by name.
+///
+/// Returns None if the property doesn't exist or can't be read.
+unsafe fn get_long_property(obj: *mut c_void, name: &str) -> Option<i32> {
+    let dispid = get_dispid_on(obj, name)?;
+    let vtbl = *(obj as *const *const IDispatchVtblRaw);
+
+    let mut params = DispParams {
+        rgvarg: ptr::null_mut(),
+        rgdispid_named_args: ptr::null_mut(),
+        c_args: 0,
+        c_named_args: 0,
+    };
+
+    let mut result_var = Variant::default();
+    let hr = ((*vtbl).invoke)(
+        obj,
+        dispid,
+        &GUID::from_u128(0),
+        0,
+        2, // DISPATCH_PROPERTYGET
+        &raw mut params,
+        &raw mut result_var,
+        ptr::null_mut(),
+        ptr::null_mut(),
+    );
+
+    if hr.0 != 0 {
+        return None;
+    }
+
+    // VT_I4 = 3, VT_INT = 22 — accept either
+    match result_var.vt {
+        3 | 22 => Some(*(result_var.data.as_ptr().cast::<i32>())),
+        _ => None,
+    }
 }
 
 /// Save the spam score to the message's custom property field.

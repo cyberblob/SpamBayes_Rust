@@ -21,6 +21,7 @@ use std::rc::Rc;
 use spambayes_config::{FilterAction, FolderId};
 
 use crate::gui::folder_browser::{FolderBrowserDialog, FolderProvider, SelectionMode};
+use crate::help_content::errors;
 use crate::manager_dlg::ManagerState;
 
 // ─── Helper: map FilterAction to ComboBoxText index ──────────────────────────
@@ -156,6 +157,9 @@ impl FilteringTab {
         watched_folders_label.set_wrap(true);
 
         let watched_folders_browse_btn = Button::with_label("Browse...");
+        watched_folders_browse_btn.set_tooltip_text(Some(
+            "Select which folders to monitor for incoming mail."
+        ));
 
         watched_row.append(&watched_folders_label);
         watched_row.append(&watched_folders_browse_btn);
@@ -184,6 +188,10 @@ impl FilteringTab {
         let spam_scale = Scale::new(Orientation::Horizontal, Some(&spam_adj));
         spam_scale.set_hexpand(true);
         spam_scale.set_digits(1);
+        spam_scale.set_tooltip_text(Some(
+            "Set the score above which messages are classified as spam. \
+             Higher values are more strict (fewer false positives)."
+        ));
 
         let spam_entry = Entry::new();
         spam_entry.set_width_chars(6);
@@ -212,6 +220,7 @@ impl FilteringTab {
         spam_action_combo.append_text("Copied to specified folder");
         spam_action_combo.append_text("Untouched");
         spam_action_combo.set_active(Some(action_to_index(&state.spam_action)));
+        spam_action_combo.set_tooltip_text(Some("Choose what to do with spam messages."));
 
         spam_action_row.append(&spam_action_label);
         spam_action_row.append(&spam_action_combo);
@@ -233,6 +242,7 @@ impl FilteringTab {
         }
 
         let spam_folder_browse_btn = Button::with_label("Browse...");
+        spam_folder_browse_btn.set_tooltip_text(Some("Select the spam destination folder."));
 
         spam_folder_row.append(&spam_folder_label);
         spam_folder_row.append(&spam_folder_entry);
@@ -257,6 +267,9 @@ impl FilteringTab {
         // TODO: Wire to config when ManagerState is extended with spam_mark_as_read
         let spam_mark_read = CheckButton::with_label("Mark spam as read");
         spam_mark_read.set_active(false); // Default: not marked as read
+        spam_mark_read.set_tooltip_text(Some(
+            "Automatically mark messages classified as spam as read."
+        ));
         spam_box.append(&spam_mark_read);
 
         spam_frame.set_child(Some(&spam_box));
@@ -282,6 +295,9 @@ impl FilteringTab {
         let unsure_scale = Scale::new(Orientation::Horizontal, Some(&unsure_adj));
         unsure_scale.set_hexpand(true);
         unsure_scale.set_digits(1);
+        unsure_scale.set_tooltip_text(Some(
+            "Set the score above which messages are classified as unsure."
+        ));
 
         let unsure_entry = Entry::new();
         unsure_entry.set_width_chars(6);
@@ -310,6 +326,7 @@ impl FilteringTab {
         unsure_action_combo.append_text("Copied to specified folder");
         unsure_action_combo.append_text("Untouched");
         unsure_action_combo.set_active(Some(action_to_index(&state.unsure_action)));
+        unsure_action_combo.set_tooltip_text(Some("Choose what to do with unsure messages."));
 
         unsure_action_row.append(&unsure_action_label);
         unsure_action_row.append(&unsure_action_combo);
@@ -331,6 +348,7 @@ impl FilteringTab {
         }
 
         let unsure_folder_browse_btn = Button::with_label("Browse...");
+        unsure_folder_browse_btn.set_tooltip_text(Some("Select the unsure destination folder."));
 
         unsure_folder_row.append(&unsure_folder_label);
         unsure_folder_row.append(&unsure_folder_entry);
@@ -355,6 +373,9 @@ impl FilteringTab {
         // TODO: Wire to config when ManagerState is extended with unsure_mark_as_read
         let unsure_mark_read = CheckButton::with_label("Mark possible spam as read");
         unsure_mark_read.set_active(false); // Default: not marked as read
+        unsure_mark_read.set_tooltip_text(Some(
+            "Automatically mark messages classified as unsure as read."
+        ));
         unsure_box.append(&unsure_mark_read);
 
         unsure_frame.set_child(Some(&unsure_box));
@@ -380,6 +401,9 @@ impl FilteringTab {
         ham_action_combo.append_text("Copied to specified folder");
         ham_action_combo.append_text("Untouched");
         ham_action_combo.set_active(Some(action_to_index(&state.ham_action)));
+        ham_action_combo.set_tooltip_text(Some(
+            "Choose what to do with messages classified as good (ham)."
+        ));
 
         ham_action_row.append(&ham_action_label);
         ham_action_row.append(&ham_action_combo);
@@ -421,6 +445,9 @@ impl FilteringTab {
         // TODO: Wire to config when ManagerState is extended with ham_mark_as_read
         let ham_mark_read = CheckButton::with_label("Mark good messages as read");
         ham_mark_read.set_active(false); // Default: not marked as read
+        ham_mark_read.set_tooltip_text(Some(
+            "Automatically mark messages classified as good (ham) as read."
+        ));
         ham_box.append(&ham_mark_read);
 
         ham_frame.set_child(Some(&ham_box));
@@ -438,6 +465,9 @@ impl FilteringTab {
         let cleanup_enabled = CheckButton::with_label(
             "Automatically delete spam messages older than:",
         );
+        cleanup_enabled.set_tooltip_text(Some(
+            "Enable automatic deletion of old spam messages to keep your mailbox tidy."
+        ));
         cleanup_enabled.set_active(false); // Default: disabled
 
         let cleanup_days_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -445,6 +475,9 @@ impl FilteringTab {
 
         let cleanup_adj = Adjustment::new(30.0, 1.0, 365.0, 1.0, 7.0, 0.0);
         let cleanup_days_spin = SpinButton::new(Some(&cleanup_adj), 1.0, 0);
+        cleanup_days_spin.set_tooltip_text(Some(
+            "Number of days to keep spam before automatically deleting it."
+        ));
         cleanup_days_spin.set_sensitive(false); // Disabled until checkbox is checked
 
         let cleanup_days_label = Label::new(Some("days"));
@@ -804,32 +837,24 @@ impl FilteringTab {
     /// Validate tab values. Returns `Ok(())` or an error message.
     ///
     /// Checks that spam_threshold > unsure_threshold and both are in [0, 100].
+    /// Error messages use pre-authored guidance from `help_content::errors`.
     ///
-    /// **Validates: Requirements 2.6, 2.7**
+    /// **Validates: Requirements 2.6, 2.7, 5.1, 5.2, 5.3**
     pub fn validate(&self) -> Result<(), String> {
         let spam_val = self.spam_scale.value();
         let unsure_val = self.unsure_scale.value();
 
         // Check range [0, 100] (Req 2.7)
         if !(0.0..=100.0).contains(&spam_val) {
-            return Err(format!(
-                "Spam threshold ({:.1}) must be between 0 and 100",
-                spam_val
-            ));
+            return Err(errors::THRESHOLD_INVALID.to_string());
         }
         if !(0.0..=100.0).contains(&unsure_val) {
-            return Err(format!(
-                "Unsure threshold ({:.1}) must be between 0 and 100",
-                unsure_val
-            ));
+            return Err(errors::THRESHOLD_INVALID.to_string());
         }
 
         // Check spam_threshold > unsure_threshold (Req 2.6)
         if spam_val <= unsure_val {
-            return Err(format!(
-                "Spam threshold ({:.1}) must be greater than unsure threshold ({:.1})",
-                spam_val, unsure_val
-            ));
+            return Err(errors::THRESHOLD_INVALID.to_string());
         }
 
         Ok(())

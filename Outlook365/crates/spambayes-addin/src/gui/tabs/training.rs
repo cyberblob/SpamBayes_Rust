@@ -205,6 +205,9 @@ impl TrainingTab {
         }
 
         let ham_folder_browse_btn = Button::with_label("Browse...");
+        ham_folder_browse_btn.set_tooltip_text(Some(
+            "Select folders containing known good (ham) messages for training.",
+        ));
 
         ham_box.append(&ham_folder_entry);
         ham_box.append(&ham_folder_browse_btn);
@@ -234,6 +237,9 @@ impl TrainingTab {
         }
 
         let spam_folder_browse_btn = Button::with_label("Browse...");
+        spam_folder_browse_btn.set_tooltip_text(Some(
+            "Select folders containing known spam messages for training.",
+        ));
 
         spam_box.append(&spam_folder_entry);
         spam_box.append(&spam_folder_browse_btn);
@@ -247,9 +253,15 @@ impl TrainingTab {
 
         let rescore_check = CheckButton::with_label("Score messages after training");
         rescore_check.set_active(config.training.rescore);
+        rescore_check.set_tooltip_text(Some(
+            "After training, re-classify all messages in watched folders.",
+        ));
 
         let rebuild_check = CheckButton::with_label("Rebuild entire database");
         rebuild_check.set_active(config.training.rebuild);
+        rebuild_check.set_tooltip_text(Some(
+            "Clear all learned data and rebuild from scratch using training folders.",
+        ));
 
         options_row.append(&rescore_check);
         options_row.append(&rebuild_check);
@@ -260,6 +272,9 @@ impl TrainingTab {
         start_training_btn.set_halign(Align::Center);
         start_training_btn.set_margin_top(8);
         start_training_btn.set_margin_bottom(8);
+        start_training_btn.set_tooltip_text(Some(
+            "Train the classifier using the selected ham and spam folders.",
+        ));
         content_box.append(&start_training_btn);
 
         // ─── 5. Incremental Training section (Req 3.5) ──────────────────
@@ -275,6 +290,9 @@ impl TrainingTab {
             "Train that a message is good when it is moved from a spam\nfolder back to the Inbox.",
         );
         train_recovered_spam_check.set_active(config.training.train_recovered_spam);
+        train_recovered_spam_check.set_tooltip_text(Some(
+            "Automatically train messages as good when you move them from the spam folder back to the Inbox.",
+        ));
         incr_box.append(&train_recovered_spam_check);
 
         // "Clicking 'Not Spam' should" row
@@ -302,6 +320,9 @@ impl TrainingTab {
             "Train that a message is spam when it is moved to the spam\nfolder.",
         );
         train_manual_spam_check.set_active(config.training.train_manual_spam);
+        train_manual_spam_check.set_tooltip_text(Some(
+            "Automatically train messages as spam when you manually move them to the spam folder.",
+        ));
         incr_box.append(&train_manual_spam_check);
 
         // "Clicking 'Spam' should" row

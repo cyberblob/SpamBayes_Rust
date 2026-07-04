@@ -15,7 +15,7 @@ use gtk4::{
 };
 
 use std::cell::Cell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use spambayes_config::AppConfig;
@@ -97,6 +97,9 @@ impl AdvancedTab {
         let timer_enable_check =
             CheckButton::with_label("Enable background filtering");
         timer_enable_check.set_active(config.filter.timer_enabled);
+        timer_enable_check.set_tooltip_text(Some(
+            "Enable automatic background filtering of messages at regular intervals.",
+        ));
         timer_box.append(&timer_enable_check);
 
         // Start delay row
@@ -118,6 +121,9 @@ impl AdvancedTab {
         let start_delay_scale = Scale::new(Orientation::Horizontal, Some(&start_delay_adj));
         start_delay_scale.set_hexpand(true);
         start_delay_scale.set_digits(1);
+        start_delay_scale.set_tooltip_text(Some(
+            "How long to wait after Outlook starts before beginning background filtering.",
+        ));
 
         let start_delay_entry = Entry::new();
         start_delay_entry.set_width_chars(5);
@@ -150,6 +156,9 @@ impl AdvancedTab {
         let interval_scale = Scale::new(Orientation::Horizontal, Some(&interval_adj));
         interval_scale.set_hexpand(true);
         interval_scale.set_digits(1);
+        interval_scale.set_tooltip_text(Some(
+            "Delay between processing each message during background filtering.",
+        ));
 
         let interval_entry = Entry::new();
         interval_entry.set_width_chars(5);
@@ -167,6 +176,9 @@ impl AdvancedTab {
         let only_receive_check =
             CheckButton::with_label("Only for folders that receive new mail");
         only_receive_check.set_active(config.filter.timer_only_receive_folders);
+        only_receive_check.set_tooltip_text(Some(
+            "Only process folders that receive new mail, not sent items or archives.",
+        ));
         timer_box.append(&only_receive_check);
 
         timer_frame.set_child(Some(&timer_box));
@@ -350,11 +362,29 @@ impl AdvancedTab {
         // ─── 6. Show Data Folder button (Req 7.3) ───────────────────────
         let data_folder_btn = Button::with_label("Show Data Folder");
         data_folder_btn.set_halign(Align::Start);
+        data_folder_btn.set_tooltip_text(Some(
+            "Open the data folder where SpamBayes stores configuration and database files.",
+        ));
         let data_dir = data_directory.to_path_buf();
         data_folder_btn.connect_clicked(move |_| {
             Self::open_data_folder(&data_dir);
         });
         content_box.append(&data_folder_btn);
+
+        // ─── 6b. Reset Database button ──────────────────────────────────
+        let reset_db_btn = Button::with_label("Reset Database");
+        reset_db_btn.set_halign(Align::Start);
+        reset_db_btn.set_tooltip_text(Some(
+            "Delete all training data and start fresh. This cannot be undone.",
+        ));
+        let data_dir_for_reset = data_directory.to_path_buf();
+        reset_db_btn.connect_clicked(move |btn| {
+            let parent_window = btn
+                .root()
+                .and_then(|root| root.downcast::<Window>().ok());
+            Self::confirm_reset_database(parent_window.as_ref(), &data_dir_for_reset);
+        });
+        content_box.append(&reset_db_btn);
 
         // ─── 7. Diagnostics button (Req 7.4) ────────────────────────────
         let verbose = Rc::new(Cell::new(config.general.verbose));
@@ -362,6 +392,9 @@ impl AdvancedTab {
 
         let diag_btn = Button::with_label("Diagnostics...");
         diag_btn.set_halign(Align::Start);
+        diag_btn.set_tooltip_text(Some(
+            "View diagnostic information and toggle verbose logging.",
+        ));
 
         let verbose_clone = Rc::clone(&verbose);
         let save_spam_info_clone = Rc::clone(&save_spam_info);
@@ -429,6 +462,143 @@ impl AdvancedTab {
                 .arg(&path_str)
                 .spawn();
         }
+    }
+
+    /// Show a confirmation dialog before resetting the database.
+    ///
+    /// Displays a warning that all training data will be lost, with
+    /// "Reset" and "Cancel" buttons.
+    fn confirm_reset_database(parent: Option<&Window>, data_directory: &Path) {
+        let dialog = Window::new();
+        dialog.set_title(Some("Reset Database"));
+        dialog.set_default_size(420, 200);
+        dialog.set_modal(true);
+        if let Some(parent_win) = parent {
+            dialog.set_transient_for(Some(parent_win));
+        }
+
+        let vbox = GtkBox::new(Orientation::Vertical, 12);
+        vbox.set_margin_top(20);
+        vbox.set_margin_bottom(20);
+        vbox.set_margin_start(20);
+        vbox.set_margin_end(20);
+
+        let warning = Label::new(Some(
+            "This will delete all training data (classifier database \
+             and message database). The classifier will need to be \
+             retrained from scratch.\n\n\
+             This action cannot be undone.",
+        ));
+        warning.set_wrap(true);
+        warning.set_halign(Align::Start);
+        vbox.append(&warning);
+
+        let button_bar = GtkBox::new(Orientation::Horizontal, 8);
+        button_bar.set_halign(Align::End);
+        button_bar.set_margin_top(12);
+
+        let reset_btn = Button::with_label("Reset");
+        let cancel_btn = Button::with_label("Cancel");
+
+        button_bar.append(&reset_btn);
+        button_bar.append(&cancel_btn);
+        vbox.append(&button_bar);
+
+        dialog.set_child(Some(&vbox));
+
+        // Wire Reset button
+        let data_dir_clone = data_directory.to_path_buf();
+        let dialog_clone = dialog.clone();
+        reset_btn.connect_clicked(move |_| {
+            Self::reset_database(&data_dir_clone, Some(&dialog_clone));
+            dialog_clone.close();
+        });
+
+        // Wire Cancel button
+        let dialog_close = dialog.clone();
+        cancel_btn.connect_clicked(move |_| {
+            dialog_close.close();
+        });
+
+        dialog.present();
+    }
+
+    /// Delete the classifier and message database files to reset to blank.
+    ///
+    /// Removes `spambayes.db` and `spambayes_msg.db` from the data directory.
+    /// Shows an info dialog on success or an error dialog on failure.
+    fn reset_database(data_directory: &Path, parent: Option<&Window>) {
+        let db_path = data_directory.join("spambayes.db");
+        let msg_db_path = data_directory.join("spambayes_msg.db");
+
+        let mut errors: Vec<String> = Vec::new();
+
+        // Delete classifier database
+        if db_path.exists() {
+            if let Err(e) = std::fs::remove_file(&db_path) {
+                errors.push(format!("spambayes.db: {e}"));
+            }
+        }
+
+        // Delete message database
+        if msg_db_path.exists() {
+            if let Err(e) = std::fs::remove_file(&msg_db_path) {
+                errors.push(format!("spambayes_msg.db: {e}"));
+            }
+        }
+
+        // Show result
+        Self::show_reset_result(parent, &errors);
+    }
+
+    /// Show the result of a database reset operation.
+    fn show_reset_result(parent: Option<&Window>, errors: &[String]) {
+        let dialog = Window::new();
+        dialog.set_default_size(400, 150);
+        dialog.set_modal(true);
+        if let Some(parent_win) = parent {
+            dialog.set_transient_for(Some(parent_win));
+        }
+
+        let vbox = GtkBox::new(Orientation::Vertical, 12);
+        vbox.set_margin_top(20);
+        vbox.set_margin_bottom(20);
+        vbox.set_margin_start(20);
+        vbox.set_margin_end(20);
+
+        if errors.is_empty() {
+            dialog.set_title(Some("Database Reset"));
+            let msg = Label::new(Some(
+                "Database has been reset successfully.\n\n\
+                 The classifier will start fresh on next use. \
+                 You will need to retrain it with ham and spam messages.",
+            ));
+            msg.set_wrap(true);
+            msg.set_halign(Align::Start);
+            vbox.append(&msg);
+        } else {
+            dialog.set_title(Some("Reset Error"));
+            let error_text = format!(
+                "Some files could not be deleted:\n\n{}\n\n\
+                 The database may be in use. Try closing Outlook first.",
+                errors.join("\n")
+            );
+            let msg = Label::new(Some(&error_text));
+            msg.set_wrap(true);
+            msg.set_halign(Align::Start);
+            vbox.append(&msg);
+        }
+
+        let ok_btn = Button::with_label("OK");
+        ok_btn.set_halign(Align::End);
+        let dialog_clone = dialog.clone();
+        ok_btn.connect_clicked(move |_| {
+            dialog_clone.close();
+        });
+        vbox.append(&ok_btn);
+
+        dialog.set_child(Some(&vbox));
+        dialog.present();
     }
 
     /// Show the Diagnostics sub-dialog.

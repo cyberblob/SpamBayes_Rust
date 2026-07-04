@@ -69,6 +69,9 @@ impl NotificationsTab {
 
         // ─── 1. Enable checkbox (Req 5.1) ────────────────────────────────
         let enable_check = CheckButton::with_label("Enable new mail notification sounds");
+        enable_check.set_tooltip_text(Some(
+            "Play sounds when messages are classified. You can customize which sounds play for ham, unsure, and spam."
+        ));
         enable_check.set_active(config.notify_sound_enabled);
         content_box.append(&enable_check);
 
@@ -128,6 +131,10 @@ impl NotificationsTab {
             0.0,
         );
         let delay_scale = Scale::new(Orientation::Horizontal, Some(&delay_adj));
+        delay_scale.set_tooltip_text(Some(
+            "Wait this many seconds after a message arrives before playing a notification. \
+             Use this to batch multiple messages into one notification."
+        ));
         delay_scale.set_hexpand(true);
         delay_scale.set_digits(0);
 

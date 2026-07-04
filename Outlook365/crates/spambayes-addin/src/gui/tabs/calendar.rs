@@ -64,6 +64,10 @@ impl CalendarTab {
             "Allow filtering of calendar invitations and meeting requests",
         );
         enable_check.set_active(config.calendar_filtering_enabled);
+        enable_check.set_tooltip_text(Some(
+            "Enable filtering of calendar invitations and meeting requests classified as spam. \
+             Warning: This feature is still in beta testing.",
+        ));
         enable_box.append(&enable_check);
 
         let beta_label = Label::new(Some("(Warning this is BETA!!)"));
@@ -101,6 +105,10 @@ impl CalendarTab {
             CalendarSpamAction::Move => 2,
         };
         spam_action_combo.set_active(Some(active_index));
+        spam_action_combo.set_tooltip_text(Some(
+            "Choose what to do with calendar invitations classified as spam: \
+             Prompt (ask user), Trash (delete), or Move (move to spam folder).",
+        ));
 
         combo_row.append(&combo_label);
         combo_row.append(&spam_action_combo);

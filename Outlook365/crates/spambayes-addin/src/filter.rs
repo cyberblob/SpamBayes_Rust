@@ -442,17 +442,7 @@ impl FilterEngine {
             stats.on_classified(result.classification);
         }
 
-        // Step 2: If save_spam_info is enabled, save the score to the message.
-        if self.config.save_spam_info {
-            self.save_score_with_retry(message, &general_config.field_score_name, result.score_pct);
-        }
-
-        // Step 3: If classified as Spam, set a cleanup timestamp if not already present.
-        if result.classification == Classification::Spam {
-            self.set_cleanup_timestamp_if_missing(message);
-        }
-
-        // Step 4: Determine action and destination based on classification.
+        // Step 2: Determine action and destination based on classification.
         let (action, folder_id, mark_as_read) = match result.classification {
             Classification::Spam => (
                 &self.config.spam_action,
@@ -471,14 +461,19 @@ impl FilterEngine {
             ),
         };
 
-        // Step 5: Mark as read if configured for this classification.
+        // Step 3: Mark as read if configured for this classification.
         if mark_as_read {
             if let Err(e) = message.set_read_state(true) {
                 eprintln!("Warning: failed to mark message as read: {e}");
             }
         }
 
-        // Step 6: Perform the filter action (move, copy, or leave untouched).
+        // Step 4: Perform the filter action (move, copy, or leave untouched).
+        // The move/copy MUST happen BEFORE saving properties. Saving properties
+        // to a message in an Exchange-managed folder (e.g. "Junk Email") modifies
+        // it in-place, which can trigger server-side rule re-evaluation and
+        // bounce the message back. After the move, property saves target the
+        // message in its new (SpamBayes-owned) destination folder.
         match action {
             FilterAction::Untouched => {
                 // Leave message in place — nothing to do.
@@ -521,6 +516,19 @@ impl FilterEngine {
                     }
                 }
             }
+        }
+
+        // Step 5: Post-move property saves — these now target the message in
+        // its destination folder (safe from Exchange re-evaluation).
+
+        // Set cleanup timestamp on spam messages (for auto-deletion tracking).
+        if result.classification == Classification::Spam {
+            self.set_cleanup_timestamp_if_missing(message);
+        }
+
+        // Save the spam score if configured.
+        if self.config.save_spam_info {
+            self.save_score_with_retry(message, &general_config.field_score_name, result.score_pct);
         }
 
         Ok(result)

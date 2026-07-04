@@ -18,15 +18,52 @@
 
 use spambayes_config::{AppConfig, ConfigChain, FilterAction, FolderId};
 
+use crate::help_content::errors;
+use crate::help_content::sections;
+use crate::help_content::tooltips::MANAGER_TOOLTIPS;
+use crate::help_dialog::{help_section_for_control, show_help, show_help_for_control};
 use crate::statistics::StatisticsManager;
+use crate::tooltip_manager::TooltipManager;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EndDialog, GetWindowLongPtrW, KillTimer, MessageBoxW, SetDlgItemTextW, SetTimer,
-    SetWindowLongPtrW, GWLP_USERDATA, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO,
-    WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WM_TIMER,
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, FF_SWISS, HFONT,
+    OUT_DEFAULT_PRECIS,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EndDialog, GetDlgCtrlID, GetDlgItem, GetWindowLongPtrW, KillTimer, MessageBoxW,
+    SendMessageW, SetDlgItemTextW, SetTimer, SetWindowLongPtrW, GWLP_USERDATA, IDYES,
+    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_INITDIALOG, WM_SETFONT, WM_TIMER,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+
+// ─── WM_HELP Support ─────────────────────────────────────────────────────────
+
+/// WM_HELP message constant (0x0053).
+///
+/// Sent when the user presses F1 while a control has focus. The LPARAM
+/// points to a `HELPINFO` structure identifying the control.
+///
+/// **Validates: Requirement 3.2**
+const WM_HELP: u32 = 0x0053;
+
+/// HELPINFO structure received via WM_HELP's LPARAM.
+///
+/// Contains context about which control the user requested help for.
+/// We only use `iCtrlId` to look up the appropriate help section.
+#[repr(C)]
+#[allow(non_snake_case, dead_code)]
+struct HELPINFO {
+    cbSize: u32,
+    iContextType: i32,
+    iCtrlId: i32,
+    hItemHandle: HWND,
+    dwContextId: u32,
+    MousePos: POINT,
+}
 
 // ─── Dialog Control ID Constants ─────────────────────────────────────────────
 
@@ -107,6 +144,35 @@ const IDC_OK: u16 = 3042;
 const IDC_CANCEL: u16 = 3043;
 #[allow(dead_code)]
 const IDC_RESET_STATS: u16 = 3044;
+/// Help button — shows context-sensitive help for the focused control/section.
+///
+/// **Validates: Requirement 3.1**
+#[allow(dead_code)]
+const IDC_HELP_BUTTON: u16 = 3045;
+
+// ─── Inline Help Label Control IDs ───────────────────────────────────────────
+//
+// Static text controls that display always-visible section descriptions
+// within the Manager dialog. Content is populated from `help_content::sections`
+// during WM_INITDIALOG.
+//
+// **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+
+/// Inline help label for the Filter Settings section.
+#[allow(dead_code)]
+const IDC_HELP_LABEL_FILTER: u16 = 3070;
+/// Inline help label for the Folder Configuration section.
+#[allow(dead_code)]
+const IDC_HELP_LABEL_FOLDERS: u16 = 3071;
+/// Inline help label for the Training section.
+#[allow(dead_code)]
+const IDC_HELP_LABEL_TRAINING: u16 = 3072;
+/// Inline help label for the Notification section.
+#[allow(dead_code)]
+const IDC_HELP_LABEL_NOTIFICATION: u16 = 3073;
+/// Inline help label for the Cleanup section.
+#[allow(dead_code)]
+const IDC_HELP_LABEL_CLEANUP: u16 = 3074;
 
 // Timer constants for real-time statistics refresh (Req 3.4)
 /// Timer ID for periodic statistics refresh while the Manager dialog is open.
@@ -494,6 +560,23 @@ impl ManagerState {
         self.spam_training_folder_ids = folders;
         self.dirty = true;
     }
+
+    // ─── Validation Helpers ──────────────────────────────────────────────
+
+    /// Check whether the threshold values are valid.
+    ///
+    /// Returns `true` if both thresholds are in [0, 100] and the unsure
+    /// threshold does not exceed the spam threshold.
+    ///
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    #[must_use]
+    pub fn is_threshold_valid(&self) -> bool {
+        self.spam_threshold >= 0.0
+            && self.spam_threshold <= 100.0
+            && self.unsure_threshold >= 0.0
+            && self.unsure_threshold <= 100.0
+            && self.unsure_threshold < self.spam_threshold
+    }
 }
 
 // ─── ManagerDialog ───────────────────────────────────────────────────────────
@@ -516,6 +599,12 @@ pub struct ManagerDialog {
     ///
     /// **Validates: Requirement 3.5**
     statistics_manager: Option<StatisticsManager>,
+    /// Tooltip manager for hover help on dialog controls.
+    ///
+    /// Created during WM_INITDIALOG and destroyed on WM_DESTROY.
+    ///
+    /// **Validates: Requirements 1.1, 1.4**
+    tooltip_manager: Option<TooltipManager>,
 }
 
 impl ManagerDialog {
@@ -536,6 +625,7 @@ impl ManagerDialog {
             stats,
             hwnd: HWND::default(),
             statistics_manager,
+            tooltip_manager: None,
         }
     }
 
@@ -737,8 +827,21 @@ impl ManagerDialog {
                 // Store the dialog pointer in window user data for later retrieval.
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, lparam.0);
                 // Populate controls from state and stats.
-                let dialog = &*(lparam.0 as *const ManagerDialog);
+                let dialog = &mut *(lparam.0 as *mut ManagerDialog);
                 Self::populate_stats_controls(hwnd, &dialog.stats);
+
+                // Create tooltip manager and register tooltips for all controls.
+                // **Validates: Requirements 1.1, 1.4**
+                let instance = GetModuleHandleW(None).unwrap_or_default();
+                let tm = TooltipManager::new(hwnd, instance.into());
+                tm.register_tooltips(hwnd, MANAGER_TOOLTIPS);
+                dialog.tooltip_manager = Some(tm);
+
+                // Populate and style inline help labels from help_content.
+                // **Validates: Requirements 2.1, 2.3, 2.4**
+                Self::populate_inline_help_labels(hwnd);
+                Self::style_inline_help_labels(hwnd);
+
                 // Start a periodic timer to refresh statistics while the dialog
                 // is open (Req 3.4: real-time update).
                 SetTimer(hwnd, IDC_STATS_TIMER, STATS_REFRESH_MS, None);
@@ -748,6 +851,16 @@ impl ManagerDialog {
                 let control_id = (wparam.0 & 0xFFFF) as u16;
                 match control_id {
                     IDC_OK => {
+                        // Validate settings before accepting. If validation fails,
+                        // show an actionable error and keep the dialog open.
+                        // **Validates: Requirements 5.1, 5.2, 5.3**
+                        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                        if ptr != 0 {
+                            let dialog = &*(ptr as *const ManagerDialog);
+                            if dialog.validate_settings(hwnd).is_err() {
+                                return 0;
+                            }
+                        }
                         let _ = EndDialog(hwnd, 1);
                         0
                     }
@@ -807,6 +920,25 @@ impl ManagerDialog {
                         // Toggle filtering enabled state
                         0
                     }
+                    IDC_HELP_BUTTON => {
+                        // Show context-sensitive help based on the focused control.
+                        // **Validates: Requirement 3.1**
+                        let focused = GetFocus();
+                        let ctrl_id = if focused.is_invalid() || focused == hwnd {
+                            0u16
+                        } else {
+                            GetDlgCtrlID(focused) as u16
+                        };
+
+                        // Try to show help for the focused control; fall back to
+                        // general filter settings help if no mapping exists.
+                        if help_section_for_control(ctrl_id).is_some() {
+                            show_help_for_control(hwnd, ctrl_id);
+                        } else {
+                            show_help(hwnd, &crate::help_content::sections::FILTER_SETTINGS);
+                        }
+                        0
+                    }
                     _ => 0,
                 }
             }
@@ -823,13 +955,76 @@ impl ManagerDialog {
                 }
                 0
             }
+            WM_HELP => {
+                // Context-sensitive help: F1 pressed while a control has focus.
+                // Extract the control ID from the HELPINFO structure and show
+                // the relevant help section.
+                // **Validates: Requirements 3.1, 3.2**
+                let help_info = &*(lparam.0 as *const HELPINFO);
+                let control_id = help_info.iCtrlId as u16;
+                show_help_for_control(hwnd, control_id);
+                1 // Return TRUE to indicate we handled it
+            }
             WM_CLOSE => {
                 // Kill the statistics refresh timer before closing (Req 3.4).
                 let _ = KillTimer(hwnd, IDC_STATS_TIMER);
                 let _ = EndDialog(hwnd, 0);
                 0
             }
+            WM_DESTROY => {
+                // Destroy the tooltip manager to clean up the tooltip window.
+                // **Validates: Requirements 1.1, 1.4**
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                if ptr != 0 {
+                    let dialog = &mut *(ptr as *mut ManagerDialog);
+                    if let Some(ref tm) = dialog.tooltip_manager {
+                        tm.destroy();
+                    }
+                    dialog.tooltip_manager = None;
+                }
+                0
+            }
             _ => 0,
+        }
+    }
+
+    /// Validate the current Manager dialog state before saving.
+    ///
+    /// Checks thresholds using guidance text from `help_content::errors`.
+    /// Returns `Ok(())` if valid, or shows a `MessageBox` with actionable
+    /// error guidance and returns `Err(())`.
+    ///
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    #[allow(dead_code)]
+    fn validate_settings(&self, hwnd: HWND) -> Result<(), ()> {
+        // Validate thresholds
+        if !self.state.is_threshold_valid() {
+            Self::show_validation_error(hwnd, errors::THRESHOLD_INVALID);
+            return Err(());
+        }
+
+        Ok(())
+    }
+
+    /// Show a validation error `MessageBox` with guidance text from
+    /// `help_content::errors`.
+    ///
+    /// The message includes both what went wrong and what to do to fix it,
+    /// making the error actionable for the user.
+    ///
+    /// **Validates: Requirements 5.1, 5.2, 5.3**
+    #[allow(dead_code)]
+    fn show_validation_error(hwnd: HWND, message: &str) {
+        let title = "SpamBayes \u{2014} Validation Error";
+        let wide_msg: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR::from_raw(wide_msg.as_ptr()),
+                PCWSTR::from_raw(wide_title.as_ptr()),
+                MB_ICONERROR | MB_OK,
+            );
         }
     }
 
@@ -896,6 +1091,131 @@ impl ManagerDialog {
         // Total session classified count
         let total_session = format_with_thousands(u64::from(stats.session_classified));
         Self::set_control_text(hwnd, IDC_STAT_SESSION_CLASSIFIED, &total_session);
+    }
+
+    // ─── Inline Help Label Infrastructure ────────────────────────────────────
+
+    /// Populate inline help labels from `help_content::sections` constants.
+    ///
+    /// Sets the text of static label controls to the section descriptions,
+    /// providing always-visible contextual guidance within the dialog.
+    ///
+    /// Called during `WM_INITDIALOG` after tooltip setup.
+    ///
+    /// **Validates: Requirements 2.1, 2.3**
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `hwnd` is a valid dialog window handle. If any
+    /// label control does not exist in the dialog template, the corresponding
+    /// `SetDlgItemTextW` call is a no-op.
+    // TODO: The LTEXT controls for these labels must be added to the dialog
+    // template (programmatic or .rc) when the full dialog layout is implemented.
+    #[allow(dead_code)]
+    unsafe fn populate_inline_help_labels(hwnd: HWND) {
+        Self::set_help_label(hwnd, IDC_HELP_LABEL_FILTER, sections::FILTER_SETTINGS.description);
+        Self::set_help_label(hwnd, IDC_HELP_LABEL_FOLDERS, sections::FOLDER_CONFIG.description);
+        Self::set_help_label(hwnd, IDC_HELP_LABEL_TRAINING, sections::TRAINING.description);
+        Self::set_help_label(
+            hwnd,
+            IDC_HELP_LABEL_NOTIFICATION,
+            sections::NOTIFICATION.description,
+        );
+        Self::set_help_label(hwnd, IDC_HELP_LABEL_CLEANUP, sections::CLEANUP.description);
+    }
+
+    /// Set the text of an inline help label control.
+    ///
+    /// Converts the UTF-8 description string to a null-terminated UTF-16
+    /// string and applies it via `SetDlgItemTextW`.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `hwnd` is a valid dialog window handle.
+    #[allow(dead_code)]
+    unsafe fn set_help_label(hwnd: HWND, control_id: u16, text: &str) {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = SetDlgItemTextW(hwnd, i32::from(control_id), PCWSTR::from_raw(wide.as_ptr()));
+    }
+
+    /// Apply a smaller, grey-tinted font to inline help labels for visual
+    /// distinction from interactive controls.
+    ///
+    /// Creates a 7pt "MS Shell Dlg" font and applies it to all inline help
+    /// label controls via `WM_SETFONT`. The smaller size and lighter weight
+    /// visually separate descriptive text from actionable controls.
+    ///
+    /// Called during `WM_INITDIALOG` after `populate_inline_help_labels`.
+    ///
+    /// **Validates: Requirements 2.3, 2.4**
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `hwnd` is a valid dialog window handle. If a label
+    /// control does not exist, `GetDlgItem` returns a null handle and the
+    /// font message is skipped for that control.
+    // TODO: The font handle created here is intentionally leaked (never
+    // deleted) because it must remain valid for the lifetime of the dialog.
+    // In a full implementation, store it and call `DeleteObject` on WM_DESTROY.
+    #[allow(dead_code)]
+    unsafe fn style_inline_help_labels(hwnd: HWND) {
+        let hfont = Self::create_help_label_font();
+        if hfont.is_invalid() {
+            return;
+        }
+
+        let label_ids = [
+            IDC_HELP_LABEL_FILTER,
+            IDC_HELP_LABEL_FOLDERS,
+            IDC_HELP_LABEL_TRAINING,
+            IDC_HELP_LABEL_NOTIFICATION,
+            IDC_HELP_LABEL_CLEANUP,
+        ];
+
+        for &id in &label_ids {
+            let ctrl = GetDlgItem(hwnd, i32::from(id));
+            if let Ok(ctrl_hwnd) = ctrl {
+                if ctrl_hwnd != HWND::default() {
+                    SendMessageW(ctrl_hwnd, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
+                }
+            }
+        }
+    }
+
+    /// Create a smaller font for inline help labels.
+    ///
+    /// Returns a 7pt "MS Shell Dlg" font with normal weight (FW_NORMAL = 400).
+    /// This produces text that is visibly smaller than the standard dialog font,
+    /// helping users distinguish informational labels from interactive controls.
+    ///
+    /// # Safety
+    ///
+    /// Uses Win32 `CreateFontW`. Returns an invalid HFONT on failure.
+    #[allow(dead_code)]
+    unsafe fn create_help_label_font() -> HFONT {
+        let face_name: Vec<u16> = "MS Shell Dlg"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // 7pt at 96 DPI ≈ -9 logical units (negative = character height)
+        let height = -9;
+
+        CreateFontW(
+            height,
+            0,                       // width (auto)
+            0,                       // escapement
+            0,                       // orientation
+            400,                     // weight (FW_NORMAL)
+            0,                       // italic
+            0,                       // underline
+            0,                       // strikeout
+            DEFAULT_CHARSET.0.into(),
+            OUT_DEFAULT_PRECIS.0.into(),
+            CLIP_DEFAULT_PRECIS.0.into(),
+            DEFAULT_QUALITY.0.into(),
+            FF_SWISS.0.into(),       // pitch and family
+            PCWSTR::from_raw(face_name.as_ptr()),
+        )
     }
 }
 
@@ -1546,5 +1866,123 @@ mod tests {
     fn test_stats_refresh_interval() {
         // The refresh interval should be 2 seconds (2000ms) per the design.
         assert_eq!(STATS_REFRESH_MS, 2000);
+    }
+
+    // ─── Error Guidance Content Tests (Task 6.3) ─────────────────────────
+
+    #[test]
+    fn test_threshold_invalid_contains_actionable_guidance() {
+        use crate::help_content::errors;
+
+        let msg = errors::THRESHOLD_INVALID;
+        // Contains valid range information
+        assert!(
+            msg.contains("0 and 100"),
+            "THRESHOLD_INVALID should mention valid range '0 and 100'"
+        );
+        // Contains relationship constraint
+        assert!(
+            msg.contains("unsure threshold") || msg.contains("unsure value"),
+            "THRESHOLD_INVALID should mention unsure threshold relationship"
+        );
+        // Contains actionable instruction
+        assert!(
+            msg.contains("fix") || msg.contains("enter") || msg.contains("set"),
+            "THRESHOLD_INVALID should contain an actionable instruction"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_days_invalid_contains_actionable_guidance() {
+        use crate::help_content::errors;
+
+        let msg = errors::CLEANUP_DAYS_INVALID;
+        // Contains valid constraint
+        assert!(
+            msg.contains("positive") || msg.contains("1 or greater"),
+            "CLEANUP_DAYS_INVALID should mention 'positive' or '1 or greater'"
+        );
+        // Contains fix instruction
+        assert!(
+            msg.contains("fix") || msg.contains("enter") || msg.contains("set"),
+            "CLEANUP_DAYS_INVALID should contain a fix instruction"
+        );
+    }
+
+    #[test]
+    fn test_folder_not_found_contains_actionable_guidance() {
+        use crate::help_content::errors;
+
+        let msg = errors::FOLDER_NOT_FOUND;
+        // Tells user what to do
+        assert!(
+            msg.contains("Browse") || msg.contains("select"),
+            "FOLDER_NOT_FOUND should tell user to Browse or select a folder"
+        );
+        // Explains what went wrong
+        assert!(
+            msg.contains("renamed") || msg.contains("deleted") || msg.contains("moved"),
+            "FOLDER_NOT_FOUND should explain the folder was renamed, deleted, or moved"
+        );
+    }
+
+    #[test]
+    fn test_training_required_contains_actionable_guidance() {
+        use crate::help_content::errors;
+
+        let msg = errors::TRAINING_REQUIRED;
+        // Tells user to train
+        assert!(
+            msg.contains("Train"),
+            "TRAINING_REQUIRED should tell user to Train"
+        );
+        // Tells user what's needed
+        assert!(
+            msg.contains("ham"),
+            "TRAINING_REQUIRED should mention 'ham'"
+        );
+        assert!(
+            msg.contains("spam"),
+            "TRAINING_REQUIRED should mention 'spam'"
+        );
+    }
+
+    #[test]
+    fn test_is_threshold_valid_invalid_unsure_exceeds_spam() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+        // Set unsure > spam (invalid: unsure=60, spam=50)
+        state.spam_threshold = 50.0;
+        state.unsure_threshold = 60.0;
+        assert!(
+            !state.is_threshold_valid(),
+            "Thresholds should be invalid when unsure (60) > spam (50)"
+        );
+    }
+
+    #[test]
+    fn test_is_threshold_valid_out_of_range() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+        // Set spam > 100 (out of range)
+        state.spam_threshold = 101.0;
+        state.unsure_threshold = 15.0;
+        assert!(
+            !state.is_threshold_valid(),
+            "Thresholds should be invalid when spam (101) > 100"
+        );
+    }
+
+    #[test]
+    fn test_is_threshold_valid_valid_state() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+        // Set valid values: spam=90, unsure=15
+        state.spam_threshold = 90.0;
+        state.unsure_threshold = 15.0;
+        assert!(
+            state.is_threshold_valid(),
+            "Thresholds should be valid when spam=90, unsure=15"
+        );
     }
 }

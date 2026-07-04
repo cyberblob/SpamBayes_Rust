@@ -251,6 +251,9 @@ impl GeneralTab {
 
         let run_filter_btn = Button::with_label("Run Filter Now");
         run_filter_btn.set_halign(Align::Start);
+        run_filter_btn.set_tooltip_text(Some(
+            "Run the spam filter on all messages in watched folders now."
+        ));
         filter_action_box.append(&run_filter_btn);
 
         let filter_progress = ProgressBar::new();
@@ -277,6 +280,9 @@ impl GeneralTab {
         // ─── 5. Enable SpamBayes checkbox (Req 1.6) ─────────────────────
         let enable_checkbox = CheckButton::with_label("Enable SpamBayes");
         enable_checkbox.set_active(state.filter_enabled);
+        enable_checkbox.set_tooltip_text(Some(
+            "Turn SpamBayes filtering on or off. When disabled, messages are not classified."
+        ));
         content_box.append(&enable_checkbox);
 
         // ─── 6. Separator ────────────────────────────────────────────────
@@ -290,7 +296,14 @@ impl GeneralTab {
         button_row.set_halign(Align::Start);
 
         let reset_config_btn = Button::with_label("Reset Configuration...");
+        reset_config_btn.set_tooltip_text(Some(
+            "Reset all SpamBayes settings to their default values.",
+        ));
+
         let wizard_btn = Button::with_label("Configuration Wizard...");
+        wizard_btn.set_tooltip_text(Some(
+            "Run the Configuration Wizard to set up or reconfigure SpamBayes.",
+        ));
 
         button_row.append(&reset_config_btn);
         button_row.append(&wizard_btn);

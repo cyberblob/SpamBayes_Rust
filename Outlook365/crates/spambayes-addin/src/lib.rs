@@ -80,6 +80,9 @@ pub mod filter;
 pub mod folder_sink;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod help_content;
+pub mod help_dialog;
+pub mod help_dialog_template;
 pub mod logger;
 pub mod manager_dlg;
 pub mod notification;
@@ -88,6 +91,7 @@ pub mod ribbon;
 pub mod statistics;
 pub mod timer;
 pub mod toolbar;
+pub mod tooltip_manager;
 pub mod train;
 #[cfg(feature = "gui")]
 pub mod training_bridge;
