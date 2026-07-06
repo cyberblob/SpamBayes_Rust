@@ -3038,6 +3038,7 @@ impl AddinCore {
             config: config.clone(),
             notification_mgr,
             logger: self.logger.clone(),
+            statistics: self.statistics.clone(),
         }));
 
         self.folder_hook_state = Some(Arc::clone(&state));

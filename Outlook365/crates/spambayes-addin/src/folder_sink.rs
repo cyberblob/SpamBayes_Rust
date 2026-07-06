@@ -244,6 +244,8 @@ pub struct FolderHookState {
     pub notification_mgr: Arc<Mutex<NotificationManager>>,
     /// Logger for debug output.
     pub logger: Option<Arc<crate::logger::Logger>>,
+    /// Statistics manager for tracking classification counts.
+    pub statistics: Option<crate::statistics::StatisticsManager>,
 }
 
 // ─── FolderHook ──────────────────────────────────────────────────────────────
@@ -837,6 +839,13 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         "  Spam threshold: {:.2}%, Unsure threshold: {:.2}%",
         filter_config.spam_threshold, filter_config.unsure_threshold
     ));
+
+    // Record the classification in the statistics manager.
+    if let Ok(state) = sink.state.lock() {
+        if let Some(stats) = &state.statistics {
+            stats.on_classified(result.classification);
+        }
+    }
 
     // Detect whether the source store is Exchange/Outlook.com/Hotmail.
     // These online stores don't support saving custom properties back, and
@@ -1746,7 +1755,6 @@ unsafe fn scan_folder_items(
                     continue;
                 }
             };
-            let spam_threshold = state_guard.config.filter.spam_threshold;
             let unsure_threshold = state_guard.config.filter.unsure_threshold;
             drop(state_guard);
             
