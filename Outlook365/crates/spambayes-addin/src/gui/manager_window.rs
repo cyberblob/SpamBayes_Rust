@@ -375,6 +375,14 @@ impl ManagerWindow {
         load_header_css(&display);
         super::tabs::general::load_general_tab_css(&display);
         self.window.present();
+
+        // On Windows, GTK4's present() may not bring the window to the
+        // foreground if another application has focus. Schedule a Win32
+        // SetForegroundWindow call after GTK has realized the window.
+        let window_clone = self.window.clone();
+        glib::idle_add_local_once(move || {
+            bring_window_to_foreground(&window_clone);
+        });
     }
 
     // ─── Task 8.2: Auto-save on close ───────────────────────────────────
@@ -598,4 +606,31 @@ fn dirs_or_default() -> PathBuf {
     }
     // Fallback
     PathBuf::from("SpamBayes")
+}
+
+// ─── Win32 Foreground Helper ─────────────────────────────────────────────────
+
+/// Bring a GTK4 window to the foreground using Win32 APIs.
+///
+/// GTK4's `present()` doesn't always bring the window to the foreground on
+/// Windows due to the OS's focus-stealing prevention policy. This function
+/// finds the window by its title and uses `SetForegroundWindow` to force it
+/// to the front.
+///
+/// Called from a `glib::idle_add_local_once` to ensure the window is fully
+/// realized before we attempt to find its HWND.
+fn bring_window_to_foreground(window: &Window) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+
+    let title = window.title();
+    let title_str = title.as_deref().unwrap_or("SpamBayes Manager");
+    let title_wide: Vec<u16> = title_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title_wide.as_ptr()));
+        if let Ok(hwnd) = hwnd {
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
 }
