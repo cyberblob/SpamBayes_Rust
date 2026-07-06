@@ -1,7 +1,7 @@
 /.kiro
 /.vscode
 /.hypothesis
-/.continue
+/.continue/
 /contrib
 /Outlook365/target/
 /Outlook365/tests/
@@ -13,7 +13,6 @@
 /scripts/
 /spambayes/
 /windows/
-/.continue/
 /documents/
 /utilities/
 /Outlook365/installer/
