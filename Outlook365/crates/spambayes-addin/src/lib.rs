@@ -81,6 +81,8 @@ pub mod folder_sink;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod help_content;
+#[cfg(feature = "gui")]
+pub mod splash_window;
 pub mod help_dialog;
 pub mod help_dialog_template;
 pub mod logger;

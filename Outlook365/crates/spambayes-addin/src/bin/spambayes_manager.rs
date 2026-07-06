@@ -133,6 +133,10 @@ fn main() {
         ).ok();
     }
 
+    // Show a lightweight splash window immediately while heavy initialization
+    // (GTK4 DLL loading, classifier DB, MAPI folder tree) proceeds.
+    let splash = spambayes_addin::splash_window::show();
+
     // Load configuration from %LOCALAPPDATA%\SpamBayes\default.ini
     let data_dir = get_data_directory();
     let profile_name = "default";
@@ -170,6 +174,10 @@ fn main() {
     let runtime = match spambayes_addin::gui::gtk_runtime::GtkRuntime::init() {
         Ok(rt) => rt,
         Err(e) => {
+            // Close splash before showing error dialog.
+            if let Some(ref s) = splash {
+                s.close();
+            }
             spambayes_addin::gui::gtk_runtime::fallback_message_box(
                 "SpamBayes Manager",
                 &format!(
@@ -189,6 +197,13 @@ fn main() {
     let folder_tree = folder_tree_handle.join().unwrap_or(None);
 
     // Show manager (with training executor) or wizard if first-run.
+    // Close the splash now — all heavy loading is done and the GTK4 window
+    // will appear immediately.
+    if let Some(ref s) = splash {
+        s.close();
+    }
+    drop(splash);
+
     let (done_tx, done_rx) = std::sync::mpsc::channel();
 
     if let Some((executor, nham, nspam)) = training_executor {
