@@ -668,7 +668,8 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
     // However, if the message was previously classified as spam/unsure but
     // ended up back in the watch folder (Exchange server-side rules undid
     // our move), we need to re-move it to the correct SpamBayes folder.
-    if check_has_score(mail_item, &general_config.field_score_name) {
+    // If use_cached_scores is false (like Python), always re-score.
+    if check_has_score(mail_item, &general_config.field_score_name) && filter_config.use_cached_scores {
         // Check if this was a user-initiated ham move (Not Spam button)
         if was_user_moved_as_ham(mail_item) {
             log_debug(&debug_path, "  Message already scored AND was user-moved as ham, skipping");
@@ -897,14 +898,6 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                             CalendarPromptResult::Delete => {
                                 log_debug(&debug_path, "  User chose: Delete");
                                 delete_item(mail_item, &debug_path);
-                            }
-                            CalendarPromptResult::MoveToSpam => {
-                                if let Some(dest_folder_id) = &filter_config.spam_folder_id {
-                                    log_debug(&debug_path, "  User chose: Move to Spam");
-                                    move_item_to_folder(mail_item, dest_folder_id, &debug_path);
-                                } else {
-                                    log_debug(&debug_path, "  User chose: Move to Spam, but no spam folder configured");
-                                }
                             }
                             CalendarPromptResult::DoNothing => {
                                 log_debug(&debug_path, "  User chose: Do Nothing (leaving in place)");
@@ -1379,8 +1372,6 @@ enum CalendarPromptResult {
     Ham,
     /// User chose to delete the item.
     Delete,
-    /// User chose to move to the spam folder.
-    MoveToSpam,
     /// User chose to do nothing (leave in place, no training).
     DoNothing,
 }
@@ -1632,7 +1623,7 @@ pub unsafe fn scan_existing_items(
         }
     };
 
-    // Get the score field name from config
+    // Get the score field name and use_cached_scores from config
     let score_field = {
         let st = match state.lock() {
             Ok(s) => s,
@@ -1643,6 +1634,18 @@ pub unsafe fn scan_existing_items(
             }
         };
         st.config.general.field_score_name.clone()
+    };
+
+    let use_cached_scores = {
+        let st = match state.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                release_dispatch(namespace);
+                release_dispatch(app_ptr);
+                return;
+            }
+        };
+        st.config.filter.use_cached_scores
     };
 
     for hook in hooks {
@@ -1659,6 +1662,7 @@ pub unsafe fn scan_existing_items(
             state,
             &score_field,
             &debug_path,
+            use_cached_scores,
         );
     }
 
@@ -1673,6 +1677,7 @@ unsafe fn scan_folder_items(
     state: &Arc<Mutex<FolderHookState>>,
     score_field: &str,
     debug_path: &str,
+    use_cached_scores: bool,
 ) {
     if items_ptr.is_null() {
         return;
@@ -1717,12 +1722,7 @@ unsafe fn scan_folder_items(
 
         // Check if already scored (has the score field set)
         let has_score = check_has_score(item, score_field);
-        if has_score {
-            skipped += 1;
-            release_dispatch(item);
-            continue;
-        }
-
+        
         // Build a temporary sink reference to reuse handle_item_add
         let temp_sink = FolderItemsSink {
             vtbl: &raw const FOLDER_SINK_VTBL,
@@ -1731,6 +1731,40 @@ unsafe fn scan_folder_items(
             folder_name: folder_name.to_string(),
             calendar_only: false,
         };
+
+        // If has_score and use_cached_scores, still call handle_item_add
+        // because it has bounce-back logic to re-move spam/unsure messages
+        // that ended up back in the watch folder. We only skip fully-scored
+        // ham messages to avoid re-processing them.
+        if has_score && use_cached_scores {
+            // Read the existing score - if ham, skip; if spam/unsure, re-move
+            let existing_score = get_score_value(item, score_field);
+            let state_guard = match temp_sink.state.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    release_dispatch(item);
+                    continue;
+                }
+            };
+            let spam_threshold = state_guard.config.filter.spam_threshold;
+            let unsure_threshold = state_guard.config.filter.unsure_threshold;
+            drop(state_guard);
+            
+            if let Some(score) = existing_score {
+                if score < unsure_threshold {
+                    // Already scored as ham - skip
+                    skipped += 1;
+                    release_dispatch(item);
+                    continue;
+                }
+                // Score is spam or unsure - go through handle_item_add for bounce-back
+                log_debug(debug_path, &format!(
+                    "  Scanned spam/unsure (score {:.1}%), processing for bounce-back", score
+                ));
+            } else {
+                // Couldn't read score - go through handle_item_add
+            }
+        }
 
         handle_item_add(&temp_sink, item);
         processed += 1;

@@ -88,7 +88,7 @@ unsafe extern "system" fn button_poll_timer_proc(
     _id_event: usize,
     _dw_time: u32,
 ) {
-    use crate::com_invoke::{dispatch_get, dispatch_invoke_method, VariantArg};
+    use crate::com_invoke::dispatch_get;
 
     let app_ptr = POLL_APP_PTR;
     if app_ptr.is_null() {
@@ -1447,9 +1447,9 @@ impl AddinCore {
                 }
             };
 
-            let state = ManagerState::from_config(&config);
-            let data_dir = Self::get_data_directory();
-            let profile_name = addin.get_mapi_profile_name()
+            let _state = ManagerState::from_config(&config);
+            let _data_dir = Self::get_data_directory();
+            let _profile_name = addin.get_mapi_profile_name()
                 .unwrap_or_else(|| "default".to_string());
 
             match &mut addin.gtk_runtime {
@@ -2903,73 +2903,6 @@ impl AddinCore {
 
         self.classifier = Some(classifier);
         self.storage = Some(storage);
-    }
-
-    /// Setup the toolbar in the Outlook Explorer window.
-    ///
-    /// Uses the Outlook Object Model (via IDispatch) to create a "SpamBayes"
-    /// command bar with Spam/Not Spam buttons and a dropdown menu.
-    fn setup_toolbar(&mut self) {
-        let app_ptr = match self.application {
-            Some(ptr) if !ptr.is_null() => ptr,
-            _ => {
-                self.log_error("setup_toolbar: No Application pointer available");
-                return;
-            }
-        };
-
-        let debug_path = Self::get_data_directory().join("addin_debug.log");
-        let _ = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&debug_path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "setup_toolbar: app_ptr={:?}", app_ptr)
-            });
-
-        let images_dir = Self::get_data_directory().join("images");
-        let mut toolbar_mgr = crate::toolbar::ToolbarManager::new(app_ptr, images_dir);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unsafe { toolbar_mgr.execute_setup() }
-        }));
-
-        match result {
-            Ok(Ok(())) => {
-                let _ = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&debug_path)
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        writeln!(f, "setup_toolbar: SUCCESS")
-                    });
-            }
-            Ok(Err(e)) => {
-                let _ = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&debug_path)
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        writeln!(f, "setup_toolbar: FAILED: {}", e)
-                    });
-            }
-            Err(panic_info) => {
-                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic".to_string()
-                };
-                let _ = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&debug_path)
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        writeln!(f, "setup_toolbar: PANICKED: {}", msg)
-                    });
-            }
-        }
     }
 
     /// Setup the filter engine with classifier, storage, and config.

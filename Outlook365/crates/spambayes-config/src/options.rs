@@ -180,6 +180,11 @@ pub struct FilterConfig {
     /// Number of days to keep spam before automatic deletion.
     /// Default: `30`.
     pub spam_auto_cleanup_days: u32,
+    /// Whether to use cached/scored messages instead of re-scoring.
+    /// When `true` (default), messages with an existing score are skipped.
+    /// When `false`, all messages are re-scored (like Python behavior).
+    /// Default: `true`.
+    pub use_cached_scores: bool,
 }
 
 impl Default for FilterConfig {
@@ -205,6 +210,7 @@ impl Default for FilterConfig {
             timer_only_receive_folders: true,
             spam_auto_cleanup_enabled: false,
             spam_auto_cleanup_days: 30,
+            use_cached_scores: false,
         }
     }
 }
@@ -722,6 +728,12 @@ impl AppConfig {
             match parse_u32(&v) {
                 Some(n) => filter.spam_auto_cleanup_days = n,
                 None => eprintln!("Warning: invalid value for [Filter] spam_auto_cleanup_days: {v:?}, using default"),
+            }
+        }
+        if let Some(v) = get("Filter", "use_cached_scores") {
+            match parse_bool(&v) {
+                Some(b) => filter.use_cached_scores = b,
+                None => eprintln!("Warning: invalid value for [Filter] use_cached_scores: {v:?}, using default"),
             }
         }
     }

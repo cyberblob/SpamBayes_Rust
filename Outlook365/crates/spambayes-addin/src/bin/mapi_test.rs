@@ -2,8 +2,6 @@
 //!
 //! Run with: cargo run --bin mapi_test --target x86_64-pc-windows-msvc
 
-use std::ffi::c_void;
-
 fn main() {
     // Initialize COM
     println!("=== SpamBayes MAPI Diagnostic ===");
