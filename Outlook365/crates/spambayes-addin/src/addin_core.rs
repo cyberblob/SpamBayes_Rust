@@ -1403,6 +1403,31 @@ impl AddinCore {
                   onAction="OnManagerClick" />
         </group>
       </tab>
+      <tab idMso="TabReadMessage">
+        <group id="grpSpamBayesRead"
+               label="SpamBayes"
+               insertAfterMso="GroupMailDelete">
+          <button id="btnSpamRead"
+                  label="Spam"
+                  size="normal"
+                  image="delete_as_spam"
+                  onAction="OnSpamClick"
+                  getEnabled="GetSpamEnabled"
+                  getVisible="GetSpamVisible" />
+          <button id="btnNotSpamRead"
+                  label="Not Spam"
+                  size="normal"
+                  image="recover_ham"
+                  onAction="OnNotSpamClick"
+                  getEnabled="GetNotSpamEnabled" />
+          <button id="btnShowCluesRead"
+                  label="Show Clues"
+                  size="normal"
+                  imageMso="TraceDependents"
+                  onAction="OnShowCluesClick"
+                  getEnabled="GetShowCluesEnabled" />
+        </group>
+      </tab>
     </tabs>
   </ribbon>
   <contextMenus>
