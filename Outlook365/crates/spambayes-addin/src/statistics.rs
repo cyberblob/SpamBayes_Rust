@@ -91,12 +91,15 @@ impl StatisticsManager {
     ///
     /// Session counters always start at zero (Requirement 1.6).
     /// If the file is missing or corrupt, lifetime counters start at zero.
+    /// If the file does not exist yet, it is created immediately with zeros
+    /// so that external tools (e.g., the Manager GUI) always have a valid file
+    /// to read.
     pub fn new(data_directory: &Path, save_interval: u32) -> Self {
         let file_path = data_directory.join("spambayes_stats.json");
 
-        let lifetime = Self::load_from_file(&file_path);
+        let (lifetime, file_existed) = Self::load_from_file(&file_path);
 
-        let inner = StatisticsInner {
+        let mut inner = StatisticsInner {
             session: SessionStats::default(),
             lifetime,
             file_path,
@@ -104,29 +107,35 @@ impl StatisticsManager {
             save_interval,
         };
 
+        // Ensure the file exists on disk even when starting fresh.
+        if !file_existed {
+            Self::save_inner(&mut inner);
+        }
+
         Self {
             inner: Arc::new(Mutex::new(inner)),
         }
     }
 
     /// Attempt to load lifetime statistics from the JSON file.
-    /// Returns default (zeros) if the file is missing or corrupt.
-    fn load_from_file(file_path: &Path) -> LifetimeStats {
+    /// Returns (stats, file_existed): default zeros if missing or corrupt,
+    /// and a bool indicating whether a valid file was found on disk.
+    fn load_from_file(file_path: &Path) -> (LifetimeStats, bool) {
         match std::fs::read_to_string(file_path) {
             Ok(contents) => match serde_json::from_str::<StatsFile>(&contents) {
-                Ok(stats_file) => stats_file.lifetime,
+                Ok(stats_file) => (stats_file.lifetime, true),
                 Err(e) => {
                     eprintln!(
                         "Warning: statistics file is corrupt ({}), starting fresh: {}",
                         file_path.display(),
                         e
                     );
-                    LifetimeStats::default()
+                    (LifetimeStats::default(), false)
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // File doesn't exist yet — normal for first run.
-                LifetimeStats::default()
+                (LifetimeStats::default(), false)
             }
             Err(e) => {
                 eprintln!(
@@ -134,7 +143,7 @@ impl StatisticsManager {
                     file_path.display(),
                     e
                 );
-                LifetimeStats::default()
+                (LifetimeStats::default(), false)
             }
         }
     }
@@ -287,8 +296,19 @@ impl StatisticsManager {
         Self::save_inner(&mut inner);
     }
 
+    /// Maximum number of retry attempts when the file is locked by another process.
+    const SAVE_MAX_RETRIES: u32 = 5;
+
+    /// Initial delay between retries (doubles on each attempt).
+    const SAVE_INITIAL_DELAY_MS: u64 = 50;
+
     /// Internal save implementation. Writes atomically via temp file + rename.
     /// Resets `dirty_count` on success. Logs warnings on failure.
+    ///
+    /// If the file is held open by another process (e.g., the Manager GUI reading
+    /// stats), this retries with exponential backoff up to ~1.5 seconds total
+    /// before giving up. The in-memory counters remain correct regardless and
+    /// will be persisted on the next successful save.
     fn save_inner(inner: &mut StatisticsInner) {
         let stats_file = StatsFile {
             version: 1,
@@ -305,21 +325,27 @@ impl StatisticsManager {
 
         let temp_path = inner.file_path.with_extension("json.tmp");
 
-        if let Err(e) = std::fs::write(&temp_path, json.as_bytes()) {
+        // Write to temp file with retry on sharing violations.
+        if !Self::retry_io(Self::SAVE_MAX_RETRIES, Self::SAVE_INITIAL_DELAY_MS, || {
+            std::fs::write(&temp_path, json.as_bytes())
+        }) {
             eprintln!(
-                "Warning: failed to write statistics temp file ({}): {}",
+                "Warning: failed to write statistics temp file after {} retries ({})",
+                Self::SAVE_MAX_RETRIES,
                 temp_path.display(),
-                e
             );
             return;
         }
 
-        if let Err(e) = std::fs::rename(&temp_path, &inner.file_path) {
+        // Rename temp → final with retry on sharing violations.
+        if !Self::retry_io(Self::SAVE_MAX_RETRIES, Self::SAVE_INITIAL_DELAY_MS, || {
+            std::fs::rename(&temp_path, &inner.file_path)
+        }) {
             eprintln!(
-                "Warning: failed to rename statistics file ({} -> {}): {}",
+                "Warning: failed to rename statistics file after {} retries ({} -> {})",
+                Self::SAVE_MAX_RETRIES,
                 temp_path.display(),
                 inner.file_path.display(),
-                e
             );
             // Try to clean up the temp file.
             let _ = std::fs::remove_file(&temp_path);
@@ -327,6 +353,52 @@ impl StatisticsManager {
         }
 
         inner.dirty_count = 0;
+    }
+
+    /// Retry an I/O operation that may fail with a sharing violation or
+    /// permission error because another process holds the file open.
+    ///
+    /// Uses exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms (total ~1.55s).
+    /// Returns `true` if the operation eventually succeeded, `false` if all
+    /// retries were exhausted.
+    fn retry_io<F>(max_retries: u32, initial_delay_ms: u64, mut op: F) -> bool
+    where
+        F: FnMut() -> std::io::Result<()>,
+    {
+        let mut delay_ms = initial_delay_ms;
+
+        for attempt in 0..=max_retries {
+            match op() {
+                Ok(()) => return true,
+                Err(ref e) if Self::is_sharing_violation(e) && attempt < max_retries => {
+                    // File is locked — wait and retry.
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms = delay_ms.saturating_mul(2);
+                }
+                Err(_) => {
+                    // Non-retryable error or final attempt — give up.
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check whether an I/O error indicates a sharing violation (file in use).
+    ///
+    /// On Windows this is `ERROR_SHARING_VIOLATION` (OS error 32) or
+    /// `ERROR_LOCK_VIOLATION` (OS error 33). On other platforms we check
+    /// for `PermissionDenied` as the closest equivalent.
+    fn is_sharing_violation(err: &std::io::Error) -> bool {
+        #[cfg(windows)]
+        {
+            // ERROR_SHARING_VIOLATION = 32, ERROR_LOCK_VIOLATION = 33
+            matches!(err.raw_os_error(), Some(32) | Some(33))
+        }
+        #[cfg(not(windows))]
+        {
+            err.kind() == std::io::ErrorKind::PermissionDenied
+        }
     }
 }
 
@@ -472,17 +544,24 @@ mod tests {
         let stats_path = dir.path().join("spambayes_stats.json");
         let mgr = StatisticsManager::new(dir.path(), 3);
 
-        // File should not exist yet (no saves).
-        assert!(!stats_path.exists());
+        // File should exist immediately (created on init with zeros).
+        assert!(stats_path.exists(), "stats file should be created on init");
+
+        // Verify it starts with zeros.
+        let contents = fs::read_to_string(&stats_path).unwrap();
+        let saved: StatsFile = serde_json::from_str(&contents).unwrap();
+        assert_eq!(saved.lifetime.total_ham_classified, 0);
 
         mgr.on_classified(Classification::Ham);
         mgr.on_classified(Classification::Spam);
-        // Still below threshold — no file yet.
-        assert!(!stats_path.exists());
+
+        // Still below save_interval — file should still show zeros (not updated).
+        let contents = fs::read_to_string(&stats_path).unwrap();
+        let saved: StatsFile = serde_json::from_str(&contents).unwrap();
+        assert_eq!(saved.lifetime.total_ham_classified, 0);
 
         // Third classification hits the save_interval of 3.
         mgr.on_classified(Classification::Unsure);
-        assert!(stats_path.exists(), "auto-save should have created the file");
 
         // Verify contents are valid JSON with correct counts.
         let contents = fs::read_to_string(&stats_path).unwrap();

@@ -28,9 +28,9 @@ fn main() {
     );
 
     println!("cargo:rustc-env=SPAMBAYES_BUILD_ID={build_id}");
-    // Always re-run so the timestamp updates on every build
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=FORCE_REBUILD");
+    // Tell Cargo to always re-run this build script so the timestamp updates
+    // on every build. Using a non-existent file means "always dirty".
+    println!("cargo:rerun-if-changed=__always_rebuild__");
 }
 
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {

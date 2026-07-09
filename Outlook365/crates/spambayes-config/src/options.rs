@@ -185,6 +185,17 @@ pub struct FilterConfig {
     /// When `false`, all messages are re-scored (like Python behavior).
     /// Default: `true`.
     pub use_cached_scores: bool,
+    /// Whether to clear the Exchange SCL (Spam Confidence Level) property
+    /// on messages before moving them out of the watched folder.
+    ///
+    /// When enabled, the add-in sets `PR_CONTENT_FILTER_SCL` to -1 on
+    /// messages it moves. This tells Exchange the message has been
+    /// whitelisted and prevents server-side junk rules from bouncing
+    /// the message back to the Junk Email folder.
+    ///
+    /// Only effective on Exchange/Outlook.com/Hotmail stores.
+    /// Default: `false`.
+    pub clear_exchange_scl: bool,
 }
 
 impl Default for FilterConfig {
@@ -211,6 +222,7 @@ impl Default for FilterConfig {
             spam_auto_cleanup_enabled: false,
             spam_auto_cleanup_days: 30,
             use_cached_scores: false,
+            clear_exchange_scl: false,
         }
     }
 }
@@ -736,6 +748,12 @@ impl AppConfig {
                 None => eprintln!("Warning: invalid value for [Filter] use_cached_scores: {v:?}, using default"),
             }
         }
+        if let Some(v) = get("Filter", "clear_exchange_scl") {
+            match parse_bool(&v) {
+                Some(b) => filter.clear_exchange_scl = b,
+                None => eprintln!("Warning: invalid value for [Filter] clear_exchange_scl: {v:?}, using default"),
+            }
+        }
     }
 
     fn load_filter_now_section(
@@ -1006,6 +1024,9 @@ impl AppConfig {
         if self.filter.spam_auto_cleanup_days != defaults.filter.spam_auto_cleanup_days {
             filter.insert("spam_auto_cleanup_days".to_string(), self.filter.spam_auto_cleanup_days.to_string());
         }
+        if self.filter.clear_exchange_scl != defaults.filter.clear_exchange_scl {
+            filter.insert("clear_exchange_scl".to_string(), format_bool(self.filter.clear_exchange_scl).to_string());
+        }
         if !filter.is_empty() {
             data.insert("Filter".to_string(), filter);
         }
@@ -1212,6 +1233,8 @@ impl AppConfig {
         filter.insert("timer_only_receive_folders".to_string(), format_bool(self.filter.timer_only_receive_folders).to_string());
         filter.insert("spam_auto_cleanup_enabled".to_string(), format_bool(self.filter.spam_auto_cleanup_enabled).to_string());
         filter.insert("spam_auto_cleanup_days".to_string(), self.filter.spam_auto_cleanup_days.to_string());
+        filter.insert("use_cached_scores".to_string(), format_bool(self.filter.use_cached_scores).to_string());
+        filter.insert("clear_exchange_scl".to_string(), format_bool(self.filter.clear_exchange_scl).to_string());
         data.insert("Filter".to_string(), filter);
 
         // ── Filter_Now section ──

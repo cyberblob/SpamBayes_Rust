@@ -688,6 +688,9 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                     score
                 ));
                 if let Some(dest) = &filter_config.spam_folder_id {
+                    if filter_config.clear_exchange_scl {
+                        clear_scl_on_item(mail_item, &debug_path);
+                    }
                     move_item_to_folder(mail_item, dest, &debug_path);
                 }
                 return;
@@ -698,6 +701,9 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                     score
                 ));
                 if let Some(dest) = &filter_config.unsure_folder_id {
+                    if filter_config.clear_exchange_scl {
+                        clear_scl_on_item(mail_item, &debug_path);
+                    }
                     move_item_to_folder(mail_item, dest, &debug_path);
                 }
                 return;
@@ -731,6 +737,9 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 score
             ));
             if let Some(dest) = &filter_config.spam_folder_id {
+                if filter_config.clear_exchange_scl {
+                    clear_scl_on_item(mail_item, &debug_path);
+                }
                 move_item_to_folder(mail_item, dest, &debug_path);
             }
             return;
@@ -740,6 +749,9 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 score
             ));
             if let Some(dest) = &filter_config.unsure_folder_id {
+                if filter_config.clear_exchange_scl {
+                    clear_scl_on_item(mail_item, &debug_path);
+                }
                 move_item_to_folder(mail_item, dest, &debug_path);
             }
             return;
@@ -840,10 +852,12 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         filter_config.spam_threshold, filter_config.unsure_threshold
     ));
 
-    // Record the classification in the statistics manager.
+    // Record the classification in the statistics manager and persist immediately.
+    // Messages arrive at low frequency so per-message saves have negligible overhead.
     if let Ok(state) = sink.state.lock() {
         if let Some(stats) = &state.statistics {
             stats.on_classified(result.classification);
+            stats.save();
         }
     }
 
@@ -923,6 +937,9 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                                 "  Calendar spam action: MOVE to spam folder (entry={}...)",
                                 &dest_folder_id.entry_id.0[..16.min(dest_folder_id.entry_id.0.len())]
                             ));
+                            if filter_config.clear_exchange_scl && is_online_store {
+                                clear_scl_on_item(mail_item, &debug_path);
+                            }
                             move_item_to_folder(mail_item, dest_folder_id, &debug_path);
                         } else {
                             log_debug(&debug_path, "  Calendar spam action: MOVE but no spam folder configured, leaving in place");
@@ -974,6 +991,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 if is_online_store {
                     mark_as_filter_moved(mail_item, result.score_pct);
                 }
+                // Clear Exchange SCL to prevent server-side junk rules from
+                // bouncing the message back after we move it.
+                if filter_config.clear_exchange_scl && is_online_store {
+                    clear_scl_on_item(mail_item, &debug_path);
+                }
                 move_item_to_folder(mail_item, dest_folder_id, &debug_path);
             } else {
                 log_debug(&debug_path, &format!(
@@ -989,6 +1011,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 ));
                 if is_online_store {
                     mark_as_filter_moved(mail_item, result.score_pct);
+                }
+                // Clear Exchange SCL to prevent server-side junk rules from
+                // bouncing the message back after we copy it.
+                if filter_config.clear_exchange_scl && is_online_store {
+                    clear_scl_on_item(mail_item, &debug_path);
                 }
                 copy_item_to_folder(mail_item, dest_folder_id, &debug_path);
             } else {
@@ -1234,6 +1261,85 @@ unsafe fn get_long_property(obj: *mut c_void, name: &str) -> Option<i32> {
     match result_var.vt {
         3 | 22 => Some(*(result_var.data.as_ptr().cast::<i32>())),
         _ => None,
+    }
+}
+
+/// Clear the Exchange Spam Confidence Level (SCL) on a message.
+///
+/// Sets `PR_CONTENT_FILTER_SCL` (property tag 0x40760003) to -1 via
+/// the Outlook Object Model's `PropertyAccessor.SetProperty`. A value
+/// of -1 tells Exchange that the message has been explicitly whitelisted,
+/// preventing server-side junk rules from re-evaluating and bouncing it
+/// back to the Junk Email folder after we move it.
+///
+/// This is only effective on Exchange/Outlook.com/Hotmail stores and
+/// should only be called when the `clear_exchange_scl` config option
+/// is enabled.
+unsafe fn clear_scl_on_item(mail_item: *mut c_void, debug_path: &str) {
+    // Get PropertyAccessor from the MailItem
+    let prop_accessor = match dispatch_get(mail_item, "PropertyAccessor") {
+        Ok(p) if !p.is_null() => p,
+        _ => {
+            log_debug(debug_path, "  clear_scl: cannot get PropertyAccessor");
+            return;
+        }
+    };
+
+    // PR_CONTENT_FILTER_SCL schema URL (MAPI property tag 0x40760003 = PT_LONG)
+    let schema = "http://schemas.microsoft.com/mapi/proptag/0x40760003";
+
+    let dispid = match get_dispid_on(prop_accessor, "SetProperty") {
+        Some(id) => id,
+        None => {
+            log_debug(debug_path, "  clear_scl: cannot resolve SetProperty DISPID");
+            release_dispatch(prop_accessor);
+            return;
+        }
+    };
+
+    let vtbl = *(prop_accessor as *const *const IDispatchVtblRaw);
+
+    // Build arguments: SetProperty(SchemaName, Value)
+    // COM args are in reverse order: Value first (index 0), SchemaName second (index 1)
+    let bstr_schema = sys_alloc_string_local(schema);
+
+    let mut args = [Variant::default(), Variant::default()];
+    // arg[0] = Value (-1 as VT_I4)
+    args[0].vt = 3; // VT_I4
+    *(args[0].data.as_mut_ptr().cast::<i32>()) = -1;
+    // arg[1] = SchemaName (VT_BSTR)
+    args[1].vt = 8; // VT_BSTR
+    *(args[1].data.as_mut_ptr().cast::<*mut u16>()) = bstr_schema;
+
+    let mut params = DispParams {
+        rgvarg: args.as_mut_ptr(),
+        rgdispid_named_args: ptr::null_mut(),
+        c_args: 2,
+        c_named_args: 0,
+    };
+
+    let hr = ((*vtbl).invoke)(
+        prop_accessor,
+        dispid,
+        &GUID::from_u128(0),
+        0,
+        1, // DISPATCH_METHOD
+        &raw mut params,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+    );
+
+    SysFreeString(bstr_schema);
+    release_dispatch(prop_accessor);
+
+    if hr.0 == 0 {
+        log_debug(debug_path, "  clear_scl: PR_CONTENT_FILTER_SCL set to -1 (whitelisted)");
+    } else {
+        log_debug(debug_path, &format!(
+            "  clear_scl: SetProperty failed (HRESULT={:#X}) — Exchange may not support this property",
+            hr.0 as u32
+        ));
     }
 }
 

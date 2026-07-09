@@ -1134,7 +1134,7 @@ impl AddinCore {
 
         // Initialize statistics manager.
         let data_dir = Self::get_data_directory();
-        let statistics = StatisticsManager::new(&data_dir, 10);
+        let statistics = StatisticsManager::new(&data_dir, 1);
         self.statistics = Some(statistics);
         self.log_info("StatisticsManager initialized");
 
