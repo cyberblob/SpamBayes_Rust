@@ -419,6 +419,11 @@ impl FilteringTab {
         let ham_folder_entry = Entry::new();
         ham_folder_entry.set_hexpand(true);
         ham_folder_entry.set_placeholder_text(Some("Select a folder..."));
+        if let Some(ref fid) = state.ham_folder_id {
+            let names = FolderBrowserDialog::resolve_folder_names(folder_provider.as_ref(), &[fid.clone()]);
+            let name = names.into_iter().next().unwrap_or_else(|| "(configured)".to_string());
+            ham_folder_entry.set_text(&name);
+        }
 
         let ham_folder_browse_btn = Button::with_label("Browse...");
 
@@ -502,7 +507,7 @@ impl FilteringTab {
         let watched_folder_ids = Rc::new(RefCell::new(state.watch_folder_ids.clone()));
         let spam_folder_id_rc = Rc::new(RefCell::new(state.spam_folder_id.clone()));
         let unsure_folder_id_rc = Rc::new(RefCell::new(state.unsure_folder_id.clone()));
-        let ham_folder_id_rc: Rc<RefCell<Option<FolderId>>> = Rc::new(RefCell::new(None));
+        let ham_folder_id_rc: Rc<RefCell<Option<FolderId>>> = Rc::new(RefCell::new(state.ham_folder_id.clone()));
 
         // ─── Wire Browse buttons to FolderBrowserDialog ──────────────────
 

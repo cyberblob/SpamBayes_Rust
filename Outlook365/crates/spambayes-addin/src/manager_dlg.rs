@@ -396,6 +396,9 @@ pub struct ManagerState {
     /// Unsure destination folder.
     pub unsure_folder_id: Option<FolderId>,
 
+    /// Ham (good) destination folder.
+    pub ham_folder_id: Option<FolderId>,
+
     /// Ham training folder IDs.
     pub ham_training_folder_ids: Vec<FolderId>,
 
@@ -423,6 +426,7 @@ impl ManagerState {
             watch_folder_ids: config.filter.watch_folder_ids.clone(),
             spam_folder_id: config.filter.spam_folder_id.clone(),
             unsure_folder_id: config.filter.unsure_folder_id.clone(),
+            ham_folder_id: config.filter.ham_folder_id.clone(),
             ham_training_folder_ids: config.training.ham_folder_ids.clone(),
             spam_training_folder_ids: config.training.spam_folder_ids.clone(),
             dirty: false,
@@ -444,6 +448,7 @@ impl ManagerState {
         config.filter.watch_folder_ids = self.watch_folder_ids.clone();
         config.filter.spam_folder_id = self.spam_folder_id.clone();
         config.filter.unsure_folder_id = self.unsure_folder_id.clone();
+        config.filter.ham_folder_id = self.ham_folder_id.clone();
         config.training.ham_folder_ids = self.ham_training_folder_ids.clone();
         config.training.spam_folder_ids = self.spam_training_folder_ids.clone();
     }
