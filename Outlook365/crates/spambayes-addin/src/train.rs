@@ -1676,8 +1676,12 @@ mod tests {
     // ── Helper Functions ─────────────────────────────────────────────────
 
     fn make_logger() -> Arc<Logger> {
-        // Use a temp file for test logging.
-        let path = std::env::temp_dir().join("spambayes_train_test.log");
+        // Log to %LOCALAPPDATA%\SpamBayes\ (consistent with production).
+        let base = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let dir = std::path::PathBuf::from(base).join("SpamBayes");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("spambayes_train_test.log");
         Arc::new(Logger::new(&path, crate::LogLevel::Verbose).unwrap())
     }
 

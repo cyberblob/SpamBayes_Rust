@@ -582,9 +582,14 @@ mod tests {
             spam_include_sub: false,
         };
 
+        let log_base = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let log_dir = std::path::PathBuf::from(log_base).join("SpamBayes");
+        let _ = fs::create_dir_all(&log_dir);
+
         let logger = Arc::new(
             Logger::new(
-                &std::env::temp_dir().join("spambayes_export_test.log"),
+                &log_dir.join("spambayes_export_test.log"),
                 crate::LogLevel::Verbose,
             )
             .unwrap(),
@@ -644,9 +649,14 @@ mod tests {
             spam_include_sub: false,
         };
 
+        let log_base = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let log_dir = std::path::PathBuf::from(log_base).join("SpamBayes");
+        let _ = fs::create_dir_all(&log_dir);
+
         let logger = Arc::new(
             Logger::new(
-                &std::env::temp_dir().join("spambayes_export_test_append.log"),
+                &log_dir.join("spambayes_export_test_append.log"),
                 crate::LogLevel::Verbose,
             )
             .unwrap(),
