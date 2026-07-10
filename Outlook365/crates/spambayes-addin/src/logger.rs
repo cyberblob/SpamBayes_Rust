@@ -2,13 +2,24 @@
 //!
 //! Provides a thread-safe [`Logger`] that writes timestamped, level-tagged
 //! entries to a file. The default output location is
-//! `%TEMP%\spambayes_debug.log`.
+//! `%LOCALAPPDATA%\SpamBayes\addin_debug.log`.
+//!
+//! ## Verbosity Levels
+//!
+//! The verbosity setting in the Manager GUI maps directly to [`LogLevel`]:
+//!
+//! | Value | Level     | Description                              |
+//! |-------|-----------|------------------------------------------|
+//! | 0     | `Error`   | Minimal logging — errors only            |
+//! | 1     | `Info`    | Application flow logging                 |
+//! | 2     | `Verbose` | Debugging verbose logging (all messages) |
 //!
 //! **Validates: Requirements 17.2, 17.3, 17.6, 17.7, 21.5**
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -21,13 +32,16 @@ use crate::LogLevel;
 /// the originating module name.
 ///
 /// Thread-safe via an internal [`Mutex`] around the buffered writer.
+/// The log level uses an [`AtomicU8`] so it can be updated at runtime
+/// without acquiring the write lock.
+///
 /// Flushes after every write to ensure entries are visible even if
 /// the process crashes.
 ///
 /// **Validates: Requirements 17.2, 17.3, 17.6, 17.7, 21.5**
 pub struct Logger {
     file: Mutex<BufWriter<File>>,
-    level: LogLevel,
+    level: AtomicU8,
 }
 
 impl Logger {
@@ -47,19 +61,51 @@ impl Logger {
 
         Ok(Self {
             file: Mutex::new(BufWriter::new(file)),
-            level,
+            level: AtomicU8::new(level as u8),
         })
     }
 
-    /// Returns the default log file path: `%TEMP%\spambayes_debug.log`.
+    /// Returns the default log file path:
+    /// `%LOCALAPPDATA%\SpamBayes\addin_debug.log`.
     ///
-    /// Falls back to the current directory if `TEMP` is not set.
+    /// Falls back to `%TEMP%\addin_debug.log` if `LOCALAPPDATA` is not set.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        let temp = std::env::var("TEMP")
-            .or_else(|_| std::env::var("TMP"))
-            .unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(temp).join("spambayes_debug.log")
+        let base = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| {
+                std::env::var("TEMP")
+                    .or_else(|_| std::env::var("TMP"))
+                    .unwrap_or_else(|_| ".".to_string())
+            });
+        PathBuf::from(base).join("SpamBayes").join("addin_debug.log")
+    }
+
+    /// Updates the log level at runtime.
+    ///
+    /// This is lock-free and can be called from any thread. Messages
+    /// logged after this call will use the new level for filtering.
+    pub fn set_level(&self, level: LogLevel) {
+        self.level.store(level as u8, Ordering::Relaxed);
+    }
+
+    /// Returns the current log level.
+    #[must_use]
+    pub fn current_level(&self) -> LogLevel {
+        LogLevel::from_u8(self.level.load(Ordering::Relaxed))
+    }
+
+    /// Converts a config verbosity value (u32) to a [`LogLevel`].
+    ///
+    /// - `0` → `Error` (minimal logging)
+    /// - `1` → `Info` (application flow)
+    /// - `2+` → `Verbose` (debugging)
+    #[must_use]
+    pub fn verbosity_to_level(verbose: u32) -> LogLevel {
+        match verbose {
+            0 => LogLevel::Error,
+            1 => LogLevel::Info,
+            _ => LogLevel::Verbose,
+        }
     }
 
     /// Logs a message if `level` is at or below the configured threshold.
@@ -73,7 +119,8 @@ impl Logger {
     pub fn log(&self, level: LogLevel, module: &str, message: &str) {
         // Higher numeric value = more verbose. Only log if the message
         // level is <= the configured threshold.
-        if (level as u8) > (self.level as u8) {
+        let current_level = self.level.load(Ordering::Relaxed);
+        if (level as u8) > current_level {
             return;
         }
 
@@ -106,6 +153,19 @@ impl Logger {
     /// Convenience method to log at [`LogLevel::Verbose`].
     pub fn verbose(&self, module: &str, message: &str) {
         self.log(LogLevel::Verbose, module, message);
+    }
+}
+
+impl LogLevel {
+    /// Converts a raw `u8` to a `LogLevel`, defaulting to `Error` for
+    /// unrecognized values.
+    #[must_use]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Error,
+            1 => Self::Info,
+            _ => Self::Verbose,
+        }
     }
 }
 

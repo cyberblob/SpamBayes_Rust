@@ -34,6 +34,7 @@ use spambayes_mapi::MsgStoreError;
 use spambayes_storage::{MessageDatabase, StorageBackend};
 
 use crate::statistics::StatisticsManager;
+use crate::logger::Logger;
 
 // ─── FilterError ─────────────────────────────────────────────────────────────
 
@@ -274,6 +275,8 @@ pub struct FilterEngine {
     tokenizer: Tokenizer,
     /// Optional statistics observer for classification tracking.
     statistics: Option<StatisticsManager>,
+    /// Optional logger for verbose diagnostics.
+    logger: Option<Arc<Logger>>,
 }
 
 impl FilterEngine {
@@ -292,6 +295,7 @@ impl FilterEngine {
             message_db,
             tokenizer: Tokenizer::with_defaults(),
             statistics,
+            logger: None,
         }
     }
 
@@ -311,7 +315,13 @@ impl FilterEngine {
             message_db,
             tokenizer,
             statistics,
+            logger: None,
         }
+    }
+
+    /// Set the logger for verbose diagnostics.
+    pub fn set_logger(&mut self, logger: Arc<Logger>) {
+        self.logger = Some(logger);
     }
 
     /// Classify raw message bytes: tokenize → score → classify.
@@ -335,6 +345,13 @@ impl FilterEngine {
         // Step 1: Tokenize the message content.
         let tokens = self.tokenizer.tokenize(message_bytes);
 
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "classify_raw: tokenized {} bytes into {} tokens",
+                message_bytes.len(), tokens.len()
+            ));
+        }
+
         // Step 2: Score using the classifier.
         let classifier = self
             .classifier
@@ -348,6 +365,13 @@ impl FilterEngine {
 
         // Step 4: Classify based on thresholds.
         let classification = self.classify_score(score_pct);
+
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "classify_raw: score={:.2}%, classification={:?} (thresholds: spam>={:.1}, unsure>={:.1})",
+                score_pct, classification, self.config.spam_threshold, self.config.unsure_threshold
+            ));
+        }
 
         Ok(FilterResult {
             classification,
@@ -434,6 +458,13 @@ impl FilterEngine {
         message_bytes: &[u8],
         general_config: &GeneralConfig,
     ) -> Result<FilterResult, FilterError> {
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "filter_message: processing {} bytes of message content",
+                message_bytes.len()
+            ));
+        }
+
         // Step 1: Score and classify the message.
         let result = self.classify_raw(message_bytes)?;
 
@@ -461,10 +492,21 @@ impl FilterEngine {
             ),
         };
 
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "filter_message: classification={:?}, score={:.2}%, action={:?}, mark_as_read={}",
+                result.classification, result.score_pct, action, mark_as_read
+            ));
+        }
+
         // Step 3: Mark as read if configured for this classification.
         if mark_as_read {
             if let Err(e) = message.set_read_state(true) {
-                eprintln!("Warning: failed to mark message as read: {e}");
+                if let Some(logger) = &self.logger {
+                    logger.verbose("filter", &format!(
+                        "filter_message: failed to mark as read: {e}"
+                    ));
+                }
             }
         }
 
@@ -476,24 +518,35 @@ impl FilterEngine {
         // message in its new (SpamBayes-owned) destination folder.
         match action {
             FilterAction::Untouched => {
-                // Leave message in place — nothing to do.
+                if let Some(logger) = &self.logger {
+                    logger.verbose("filter", "filter_message: action=Untouched, leaving in place");
+                }
             }
             FilterAction::Move => {
                 match folder_id {
                     Some(fid) => {
                         let folder_str = fid.to_ini_str();
+                        if let Some(logger) = &self.logger {
+                            logger.verbose("filter", &format!(
+                                "filter_message: moving to folder '{}'", folder_str
+                            ));
+                        }
                         if let Err(e) = message.move_to(&folder_str) {
-                            eprintln!(
-                                "Error: failed to move message to folder '{folder_str}': {e}"
-                            );
+                            if let Some(logger) = &self.logger {
+                                logger.log(crate::LogLevel::Error, "filter", &format!(
+                                    "filter_message: move failed: {e}"
+                                ));
+                            }
                             // Leave message in place per requirement 6.8
                         }
                     }
                     None => {
-                        eprintln!(
-                            "Error: destination folder not configured for {:?} action, leaving message in place",
-                            result.classification
-                        );
+                        if let Some(logger) = &self.logger {
+                            logger.log(crate::LogLevel::Error, "filter", &format!(
+                                "filter_message: no folder configured for {:?} move action",
+                                result.classification
+                            ));
+                        }
                     }
                 }
             }
@@ -501,18 +554,27 @@ impl FilterEngine {
                 match folder_id {
                     Some(fid) => {
                         let folder_str = fid.to_ini_str();
+                        if let Some(logger) = &self.logger {
+                            logger.verbose("filter", &format!(
+                                "filter_message: copying to folder '{}'", folder_str
+                            ));
+                        }
                         if let Err(e) = message.copy_to(&folder_str) {
-                            eprintln!(
-                                "Error: failed to copy message to folder '{folder_str}': {e}"
-                            );
+                            if let Some(logger) = &self.logger {
+                                logger.log(crate::LogLevel::Error, "filter", &format!(
+                                    "filter_message: copy failed: {e}"
+                                ));
+                            }
                             // Leave message in place per requirement 6.8
                         }
                     }
                     None => {
-                        eprintln!(
-                            "Error: destination folder not configured for {:?} copy action, leaving message in place",
-                            result.classification
-                        );
+                        if let Some(logger) = &self.logger {
+                            logger.log(crate::LogLevel::Error, "filter", &format!(
+                                "filter_message: no folder configured for {:?} copy action",
+                                result.classification
+                            ));
+                        }
                     }
                 }
             }
@@ -640,11 +702,21 @@ impl FilterEngine {
     ) -> Result<CleanupResult, FilterError> {
         // Requirement 18.1: Return early if cleanup is disabled.
         if !self.config.spam_auto_cleanup_enabled {
+            if let Some(logger) = &self.logger {
+                logger.verbose("filter", "cleanup_old_spam: disabled, skipping");
+            }
             return Ok(CleanupResult {
                 deleted_count: 0,
                 skipped_count: 0,
                 error_count: 0,
             });
+        }
+
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "cleanup_old_spam: running (retention={} days)",
+                self.config.spam_auto_cleanup_days
+            ));
         }
 
         // Requirement 18.1: Must have a spam folder configured.
@@ -683,18 +755,32 @@ impl FilterEngine {
 
             if age_days >= i64::from(self.config.spam_auto_cleanup_days) {
                 // Message has exceeded retention period — delete it.
+                if let Some(logger) = &self.logger {
+                    logger.verbose("filter", &format!(
+                        "cleanup_old_spam: deleting message (age={} days)", age_days
+                    ));
+                }
                 match msg.delete() {
                     Ok(()) => result.deleted_count += 1,
                     Err(e) => {
                         // Requirement 18.4: Log error and continue.
-                        eprintln!(
-                            "Warning: failed to delete spam message during cleanup: {e}"
-                        );
+                        if let Some(logger) = &self.logger {
+                            logger.log(crate::LogLevel::Error, "filter", &format!(
+                                "cleanup_old_spam: delete failed: {e}"
+                            ));
+                        }
                         result.error_count += 1;
                     }
                 }
             }
             // If age < retention, message is kept (not counted anywhere special).
+        }
+
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "cleanup_old_spam: complete — deleted={}, skipped={}, errors={}",
+                result.deleted_count, result.skipped_count, result.error_count
+            ));
         }
 
         Ok(result)
@@ -731,6 +817,16 @@ impl FilterEngine {
         // Requirement 8.7: Error if no folders configured.
         if filter_now_config.folder_ids.is_empty() {
             return Err(FilterError::NoFoldersConfigured);
+        }
+
+        if let Some(logger) = &self.logger {
+            logger.verbose("filter", &format!(
+                "filter_now: starting ({} folders, include_sub={}, only_unread={}, only_unseen={})",
+                filter_now_config.folder_ids.len(),
+                filter_now_config.include_sub,
+                filter_now_config.only_unread,
+                filter_now_config.only_unseen,
+            ));
         }
 
         let mut result = FilterNowResult::new();

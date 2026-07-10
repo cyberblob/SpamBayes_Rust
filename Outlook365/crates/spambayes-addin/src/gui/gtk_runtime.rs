@@ -22,6 +22,7 @@ use super::message_boxes::{MsgBoxKind, MsgBoxResult};
 use super::wizard_window::{WizardResult, WizardWindow};
 use super::folder_browser::{FolderNode, FolderProvider, NullFolderProvider};
 use crate::manager_dlg::ManagerState;
+use crate::statistics::StatisticsManager;
 use crate::wizard::ConfigWizard;
 
 /// Commands sent from the COM thread to the GTK4 thread.
@@ -39,6 +40,9 @@ pub enum GuiCommand {
         training_executor: Option<Arc<dyn super::tabs::training::TrainingExecutor>>,
         /// Optional stats (ham/spam trained counts). If None, defaults to zeros.
         stats: Option<crate::manager_dlg::ManagerStats>,
+        /// Optional statistics manager for the Statistics tab's "Reset Statistics" button.
+        /// If None, the reset button will be non-functional.
+        statistics_manager: Option<StatisticsManager>,
     },
     /// Show the Configuration Wizard.
     ShowWizard {
@@ -195,6 +199,7 @@ impl GtkRuntime {
                         folder_tree,
                         training_executor,
                         stats,
+                        statistics_manager,
                     } => {
                         // Mark the manager as open.
                         is_open.store(true, Ordering::SeqCst);
@@ -207,7 +212,7 @@ impl GtkRuntime {
                             ),
                             None => std::rc::Rc::new(NullFolderProvider),
                         };
-                        let manager = ManagerWindow::new(&state, &stats, &config, folder_provider);
+                        let manager = ManagerWindow::new(&state, &stats, &config, folder_provider, statistics_manager);
 
                         // Wire up the training executor if provided.
                         if let Some(executor) = training_executor {
@@ -331,6 +336,7 @@ impl GtkRuntime {
             folder_tree,
             training_executor: None,
             stats: None,
+            statistics_manager: None,
         });
     }
 
@@ -347,6 +353,7 @@ impl GtkRuntime {
         folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
         training_executor: Arc<dyn super::tabs::training::TrainingExecutor>,
         stats: Option<crate::manager_dlg::ManagerStats>,
+        statistics_manager: Option<StatisticsManager>,
         on_close: impl FnOnce() + Send + 'static,
     ) {
         if self.is_open.load(Ordering::SeqCst) {
@@ -359,6 +366,7 @@ impl GtkRuntime {
             folder_tree,
             training_executor: Some(training_executor),
             stats,
+            statistics_manager,
         });
     }
 
@@ -434,7 +442,7 @@ impl GtkRuntime {
         on_close: impl FnOnce() + Send + 'static,
     ) {
         self.show_manager_or_wizard_inner(
-            state, config, data_dir, profile_name, folder_tree, None, None, on_close,
+            state, config, data_dir, profile_name, folder_tree, None, None, None, on_close,
         );
     }
 
@@ -453,10 +461,11 @@ impl GtkRuntime {
         folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
         training_executor: Arc<dyn super::tabs::training::TrainingExecutor>,
         stats: Option<crate::manager_dlg::ManagerStats>,
+        statistics_manager: Option<StatisticsManager>,
         on_close: impl FnOnce() + Send + 'static,
     ) {
         self.show_manager_or_wizard_inner(
-            state, config, data_dir, profile_name, folder_tree, Some(training_executor), stats, on_close,
+            state, config, data_dir, profile_name, folder_tree, Some(training_executor), stats, statistics_manager, on_close,
         );
     }
 
@@ -470,6 +479,7 @@ impl GtkRuntime {
         folder_tree: Option<Vec<super::folder_browser::FolderNode>>,
         training_executor: Option<Arc<dyn super::tabs::training::TrainingExecutor>>,
         stats: Option<crate::manager_dlg::ManagerStats>,
+        statistics_manager: Option<StatisticsManager>,
         on_close: impl FnOnce() + Send + 'static,
     ) {
         if ConfigWizard::needs_wizard(data_dir, profile_name) {
@@ -489,6 +499,7 @@ impl GtkRuntime {
                             folder_tree,
                             training_executor,
                             stats,
+                            statistics_manager,
                         });
                     }
                     WizardResult::Cancelled => {
@@ -499,7 +510,7 @@ impl GtkRuntime {
                 }
             });
         } else if let Some(executor) = training_executor {
-            self.show_manager_with_training(state, config, folder_tree, executor, stats, on_close);
+            self.show_manager_with_training(state, config, folder_tree, executor, stats, statistics_manager, on_close);
         } else {
             self.show_manager(state, config, folder_tree, on_close);
         }
@@ -782,6 +793,7 @@ mod tests {
             folder_tree: None,
             training_executor: None,
             stats: None,
+            statistics_manager: None,
         };
     }
 

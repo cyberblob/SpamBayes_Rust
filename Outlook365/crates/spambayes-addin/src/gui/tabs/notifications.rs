@@ -9,9 +9,11 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Align, Box as GtkBox, Button, CheckButton, Entry, EventControllerFocus, FileDialog,
-    FileFilter, Frame, Label, Orientation, Scale, ScrolledWindow,
+    Adjustment, Align, Box as GtkBox, Button, CheckButton, Entry, EventControllerFocus,
+    EventControllerScroll, EventControllerScrollFlags, FileDialog, FileFilter, Frame, Label,
+    Orientation, Scale, ScrolledWindow,
 };
+use gtk4::glib;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -137,6 +139,11 @@ impl NotificationsTab {
         ));
         delay_scale.set_hexpand(true);
         delay_scale.set_digits(0);
+
+        // Inhibit mouse scroll on the scale so scrolling the page doesn't change the value
+        let delay_scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        delay_scroll_ctrl.connect_scroll(|_, _, _| glib::Propagation::Stop);
+        delay_scale.add_controller(delay_scroll_ctrl);
 
         let delay_entry = Entry::new();
         delay_entry.set_width_chars(4);

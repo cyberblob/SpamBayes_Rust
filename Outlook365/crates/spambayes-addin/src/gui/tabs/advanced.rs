@@ -10,9 +10,11 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Align, Box as GtkBox, Button, CheckButton, Entry, EventControllerFocus, Frame,
-    Label, Orientation, Scale, ScrolledWindow, Window,
+    Adjustment, Align, Box as GtkBox, Button, CheckButton, Entry, EventControllerFocus,
+    EventControllerScroll, EventControllerScrollFlags, Frame, Label, Orientation, Scale,
+    ScrolledWindow, Window,
 };
+use gtk4::glib;
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -125,6 +127,11 @@ impl AdvancedTab {
             "How long to wait after Outlook starts before beginning background filtering.",
         ));
 
+        // Inhibit mouse scroll on the scale so scrolling the page doesn't change the value
+        let sd_scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        sd_scroll_ctrl.connect_scroll(|_, _, _| glib::Propagation::Stop);
+        start_delay_scale.add_controller(sd_scroll_ctrl);
+
         let start_delay_entry = Entry::new();
         start_delay_entry.set_width_chars(5);
         start_delay_entry.set_text(&format!("{:.1}", config.filter.timer_start_delay));
@@ -159,6 +166,11 @@ impl AdvancedTab {
         interval_scale.set_tooltip_text(Some(
             "Delay between processing each message during background filtering.",
         ));
+
+        // Inhibit mouse scroll on the scale so scrolling the page doesn't change the value
+        let iv_scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        iv_scroll_ctrl.connect_scroll(|_, _, _| glib::Propagation::Stop);
+        interval_scale.add_controller(iv_scroll_ctrl);
 
         let interval_entry = Entry::new();
         interval_entry.set_width_chars(5);
@@ -653,7 +665,7 @@ impl AdvancedTab {
         // View log button
         let view_log_btn = Button::with_label("View log...");
         view_log_btn.set_halign(Align::Start);
-        let log_path = data_directory.join("spambayes.log");
+        let log_path = data_directory.join("addin_debug.log");
         view_log_btn.connect_clicked(move |_| {
             Self::open_log_file(&log_path);
         });

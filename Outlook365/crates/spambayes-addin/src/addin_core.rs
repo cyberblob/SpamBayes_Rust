@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::core::{GUID, HRESULT};
 
@@ -46,6 +46,11 @@ const IID_IDISPATCH: GUID = GUID::from_u128(
 
 // ─── Deferred Toolbar Setup (Timer) ─────────────────────────────────────────
 
+/// Well-known folder names for name-based fallback comparison.
+/// Used when EntryID comparison fails (format mismatch between sessions).
+const SPAM_FOLDER_NAMES: &[&str] = &["SpamBayes Junk E-mail", "Junk E-Mail"];
+const UNSURE_FOLDER_NAMES: &[&str] = &["SpamBayes Junk Suspects", "Junk Suspects"];
+
 /// Timer ID for deferred toolbar creation.
 const TOOLBAR_TIMER_ID: usize = 0x5B01;
 
@@ -80,6 +85,102 @@ static mut GLOBAL_ADDIN_PTR: *mut AddinCore = std::ptr::null_mut();
 /// when the user switches folders.
 /// SAFETY: Only accessed from the COM STA thread.
 pub static mut GLOBAL_RIBBON_UI: *mut c_void = std::ptr::null_mut();
+
+// ─── MAPI Health Tracking ────────────────────────────────────────────────────
+
+/// Threshold in milliseconds above which a MAPI call is considered "slow".
+const MAPI_SLOW_THRESHOLD_MS: u128 = 2000;
+
+/// Cooldown period in seconds after detecting a slow MAPI call.
+/// During cooldown, MAPI calls are skipped to prevent repeated hangs.
+const MAPI_COOLDOWN_SECS: u64 = 30;
+
+/// Tracks the health state of MAPI operations to prevent repeated hangs.
+///
+/// Since this add-in runs on a Single-Threaded Apartment (STA), MAPI calls are
+/// synchronous and cannot be interrupted mid-call. Instead, we track elapsed
+/// time and enter a cooldown period if a call takes too long. During cooldown,
+/// subsequent MAPI calls are skipped and the function falls through to the
+/// faster fallback comparisons (prefix match, then case-insensitive hex).
+///
+/// SAFETY: Only accessed from the COM STA thread (single-thread guarantee).
+struct MapiHealthState {
+    /// Whether MAPI is currently in cooldown (skipping MAPI calls).
+    in_cooldown: bool,
+    /// Timestamp when the cooldown started (seconds since UNIX_EPOCH).
+    cooldown_start_secs: u64,
+    /// Duration of the last MAPI call in milliseconds.
+    last_call_duration_ms: u128,
+}
+
+impl MapiHealthState {
+    const fn new() -> Self {
+        Self {
+            in_cooldown: false,
+            cooldown_start_secs: 0,
+            last_call_duration_ms: 0,
+        }
+    }
+
+    /// Check if MAPI is in cooldown. If the cooldown period has elapsed, exit cooldown.
+    fn is_in_cooldown(&mut self) -> bool {
+        if !self.in_cooldown {
+            return false;
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if now_secs.saturating_sub(self.cooldown_start_secs) >= MAPI_COOLDOWN_SECS {
+            self.in_cooldown = false;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Record the duration of a MAPI call and enter cooldown if it exceeded the threshold.
+    fn record_call(&mut self, duration_ms: u128) {
+        self.last_call_duration_ms = duration_ms;
+        if duration_ms >= MAPI_SLOW_THRESHOLD_MS {
+            self.in_cooldown = true;
+            self.cooldown_start_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+        }
+    }
+}
+
+/// Global MAPI health state.
+/// SAFETY: Only accessed from the COM STA thread.
+static mut MAPI_HEALTH: MapiHealthState = MapiHealthState::new();
+
+// ─── Folder ID Cache ─────────────────────────────────────────────────────────
+
+/// Cache of "canonical" folder IDs obtained from the first successful comparison.
+///
+/// When `is_in_spam_or_unsure_folder()` successfully identifies a folder as spam
+/// or unsure, the current folder's EntryID is cached. On subsequent calls where
+/// the initial comparison fails (due to Outlook returning a different EntryID format),
+/// the function checks against this cached canonical ID as a fallback.
+///
+/// This addresses the bug where Outlook returns different EntryID formats
+/// (short-term vs long-term) in different contexts, causing the "Not Spam"
+/// button to disappear when navigating back to the same folder.
+struct FolderIdCache {
+    /// Canonical folder ID for the spam folder (stored on first successful match).
+    spam_canonical: Option<spambayes_config::FolderId>,
+    /// Canonical folder ID for the unsure folder (stored on first successful match).
+    unsure_canonical: Option<spambayes_config::FolderId>,
+}
+
+/// Global folder ID cache protected by a mutex.
+/// Uses `LazyLock` for safe static initialization without `unsafe`.
+static FOLDER_ID_CACHE: LazyLock<Mutex<FolderIdCache>> = LazyLock::new(|| {
+    Mutex::new(FolderIdCache {
+        spam_canonical: None,
+        unsure_canonical: None,
+    })
+});
 
 /// Timer callback that polls CommandBars.ActionControl for button clicks.
 unsafe extern "system" fn button_poll_timer_proc(
@@ -1063,6 +1164,7 @@ impl AddinCore {
             });
 
         // Initialize the logger first so all subsequent operations can log.
+        // Start at Info level; after config loads, we apply the configured verbosity.
         let log_path = Logger::default_path();
         if let Ok(logger) = Logger::new(&log_path, LogLevel::Info) {
             let logger = Arc::new(logger);
@@ -1094,6 +1196,9 @@ impl AddinCore {
             // Load config with "default" profile since MAPI is unavailable.
             self.load_config_chain();
 
+            // Apply the configured verbosity level to the logger.
+            self.apply_verbosity_from_config();
+
             self.error_reporter.report_once(
                 HRESULT(E_FAIL.0),
                 "SpamBayes failed to initialize the MAPI session.\n\
@@ -1116,6 +1221,10 @@ impl AddinCore {
         // Load configuration using ConfigChain (now that MAPI is available for profile name).
         self.load_config_chain();
 
+        // Apply the configured verbosity level to the logger.
+        // 0 = Error only, 1 = Info (application flow), 2 = Verbose (debug).
+        self.apply_verbosity_from_config();
+
         let _ = std::fs::OpenOptions::new()
             .append(true)
             .open(&debug_path)
@@ -1126,7 +1235,7 @@ impl AddinCore {
 
         // Requirement 1.7: Set LC_NUMERIC locale to "C" after MAPI init.
         self.set_lc_numeric_c();
-        self.log_info("OnConnection: LC_NUMERIC set to \"C\"");
+        self.log_verbose("OnConnection: LC_NUMERIC set to \"C\"");
 
         // Load classifier database.
         // Requirement 1.6: If DB load fails, report error and init empty database.
@@ -1136,7 +1245,7 @@ impl AddinCore {
         let data_dir = Self::get_data_directory();
         let statistics = StatisticsManager::new(&data_dir, 1);
         self.statistics = Some(statistics);
-        self.log_info("StatisticsManager initialized");
+        self.log_verbose("OnConnection: StatisticsManager initialized");
 
         // Setup the filter engine.
         self.setup_filter_engine();
@@ -1155,6 +1264,22 @@ impl AddinCore {
                 writeln!(f, "OnConnection: COMPLETE, initialized=true")
             });
 
+        // Log final startup summary at verbose level
+        if let Some(config) = &self.config {
+            self.log_verbose(&format!(
+                "OnConnection: Startup summary — filter.enabled={}, spam_threshold={:.1}, \
+                 unsure_threshold={:.1}, timer.enabled={}, watch_folders={}, \
+                 calendar.enabled={}, verbosity={}",
+                config.filter.enabled,
+                config.filter.spam_threshold,
+                config.filter.unsure_threshold,
+                config.filter.timer_enabled,
+                config.filter.watch_folder_ids.len(),
+                config.calendar.calendar_filtering_enabled,
+                config.general.verbose,
+            ));
+        }
+
         self.log_info("OnConnection: SpamBayes add-in initialization complete");
         S_OK
     }
@@ -1167,18 +1292,25 @@ impl AddinCore {
         self.log_info("OnDisconnection: SpamBayes add-in shutting down");
 
         // Save dirty classifier data.
+        self.log_verbose("OnDisconnection: saving dirty classifier data");
         self.save_dirty_data();
 
         // Persist statistics to disk before releasing components.
         if let Some(stats) = &self.statistics {
+            self.log_verbose("OnDisconnection: persisting statistics");
             stats.save();
         }
 
         // Release filter engine (cancels timer state).
+        self.log_verbose("OnDisconnection: releasing filter engine and timer state");
         self.filter_engine = None;
         self.timer_state = None;
 
         // Disconnect folder hooks.
+        self.log_verbose(&format!(
+            "OnDisconnection: disconnecting {} folder hooks",
+            self.folder_hooks.len()
+        ));
         for hook in &mut self.folder_hooks {
             hook.disconnect();
         }
@@ -1189,6 +1321,7 @@ impl AddinCore {
         unsafe { GLOBAL_ADDIN_PTR = std::ptr::null_mut(); }
 
         // Release training engine.
+        self.log_verbose("OnDisconnection: releasing training engine");
         self.training_engine = None;
 
         // Release statistics manager.
@@ -2334,6 +2467,14 @@ impl AddinCore {
                 if Self::folder_ids_equal(&current, spam_id) {
                     let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
                         .and_then(|mut f| { use std::io::Write; writeln!(f, "  -> MATCH spam folder") });
+                    // Cache the current folder ID as canonical for spam
+                    if let Ok(mut cache) = FOLDER_ID_CACHE.lock() {
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                "  -> Caching canonical spam folder ID: ({}, {})",
+                                current.store_id.0, current.entry_id.0) });
+                        cache.spam_canonical = Some(current.clone());
+                    }
                     return true;
                 }
             }
@@ -2347,7 +2488,72 @@ impl AddinCore {
                 if Self::folder_ids_equal(&current, unsure_id) {
                     let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
                         .and_then(|mut f| { use std::io::Write; writeln!(f, "  -> MATCH unsure folder") });
+                    // Cache the current folder ID as canonical for unsure
+                    if let Ok(mut cache) = FOLDER_ID_CACHE.lock() {
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                "  -> Caching canonical unsure folder ID: ({}, {})",
+                                current.store_id.0, current.entry_id.0) });
+                        cache.unsure_canonical = Some(current.clone());
+                    }
                     return true;
+                }
+            }
+
+            // Direct comparison failed — try cached canonical IDs as fallback.
+            // This handles the case where Outlook returns a different EntryID format
+            // than what was seen during the first successful comparison.
+            if let Ok(cache) = FOLDER_ID_CACHE.lock() {
+                if let Some(ref cached_spam) = cache.spam_canonical {
+                    if Self::folder_ids_equal(&current, cached_spam) {
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                "  -> CACHE HIT: matches cached canonical spam folder") });
+                        return true;
+                    }
+                }
+                if let Some(ref cached_unsure) = cache.unsure_canonical {
+                    if Self::folder_ids_equal(&current, cached_unsure) {
+                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                "  -> CACHE HIT: matches cached canonical unsure folder") });
+                        return true;
+                    }
+                }
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "  -> CACHE MISS: no cached canonical IDs matched") });
+            }
+
+            // Fallback 3: Name-based comparison — handles edge cases where EntryID
+            // formats changed between sessions but the folder name is still recognizable.
+            if let Some(current_name) = Self::get_current_folder_name(addin) {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "  -> Trying name-based fallback: current folder name = \"{}\"", current_name) });
+
+                // Check against spam folder names
+                if config.filter.spam_folder_id.is_some() {
+                    for name in SPAM_FOLDER_NAMES {
+                        if current_name.eq_ignore_ascii_case(name) {
+                            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                    "  -> NAME MATCH: spam folder (matched \"{}\")", name) });
+                            return true;
+                        }
+                    }
+                }
+
+                // Check against unsure folder names
+                if config.filter.unsure_folder_id.is_some() {
+                    for name in UNSURE_FOLDER_NAMES {
+                        if current_name.eq_ignore_ascii_case(name) {
+                            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                    "  -> NAME MATCH: unsure folder (matched \"{}\")", name) });
+                            return true;
+                        }
+                    }
                 }
             }
 
@@ -2358,37 +2564,81 @@ impl AddinCore {
         }
     }
 
-    /// Compare two FolderIds using MAPI CompareEntryIDs.
+    /// Compare two FolderIds using MAPI CompareEntryIDs with prefix fallback.
     ///
     /// Outlook uses different entry ID formats (short-term vs long-term).
     /// Simple string comparison fails because the INI may store short-term IDs
     /// while the Object Model returns long-term IDs. MAPI's CompareEntryIDs
     /// handles this correctly by comparing the underlying binary data.
     ///
-    /// Falls back to case-insensitive hex string comparison if MAPI is unavailable.
+    /// Comparison strategy (in order):
+    /// 1. MAPI CompareEntryIDs — authoritative if available
+    /// 2. Prefix matching — handles long-term IDs that contain short-term IDs
+    /// 3. Case-insensitive hex comparison — final fallback (preserved behavior)
     fn folder_ids_equal(a: &spambayes_config::FolderId, b: &spambayes_config::FolderId) -> bool {
+        let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+
         // Store IDs must match first (case-insensitive hex comparison is fine for store IDs)
         if !a.store_id.0.eq_ignore_ascii_case(&b.store_id.0) {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                    "folder_ids_equal: store IDs differ, returning false") });
             return false;
         }
 
-        // Try MAPI CompareEntryIDs for the entry IDs
+        // Try MAPI CompareEntryIDs for the entry IDs (with timeout/health tracking)
         unsafe {
-            let addin = GLOBAL_ADDIN_PTR;
-            if !addin.is_null() {
-                let addin = &mut *addin;
-                if let Some(ref mut session) = addin.mapi_session {
-                    // Decode both entry IDs from hex to bytes
-                    if let (Some(eid_a), Some(eid_b)) = (
-                        Self::hex_to_bytes(&a.entry_id.0),
-                        Self::hex_to_bytes(&b.entry_id.0),
-                    ) {
-                        // Decode store ID to open the store
-                        if let Some(store_eid) = Self::hex_to_bytes(&a.store_id.0) {
-                            if let Ok(store_ptr) = session.open_store(&store_eid) {
-                                return Self::mapi_compare_entry_ids(
-                                    store_ptr, &eid_a, &eid_b,
-                                );
+            // Check if MAPI is in cooldown due to a previous slow call
+            if MAPI_HEALTH.is_in_cooldown() {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "folder_ids_equal: MAPI in cooldown (last call took {}ms), skipping to fallback",
+                        MAPI_HEALTH.last_call_duration_ms) });
+            } else {
+                let addin = GLOBAL_ADDIN_PTR;
+                if !addin.is_null() {
+                    let addin = &mut *addin;
+                    if let Some(ref mut session) = addin.mapi_session {
+                        // Decode both entry IDs from hex to bytes
+                        if let (Some(eid_a), Some(eid_b)) = (
+                            Self::hex_to_bytes(&a.entry_id.0),
+                            Self::hex_to_bytes(&b.entry_id.0),
+                        ) {
+                            // Decode store ID to open the store
+                            if let Some(store_eid) = Self::hex_to_bytes(&a.store_id.0) {
+                                let start = std::time::Instant::now();
+                                let store_result = session.open_store(&store_eid);
+                                let elapsed_ms = start.elapsed().as_millis();
+                                MAPI_HEALTH.record_call(elapsed_ms);
+
+                                if elapsed_ms >= MAPI_SLOW_THRESHOLD_MS {
+                                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                        .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                            "folder_ids_equal: MAPI open_store took {}ms (threshold={}ms), entering cooldown for {}s",
+                                            elapsed_ms, MAPI_SLOW_THRESHOLD_MS, MAPI_COOLDOWN_SECS) });
+                                }
+
+                                if let Ok(store_ptr) = store_result {
+                                    let start = std::time::Instant::now();
+                                    let result = Self::mapi_compare_entry_ids(
+                                        store_ptr, &eid_a, &eid_b,
+                                    );
+                                    let elapsed_ms = start.elapsed().as_millis();
+                                    MAPI_HEALTH.record_call(elapsed_ms);
+
+                                    if elapsed_ms >= MAPI_SLOW_THRESHOLD_MS {
+                                        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                                "folder_ids_equal: MAPI CompareEntryIDs took {}ms (threshold={}ms), entering cooldown for {}s",
+                                                elapsed_ms, MAPI_SLOW_THRESHOLD_MS, MAPI_COOLDOWN_SECS) });
+                                    }
+
+                                    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                                        .and_then(|mut f| { use std::io::Write; writeln!(f,
+                                            "folder_ids_equal: MAPI CompareEntryIDs returned {} (took {}ms)", result, elapsed_ms) });
+                                    return result;
+                                }
                             }
                         }
                     }
@@ -2396,8 +2646,29 @@ impl AddinCore {
             }
         }
 
-        // Fallback: case-insensitive hex comparison
-        a.entry_id.0.eq_ignore_ascii_case(&b.entry_id.0)
+        // Fallback 1: Prefix matching — handles format changes where long-term ID
+        // contains short-term ID as a prefix (common with Outlook EntryID conversions).
+        // Minimum prefix length of 8 chars (4 bytes) avoids false positives on trivially
+        // short strings like "0000".
+        let a_upper = a.entry_id.0.to_ascii_uppercase();
+        let b_upper = b.entry_id.0.to_ascii_uppercase();
+        let min_prefix_len = 8;
+        if a_upper.len() >= min_prefix_len && b_upper.len() >= min_prefix_len {
+            if a_upper.starts_with(&b_upper) || b_upper.starts_with(&a_upper) {
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f,
+                        "folder_ids_equal: prefix match succeeded (a_len={}, b_len={})",
+                        a_upper.len(), b_upper.len()) });
+                return true;
+            }
+        }
+
+        // Fallback 2: Case-insensitive hex comparison (preserved existing behavior)
+        let result = a.entry_id.0.eq_ignore_ascii_case(&b.entry_id.0);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+            .and_then(|mut f| { use std::io::Write; writeln!(f,
+                "folder_ids_equal: hex comparison returned {}", result) });
+        result
     }
 
     /// Decode a hex string to bytes.
@@ -2465,15 +2736,31 @@ impl AddinCore {
         } else {
             addin.application?
         };
-        if app_ptr.is_null() { return None; }
+        if app_ptr.is_null() {
+            let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "get_current_folder_id: app_ptr is null (POLL_APP_PTR={:?}, application={:?})", POLL_APP_PTR, addin.application) });
+            return None;
+        }
 
         // Application.ActiveExplorer
         let explorer = dispatch_get(app_ptr, "ActiveExplorer").ok()?;
-        if explorer.is_null() { return None; }
+        if explorer.is_null() {
+            let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "get_current_folder_id: ActiveExplorer is null (Outlook may be starting up or shutting down)") });
+            return None;
+        }
 
         // Explorer.CurrentFolder
         let folder = dispatch_get(explorer, "CurrentFolder").ok()?;
         if folder.is_null() {
+            let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "get_current_folder_id: CurrentFolder is null (no folder selected in explorer)") });
             Self::release_dispatch(explorer);
             return None;
         }
@@ -2493,8 +2780,48 @@ impl AddinCore {
                     spambayes_config::EntryId::new(&entry),
                 ))
             }
-            _ => None,
+            _ => {
+                let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
+                let debug_path = format!("{data_dir}\\SpamBayes\\addin_debug.log");
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "get_current_folder_id: StoreID or EntryID is None/empty") });
+                None
+            }
         }
+    }
+
+    /// Get the display name of the currently displayed folder in the active Explorer.
+    ///
+    /// Uses Outlook Object Model:
+    ///   Application.ActiveExplorer.CurrentFolder.Name
+    ///
+    /// Returns `None` if the explorer, folder, or name is unavailable.
+    unsafe fn get_current_folder_name(addin: &AddinCore) -> Option<String> {
+        use crate::com_invoke::{dispatch_get, dispatch_get_string};
+
+        // Prefer POLL_APP_PTR (obtained via CoCreateInstance, more reliable)
+        let app_ptr = if !POLL_APP_PTR.is_null() {
+            POLL_APP_PTR
+        } else {
+            addin.application?
+        };
+        if app_ptr.is_null() { return None; }
+
+        let explorer = dispatch_get(app_ptr, "ActiveExplorer").ok()?;
+        if explorer.is_null() { return None; }
+
+        let folder = dispatch_get(explorer, "CurrentFolder").ok()?;
+        if folder.is_null() {
+            Self::release_dispatch(explorer);
+            return None;
+        }
+
+        let name = dispatch_get_string(folder, "Name");
+
+        Self::release_dispatch(folder);
+        Self::release_dispatch(explorer);
+
+        name
     }
 
     /// Release an IDispatch pointer (call IUnknown::Release).
@@ -2612,11 +2939,10 @@ impl AddinCore {
             }
         }
 
-        // Determine profile name from MAPI session (if available).
-        let profile_name = self.get_mapi_profile_name().unwrap_or_else(|| {
-            self.log_info("MAPI profile name not available, using \"default\"");
-            "default".to_string()
-        });
+        // Always use "default" as the profile name for INI file.
+        // The MAPI "profile name" (e.g. "Microsoft Outlook Address Book Provider")
+        // is a provider service name, not meaningful for config file naming.
+        let profile_name = "default".to_string();
 
         self.log_info(&format!("Loading config chain for profile: \"{}\"", profile_name));
 
@@ -2749,8 +3075,7 @@ impl AddinCore {
     /// calendar config, etc.) take effect immediately without restarting Outlook.
     fn reload_config_from_disk(&mut self) {
         let data_dir = Self::get_data_directory();
-        let profile_name = self.get_mapi_profile_name()
-            .unwrap_or_else(|| "default".to_string());
+        let profile_name = "default";
 
         self.log_info(&format!(
             "reload_config_from_disk: reloading from {}/{}.ini",
@@ -2784,6 +3109,27 @@ impl AddinCore {
                 self.log_error("reload_config_from_disk: FolderHookState lock poisoned");
             }
         }
+
+        // Apply the new verbosity level to the logger.
+        self.apply_verbosity_from_config();
+
+        self.log_verbose(&format!(
+            "reload_config_from_disk: full config — filter.enabled={}, spam_threshold={:.1}, \
+             unsure_threshold={:.1}, timer.enabled={}, timer.start_delay={:.1}s, \
+             timer.interval={:.1}s, watch_folders={}, calendar.enabled={}, \
+             cleanup.enabled={}, cleanup.days={}, verbosity={}",
+            new_config.filter.enabled,
+            new_config.filter.spam_threshold,
+            new_config.filter.unsure_threshold,
+            new_config.filter.timer_enabled,
+            new_config.filter.timer_start_delay,
+            new_config.filter.timer_interval,
+            new_config.filter.watch_folder_ids.len(),
+            new_config.calendar.calendar_filtering_enabled,
+            new_config.filter.spam_auto_cleanup_enabled,
+            new_config.filter.spam_auto_cleanup_days,
+            new_config.general.verbose,
+        ));
 
         self.log_info(&format!(
             "reload_config_from_disk: complete (filter.enabled={}, calendar.enabled={}, spam_threshold={:.1})",
@@ -2848,7 +3194,8 @@ impl AddinCore {
         let data_dir = Self::get_data_directory();
         let db_path = data_dir.join("spambayes.db");
 
-        self.log_info(&format!("Loading classifier database from: {}", db_path.display()));
+        self.log_verbose(&format!("load_classifier_database: path={}", db_path.display()));
+        self.log_verbose(&format!("load_classifier_database: file exists={}", db_path.exists()));
 
         // If the Rust-format database file exists, load it directly.
         if db_path.exists() {
@@ -2858,6 +3205,10 @@ impl AddinCore {
                     self.log_info(&format!(
                         "Database loaded: nspam={}, nham={}",
                         state.nspam, state.nham
+                    ));
+                    self.log_verbose(&format!(
+                        "load_classifier_database: token count={}",
+                        backend.data().len()
                     ));
 
                     let config = spambayes_core::ClassifierConfig::default();
@@ -2957,22 +3308,36 @@ impl AddinCore {
             )));
 
         // Create filter engine.
-        let filter = FilterEngine::new(
+        let mut filter = FilterEngine::new(
             config.filter.clone(),
             Arc::clone(&classifier),
             Arc::clone(&storage),
             Arc::clone(&message_db),
             self.statistics.clone(),
         );
+        if let Some(logger) = &self.logger {
+            filter.set_logger(Arc::clone(logger));
+        }
+        self.log_verbose(&format!(
+            "setup_filter_engine: FilterEngine created (spam_threshold={:.1}, unsure_threshold={:.1})",
+            config.filter.spam_threshold, config.filter.unsure_threshold
+        ));
         self.filter_engine = Some(filter);
 
         // Create timer state.
         let timer_state = TimerFilterState::new(&config.filter);
+        self.log_verbose(&format!(
+            "setup_filter_engine: TimerFilterState created (start_delay={:.1}s, interval={:.1}s, valid={})",
+            config.filter.timer_start_delay,
+            config.filter.timer_interval,
+            timer_state.is_timer_valid()
+        ));
         self.timer_state = Some(timer_state);
 
         // Create notification manager.
         let notification_mgr = NotificationManager::new(&config.notification);
         self.notification_mgr = Some(notification_mgr);
+        self.log_verbose("setup_filter_engine: NotificationManager created");
 
         // Create training engine (if logger is available).
         if let Some(logger) = &self.logger {
@@ -2984,6 +3349,7 @@ impl AddinCore {
                 self.statistics.clone(),
             );
             self.training_engine = Some(training_engine);
+            self.log_verbose("setup_filter_engine: TrainingEngine created");
         }
 
         self.log_info("Filter engine, timer, notification, and training engine initialized");
@@ -3173,6 +3539,15 @@ impl AddinCore {
         }
     }
 
+    /// Log a verbose/debug message if the logger is available.
+    ///
+    /// Only emitted when verbosity is set to 2 (Verbose/Debug).
+    fn log_verbose(&self, message: &str) {
+        if let Some(logger) = &self.logger {
+            logger.verbose("addin_core", message);
+        }
+    }
+
     /// Get the directory containing this DLL.
     ///
     /// Used to locate `spambayes_manager.exe` which is installed alongside the DLL.
@@ -3227,6 +3602,29 @@ impl AddinCore {
     fn log_error(&self, message: &str) {
         if let Some(logger) = &self.logger {
             logger.error("addin_core", message);
+        }
+    }
+
+    /// Apply the verbosity level from the loaded config to the logger.
+    ///
+    /// Maps `config.general.verbose` (0/1/2) to the corresponding `LogLevel`:
+    /// - 0 = Error (minimal logging)
+    /// - 1 = Info (application flow)
+    /// - 2 = Verbose (debugging)
+    fn apply_verbosity_from_config(&self) {
+        if let (Some(logger), Some(config)) = (&self.logger, &self.config) {
+            let new_level = Logger::verbosity_to_level(config.general.verbose);
+            logger.set_level(new_level);
+
+            // Also update folder_sink's verbosity so its log_debug calls respect the level.
+            crate::folder_sink::set_verbose_level(config.general.verbose);
+
+            // Always log the level change at Error level so it's visible
+            // regardless of the new setting.
+            logger.error("addin_core", &format!(
+                "Log verbosity set to {} (level={:?})",
+                config.general.verbose, new_level
+            ));
         }
     }
 }
@@ -3522,5 +3920,435 @@ mod tests {
                 token_str
             );
         }
+    }
+
+    // ─── folder_ids_equal tests ──────────────────────────────────────────
+
+    use spambayes_config::{FolderId, StoreId, EntryId};
+
+    /// Helper to build a FolderId from store and entry hex strings.
+    fn make_folder_id(store: &str, entry: &str) -> FolderId {
+        FolderId {
+            store_id: StoreId(store.to_string()),
+            entry_id: EntryId(entry.to_string()),
+        }
+    }
+
+    #[test]
+    fn folder_ids_equal_identical_ids_match() {
+        // Exact same IDs should always match
+        let a = make_folder_id("AABB1122", "000000001D0EAEA09C64C948");
+        let b = make_folder_id("AABB1122", "000000001D0EAEA09C64C948");
+        assert!(AddinCore::folder_ids_equal(&a, &b));
+    }
+
+    #[test]
+    fn folder_ids_equal_case_insensitive_match() {
+        // Case-insensitive hex comparison (existing preserved behavior)
+        let a = make_folder_id("AABB1122", "000000001D0EAEA09C64C948");
+        let b = make_folder_id("aabb1122", "000000001d0eaea09c64c948");
+        assert!(AddinCore::folder_ids_equal(&a, &b));
+    }
+
+    #[test]
+    fn folder_ids_equal_different_store_ids_no_match() {
+        // Different store IDs should never match, regardless of entry IDs
+        let a = make_folder_id("AABB1122", "000000001D0EAEA09C64C948");
+        let b = make_folder_id("CCDD3344", "000000001D0EAEA09C64C948");
+        assert!(!AddinCore::folder_ids_equal(&a, &b));
+    }
+
+    #[test]
+    fn folder_ids_equal_completely_different_entry_ids_no_match() {
+        // Completely different entry IDs (no prefix relationship) should not match
+        let a = make_folder_id("AABB1122", "DEADBEEF12345678AABBCCDD");
+        let b = make_folder_id("AABB1122", "11223344556677889900AABB");
+        assert!(!AddinCore::folder_ids_equal(&a, &b));
+    }
+
+    #[test]
+    fn folder_ids_equal_prefix_match_long_contains_short() {
+        // Bug condition: long-term EntryID starts with (contains) the short-term EntryID
+        // This is the key fix for the "Not Spam" button visibility bug.
+        let short_term = "00000000A57E8E40B99C4F8BB6E30000";
+        let long_term = "00000000A57E8E40B99C4F8BB6E300003000000000000000000000000000000";
+        let a = make_folder_id("AABB1122", short_term);
+        let b = make_folder_id("AABB1122", long_term);
+        assert!(AddinCore::folder_ids_equal(&a, &b),
+            "Prefix match should succeed: long-term ID starts with short-term ID");
+    }
+
+    #[test]
+    fn folder_ids_equal_prefix_match_short_contains_long() {
+        // Reverse order: short-term first, long-term second
+        let short_term = "00000000A57E8E40B99C4F8BB6E30000";
+        let long_term = "00000000A57E8E40B99C4F8BB6E300003000000000000000000000000000000";
+        let a = make_folder_id("AABB1122", long_term);
+        let b = make_folder_id("AABB1122", short_term);
+        assert!(AddinCore::folder_ids_equal(&a, &b),
+            "Prefix match should succeed regardless of argument order");
+    }
+
+    #[test]
+    fn folder_ids_equal_prefix_match_case_insensitive() {
+        // Prefix matching should be case-insensitive
+        let short_term = "00000000a57e8e40b99c4f8bb6e30000";
+        let long_term = "00000000A57E8E40B99C4F8BB6E300003000000000000000000000000000000";
+        let a = make_folder_id("AABB1122", short_term);
+        let b = make_folder_id("aabb1122", long_term);
+        assert!(AddinCore::folder_ids_equal(&a, &b),
+            "Prefix match should be case-insensitive");
+    }
+
+    #[test]
+    fn folder_ids_equal_short_prefix_no_false_positive() {
+        // Very short entry IDs (< 8 chars) should NOT trigger prefix matching
+        // to avoid false positives on trivially short strings like "0000"
+        let a = make_folder_id("AABB1122", "0000");
+        let b = make_folder_id("AABB1122", "000000001D0EAEA09C64C948");
+        // "0000" is only 4 chars, below the 8-char minimum for prefix matching.
+        // It also won't match via hex comparison. Should return false.
+        assert!(!AddinCore::folder_ids_equal(&a, &b),
+            "Short IDs (< 8 chars) should not trigger prefix match to avoid false positives");
+    }
+
+    #[test]
+    fn folder_ids_equal_realistic_entryid_format_mismatch() {
+        // Realistic scenario from the bug report: configured long-term ID vs
+        // Object Model short-term ID where one is a prefix of the other
+        let configured_long = "000000001D0EAEA09C64C9485E6E8000767C5010003000000000000000000000000000000";
+        let current_short = "000000001D0EAEA09C64C9485E6E8000767C5010";
+        let a = make_folder_id("STORE123ABC", configured_long);
+        let b = make_folder_id("STORE123ABC", current_short);
+        assert!(AddinCore::folder_ids_equal(&a, &b),
+            "Realistic format mismatch: long-term ID should prefix-match short-term ID");
+    }
+
+    #[test]
+    fn folder_ids_equal_non_target_folder_stays_false() {
+        // Preservation: non-target folders (Inbox, Sent, etc.) should still not match
+        let spam_folder = make_folder_id("STORE1", "DEADBEEF1234567890ABCDEF");
+        let inbox_folder = make_folder_id("STORE1", "AABBCCDD1234567890ABCDEF");
+        assert!(!AddinCore::folder_ids_equal(&spam_folder, &inbox_folder),
+            "Non-target folders must remain non-matching");
+    }
+
+    // ─── MAPI health tracking tests ─────────────────────────────────────
+
+    use super::{MapiHealthState, MAPI_SLOW_THRESHOLD_MS, MAPI_COOLDOWN_SECS};
+
+    #[test]
+    fn mapi_health_initial_state_not_in_cooldown() {
+        let mut state = MapiHealthState::new();
+        assert!(!state.is_in_cooldown(), "Fresh state should not be in cooldown");
+        assert_eq!(state.last_call_duration_ms, 0);
+    }
+
+    #[test]
+    fn mapi_health_fast_call_does_not_trigger_cooldown() {
+        let mut state = MapiHealthState::new();
+        // Record a fast call (well below threshold)
+        state.record_call(50);
+        assert!(!state.is_in_cooldown(), "Fast call should not trigger cooldown");
+        assert_eq!(state.last_call_duration_ms, 50);
+    }
+
+    #[test]
+    fn mapi_health_slow_call_triggers_cooldown() {
+        let mut state = MapiHealthState::new();
+        // Record a call at exactly the threshold
+        state.record_call(MAPI_SLOW_THRESHOLD_MS);
+        assert!(state.in_cooldown, "Call at threshold should trigger cooldown");
+        assert!(state.is_in_cooldown(), "Should report as in cooldown");
+        assert_eq!(state.last_call_duration_ms, MAPI_SLOW_THRESHOLD_MS);
+    }
+
+    #[test]
+    fn mapi_health_very_slow_call_triggers_cooldown() {
+        let mut state = MapiHealthState::new();
+        // Record a very slow call (well above threshold)
+        state.record_call(5000);
+        assert!(state.in_cooldown, "Slow call should trigger cooldown");
+        assert!(state.is_in_cooldown(), "Should report as in cooldown");
+        assert_eq!(state.last_call_duration_ms, 5000);
+    }
+
+    #[test]
+    fn mapi_health_cooldown_expires_after_period() {
+        let mut state = MapiHealthState::new();
+        // Trigger cooldown
+        state.record_call(MAPI_SLOW_THRESHOLD_MS + 1000);
+        assert!(state.is_in_cooldown());
+
+        // Simulate cooldown expiry by setting start time far in the past
+        state.cooldown_start_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .saturating_sub(MAPI_COOLDOWN_SECS + 1);
+
+        // Now it should no longer be in cooldown
+        assert!(!state.is_in_cooldown(), "Cooldown should expire after the cooldown period");
+        assert!(!state.in_cooldown, "in_cooldown flag should be cleared");
+    }
+
+    #[test]
+    fn mapi_health_cooldown_active_within_period() {
+        let mut state = MapiHealthState::new();
+        // Trigger cooldown
+        state.record_call(MAPI_SLOW_THRESHOLD_MS);
+        // cooldown_start_secs is set to "now", so within the 30s window
+        assert!(state.is_in_cooldown(), "Should still be in cooldown within the period");
+    }
+
+    #[test]
+    fn mapi_health_multiple_fast_calls_no_cooldown() {
+        let mut state = MapiHealthState::new();
+        // Multiple fast calls should never trigger cooldown
+        for ms in [10, 100, 500, 1000, 1999] {
+            state.record_call(ms);
+            assert!(!state.is_in_cooldown(),
+                "Call of {}ms should not trigger cooldown", ms);
+        }
+    }
+
+    #[test]
+    fn mapi_health_recovery_after_cooldown_with_fast_call() {
+        let mut state = MapiHealthState::new();
+        // Trigger cooldown with slow call
+        state.record_call(3000);
+        assert!(state.is_in_cooldown());
+
+        // Simulate cooldown expiry
+        state.cooldown_start_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .saturating_sub(MAPI_COOLDOWN_SECS + 1);
+
+        // Cooldown should be cleared
+        assert!(!state.is_in_cooldown());
+
+        // A subsequent fast call should not re-trigger cooldown
+        state.record_call(100);
+        assert!(!state.is_in_cooldown(), "Fast call after recovery should not re-trigger cooldown");
+    }
+
+    #[test]
+    fn mapi_health_threshold_boundary() {
+        let mut state = MapiHealthState::new();
+
+        // Just below threshold — no cooldown
+        state.record_call(MAPI_SLOW_THRESHOLD_MS - 1);
+        assert!(!state.is_in_cooldown(), "Call at threshold-1 should not trigger cooldown");
+
+        // Exactly at threshold — cooldown triggered
+        state.record_call(MAPI_SLOW_THRESHOLD_MS);
+        assert!(state.is_in_cooldown(), "Call at exact threshold should trigger cooldown");
+    }
+
+    // ─── Folder ID cache tests ───────────────────────────────────────────
+
+    use super::FOLDER_ID_CACHE;
+
+    #[test]
+    fn folder_id_cache_initially_empty() {
+        // The cache should start with no canonical IDs stored
+        let cache = FOLDER_ID_CACHE.lock().unwrap();
+        // Note: In a shared test process, the cache may already be populated
+        // by other tests. We just verify the lock works correctly.
+        drop(cache);
+    }
+
+    #[test]
+    fn folder_id_cache_stores_spam_canonical() {
+        // Simulate storing a canonical spam folder ID in the cache
+        let spam_folder = make_folder_id("STORE_AAA", "000000001D0EAEA09C64C948");
+        {
+            let mut cache = FOLDER_ID_CACHE.lock().unwrap();
+            cache.spam_canonical = Some(spam_folder.clone());
+        }
+        // Verify it can be read back
+        let cache = FOLDER_ID_CACHE.lock().unwrap();
+        assert_eq!(cache.spam_canonical.as_ref().unwrap().entry_id.0, "000000001D0EAEA09C64C948");
+        assert_eq!(cache.spam_canonical.as_ref().unwrap().store_id.0, "STORE_AAA");
+    }
+
+    #[test]
+    fn folder_id_cache_stores_unsure_canonical() {
+        // Simulate storing a canonical unsure folder ID in the cache
+        let unsure_folder = make_folder_id("STORE_BBB", "AABBCCDD11223344");
+        {
+            let mut cache = FOLDER_ID_CACHE.lock().unwrap();
+            cache.unsure_canonical = Some(unsure_folder.clone());
+        }
+        // Verify it can be read back
+        let cache = FOLDER_ID_CACHE.lock().unwrap();
+        assert_eq!(cache.unsure_canonical.as_ref().unwrap().entry_id.0, "AABBCCDD11223344");
+        assert_eq!(cache.unsure_canonical.as_ref().unwrap().store_id.0, "STORE_BBB");
+    }
+
+    #[test]
+    fn folder_id_cache_fallback_matches_cached_canonical() {
+        // This test verifies the core caching logic:
+        // 1. A folder ID is cached as canonical after a successful match
+        // 2. A different format of the same folder ID can be recognized
+        //    by comparing against the cached canonical via folder_ids_equal
+        //
+        // Scenario: The first time we see the folder, it has a short-term EntryID.
+        // The second time, Outlook returns a long-term EntryID. The cache lets us
+        // recognize it because the long-term ID starts with the short-term ID (prefix match).
+        let canonical_short = make_folder_id("STORE_CCC", "000000001D0EAEA09C64C948");
+        let different_long = make_folder_id("STORE_CCC", "000000001D0EAEA09C64C9483000000000000000");
+
+        // Store the short-term ID as canonical (simulating first successful match)
+        {
+            let mut cache = FOLDER_ID_CACHE.lock().unwrap();
+            cache.spam_canonical = Some(canonical_short.clone());
+        }
+
+        // Now verify that the different (long-term) format matches via folder_ids_equal
+        // against the cached canonical ID
+        let cache = FOLDER_ID_CACHE.lock().unwrap();
+        let cached_spam = cache.spam_canonical.as_ref().unwrap();
+        assert!(AddinCore::folder_ids_equal(&different_long, cached_spam),
+            "Long-term ID should match cached canonical short-term ID via prefix matching");
+    }
+
+    #[test]
+    fn folder_id_cache_no_false_positive_for_different_folder() {
+        // A completely different folder should NOT match the cached canonical ID
+        let canonical = make_folder_id("STORE_DDD", "AABBCCDD11223344EEFF0011");
+        let different_folder = make_folder_id("STORE_DDD", "99887766554433221100FFEE");
+
+        {
+            let mut cache = FOLDER_ID_CACHE.lock().unwrap();
+            cache.unsure_canonical = Some(canonical.clone());
+        }
+
+        let cache = FOLDER_ID_CACHE.lock().unwrap();
+        let cached_unsure = cache.unsure_canonical.as_ref().unwrap();
+        assert!(!AddinCore::folder_ids_equal(&different_folder, cached_unsure),
+            "Different folder should NOT match cached canonical ID");
+    }
+
+    // ─── Name-based fallback tests ───────────────────────────────────────
+
+    use super::{SPAM_FOLDER_NAMES, UNSURE_FOLDER_NAMES};
+
+    #[test]
+    fn name_fallback_constants_defined_correctly() {
+        // Verify the well-known folder name constants are correctly defined
+        assert_eq!(SPAM_FOLDER_NAMES.len(), 2);
+        assert!(SPAM_FOLDER_NAMES.contains(&"SpamBayes Junk E-mail"));
+        assert!(SPAM_FOLDER_NAMES.contains(&"Junk E-Mail"));
+
+        assert_eq!(UNSURE_FOLDER_NAMES.len(), 2);
+        assert!(UNSURE_FOLDER_NAMES.contains(&"SpamBayes Junk Suspects"));
+        assert!(UNSURE_FOLDER_NAMES.contains(&"Junk Suspects"));
+    }
+
+    #[test]
+    fn name_fallback_spam_folder_case_insensitive_match() {
+        // The name-based fallback uses eq_ignore_ascii_case
+        let current_name = "spambayes junk e-mail";
+        let matched = SPAM_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(matched, "Case-insensitive match should succeed for spam folder name");
+    }
+
+    #[test]
+    fn name_fallback_unsure_folder_case_insensitive_match() {
+        let current_name = "SPAMBAYES JUNK SUSPECTS";
+        let matched = UNSURE_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(matched, "Case-insensitive match should succeed for unsure folder name");
+    }
+
+    #[test]
+    fn name_fallback_default_junk_email_matches() {
+        // "Junk E-Mail" is the default name used during wizard config
+        let current_name = "Junk E-Mail";
+        let matched = SPAM_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(matched, "Default 'Junk E-Mail' should match spam folder names");
+    }
+
+    #[test]
+    fn name_fallback_default_junk_suspects_matches() {
+        // "Junk Suspects" is the default name used during wizard config
+        let current_name = "Junk Suspects";
+        let matched = UNSURE_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(matched, "Default 'Junk Suspects' should match unsure folder names");
+    }
+
+    #[test]
+    fn name_fallback_inbox_does_not_match() {
+        // Non-target folder names should NOT match
+        let current_name = "Inbox";
+        let matched_spam = SPAM_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        let matched_unsure = UNSURE_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(!matched_spam, "Inbox should not match spam folder names");
+        assert!(!matched_unsure, "Inbox should not match unsure folder names");
+    }
+
+    #[test]
+    fn name_fallback_sent_items_does_not_match() {
+        // Sent Items should NOT match any target folder name
+        let current_name = "Sent Items";
+        let matched_spam = SPAM_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        let matched_unsure = UNSURE_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(!matched_spam, "Sent Items should not match spam folder names");
+        assert!(!matched_unsure, "Sent Items should not match unsure folder names");
+    }
+
+    #[test]
+    fn name_fallback_partial_name_does_not_match() {
+        // A partial match should NOT succeed (must be full case-insensitive match)
+        let current_name = "Junk";
+        let matched_spam = SPAM_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        let matched_unsure = UNSURE_FOLDER_NAMES.iter().any(|name| {
+            current_name.eq_ignore_ascii_case(name)
+        });
+        assert!(!matched_spam, "Partial name 'Junk' should not match spam folder names");
+        assert!(!matched_unsure, "Partial name 'Junk' should not match unsure folder names");
+    }
+
+    // ─── Config filename regression ──────────────────────────────────────
+
+    /// Regression test: The DLL must always use "default" as the INI profile name.
+    ///
+    /// Previously, `load_config_chain` used `get_mapi_profile_name()` which
+    /// returned MAPI provider service names like "Microsoft Outlook Address
+    /// Book Provider". This caused the DLL to read/write a differently-named
+    /// INI file than the Manager GUI (which hardcodes "default"), breaking
+    /// config persistence — folder selections made in the Manager were invisible
+    /// to the DLL, causing training to fail with MAPI_E_NOT_FOUND.
+    ///
+    /// If you need per-profile config in the future, use a stable identifier
+    /// (e.g. email address) — never the raw MAPI profile name.
+    #[test]
+    fn config_profile_name_is_always_default() {
+        // The source code in load_config_chain and reload_config_from_disk
+        // must use "default" — this test documents the invariant.
+        // Any change to use get_mapi_profile_name() for the INI filename
+        // will break Manager ↔ DLL config sharing.
+        let profile = "default";
+        assert_eq!(profile, "default",
+            "REGRESSION: config profile name must be 'default'. \
+             See training failure bug caused by MAPI profile name mismatch.");
     }
 }

@@ -227,6 +227,13 @@ impl TrainingEngine {
     ) -> Result<bool, TrainError> {
         let search_key = msg.get_search_key();
 
+        self.logger.verbose("train", &format!(
+            "train_message: '{}' as {} (search_key={} bytes)",
+            msg.get_display_id(),
+            if is_spam { "spam" } else { "ham" },
+            search_key.len()
+        ));
+
         // Look up existing training state in message database.
         let existing_info = {
             let db = self.message_db.lock()
@@ -238,14 +245,30 @@ impl TrainingEngine {
         match existing_info.as_ref().and_then(|info| info.trained_as) {
             Some(prev_is_spam) if prev_is_spam == is_spam => {
                 // Requirement 9.4: Already correctly trained — skip.
+                self.logger.verbose("train", &format!(
+                    "train_message: '{}' already trained as {}, skipping",
+                    msg.get_display_id(),
+                    if is_spam { "spam" } else { "ham" }
+                ));
                 return Ok(false);
             }
             Some(prev_is_spam) => {
                 // Requirement 9.3: Trained with wrong classification —
                 // untrain old, then train new.
+                self.logger.verbose("train", &format!(
+                    "train_message: '{}' was trained as {}, retraining as {}",
+                    msg.get_display_id(),
+                    if prev_is_spam { "spam" } else { "ham" },
+                    if is_spam { "spam" } else { "ham" }
+                ));
                 let raw_content = msg.get_raw_content()
                     .map_err(|e| TrainError::ContentExtraction(e.to_string()))?;
                 let tokens = self.tokenizer.tokenize(&raw_content);
+
+                self.logger.verbose("train", &format!(
+                    "train_message: tokenized {} bytes into {} tokens",
+                    raw_content.len(), tokens.len()
+                ));
 
                 let mut classifier = self.classifier.lock()
                     .map_err(|_| TrainError::ClassifierLockPoisoned)?;
@@ -257,9 +280,19 @@ impl TrainingEngine {
             }
             None => {
                 // Requirement 9.2: Not previously trained — train now.
+                self.logger.verbose("train", &format!(
+                    "train_message: '{}' not previously trained, training as {}",
+                    msg.get_display_id(),
+                    if is_spam { "spam" } else { "ham" }
+                ));
                 let raw_content = msg.get_raw_content()
                     .map_err(|e| TrainError::ContentExtraction(e.to_string()))?;
                 let tokens = self.tokenizer.tokenize(&raw_content);
+
+                self.logger.verbose("train", &format!(
+                    "train_message: tokenized {} bytes into {} tokens",
+                    raw_content.len(), tokens.len()
+                ));
 
                 let mut classifier = self.classifier.lock()
                     .map_err(|_| TrainError::ClassifierLockPoisoned)?;
@@ -291,6 +324,13 @@ impl TrainingEngine {
         // Report training event to statistics.
         if let Some(stats) = &self.statistics {
             stats.on_trained(is_spam);
+
+            // Report accuracy correction if the message was previously classified.
+            // This detects when a user's manual training contradicts or confirms
+            // the original automatic classification.
+            if let Some(original_classification) = existing_info.as_ref().and_then(|info| info.classification) {
+                stats.on_correction(original_classification, is_spam);
+            }
         }
 
         Ok(true)
@@ -384,6 +424,11 @@ impl TrainingEngine {
     ) -> Result<(), TrainError> {
         let search_key = msg.get_search_key();
 
+        self.logger.verbose("train", &format!(
+            "on_message_moved: '{}' moved to folder",
+            msg.get_display_id(),
+        ));
+
         // Look up the message in the database.
         let existing_info = {
             let db = self.message_db.lock()
@@ -396,10 +441,10 @@ impl TrainingEngine {
         let info = match &existing_info {
             Some(info) if info.classification.is_some() => info,
             _ => {
-                self.logger.info(
+                self.logger.verbose(
                     "train",
                     &format!(
-                        "Skipping incremental training for '{}': never classified by SpamBayes",
+                        "on_message_moved: skipping '{}' — never classified by SpamBayes",
                         msg.get_display_id()
                     ),
                 );
@@ -417,6 +462,11 @@ impl TrainingEngine {
             spam_folder_id,
             info.original_folder.as_ref(),
         );
+
+        self.logger.verbose("train", &format!(
+            "on_message_moved: '{}' classification={:?}, action={:?}",
+            msg.get_display_id(), classification, action
+        ));
 
         match action {
             IncrementalAction::TrainAsSpam => {
@@ -599,6 +649,11 @@ impl TrainingEngine {
         // Report incremental training event to statistics.
         if let Some(stats) = &self.statistics {
             stats.on_trained(train_as_spam);
+
+            // Report accuracy correction if the message was previously classified.
+            if let Some(original_classification) = existing_info.as_ref().and_then(|i| i.classification) {
+                stats.on_correction(original_classification, train_as_spam);
+            }
         }
 
         self.logger.info(
@@ -642,6 +697,14 @@ impl TrainingEngine {
             return Err(TrainError::NoFoldersConfigured);
         }
 
+        self.logger.verbose("train", &format!(
+            "train_batch: starting (ham_folders={}, spam_folders={}, ham_include_sub={}, spam_include_sub={})",
+            config.ham_folder_ids.len(),
+            config.spam_folder_ids.len(),
+            config.ham_include_sub,
+            config.spam_include_sub,
+        ));
+
         let mut result = TrainResult::new();
 
         // Requirement 9.1: Process ham folders (and sub-folders if configured).
@@ -650,6 +713,9 @@ impl TrainingEngine {
             config.ham_include_sub,
             folder_provider,
         );
+        self.logger.verbose("train", &format!(
+            "train_batch: expanded to {} ham folders", ham_folders.len()
+        ));
         for folder_id in &ham_folders {
             self.train_folder(
                 folder_id,
@@ -666,6 +732,9 @@ impl TrainingEngine {
             config.spam_include_sub,
             folder_provider,
         );
+        self.logger.verbose("train", &format!(
+            "train_batch: expanded to {} spam folders", spam_folders.len()
+        ));
         for folder_id in &spam_folders {
             self.train_folder(
                 folder_id,
@@ -750,6 +819,11 @@ impl TrainingEngine {
             return Err(TrainError::NoFoldersConfigured);
         }
 
+        self.logger.verbose("train", &format!(
+            "rebuild: starting full rebuild (ham_folders={}, spam_folders={})",
+            config.ham_folder_ids.len(), config.spam_folder_ids.len()
+        ));
+
         // Requirement 9.5: Create a new temporary classifier with same config.
         let classifier_config = {
             let current = self.classifier.lock()
@@ -814,12 +888,17 @@ impl TrainingEngine {
             }
         }
 
-        // Requirement 9.5: Atomically swap the new classifier in.
+        // Requirement 9.5: Swap the new classifier in atomically.
         {
             let mut classifier_guard = self.classifier.lock()
                 .map_err(|_| TrainError::ClassifierLockPoisoned)?;
             *classifier_guard = new_classifier;
         }
+
+        self.logger.verbose("train", &format!(
+            "rebuild: classifier swapped ({} messages trained)",
+            trained_messages.len()
+        ));
 
         // Update message database: re-record all trained messages.
         {

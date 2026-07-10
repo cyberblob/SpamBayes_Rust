@@ -17,6 +17,11 @@ use std::sync::{Arc, Mutex};
 /// Only one calendar prompt (or filter action) runs at a time on the STA thread.
 static PROCESSING_EVENT: AtomicBool = AtomicBool::new(false);
 
+/// Global verbosity level for folder_sink debug logging.
+/// Updated from config.general.verbose when folder hooks are set up or config is reloaded.
+/// 0 = no folder_sink logging, 1 = errors/important only, 2 = full verbose trace.
+static FOLDER_SINK_VERBOSE: AtomicU32 = AtomicU32::new(0);
+
 /// Set of message identifiers (Subject + SenderName hash) recently moved by
 /// user action (train as ham/spam). Messages in this set are skipped by
 /// `handle_item_add` to avoid re-filtering after a deliberate move.
@@ -513,11 +518,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         ));
     }
 
-    log_debug(&debug_path, &format!(
+    log_debug_important(&debug_path, &format!(
         "========== ItemAdd FIRED in '{}' ==========", sink.folder_name
     ));
-    log_debug(&debug_path, &format!("  Subject: {}", subject));
-    log_debug(&debug_path, &format!("  Sender: {}", sender));
+    log_debug_important(&debug_path, &format!("  Subject: {}", subject));
+    log_debug_important(&debug_path, &format!("  Sender: {}", sender));
     log_debug(&debug_path, &format!("  MessageClass: {}", msg_class));
 
     // ── Message class gate ──────────────────────────────────────────────────
@@ -567,7 +572,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 let state = match sink.state.lock() {
                     Ok(s) => s,
                     Err(_) => {
-                        log_debug(&debug_path, "ERROR: FolderHookState lock poisoned");
+                        log_debug_important(&debug_path, "ERROR: FolderHookState lock poisoned");
                         return;
                     }
                 };
@@ -602,7 +607,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                     let state = match sink.state.lock() {
                         Ok(s) => s,
                         Err(_) => {
-                            log_debug(&debug_path, "ERROR: FolderHookState lock poisoned");
+                            log_debug_important(&debug_path, "ERROR: FolderHookState lock poisoned");
                             return;
                         }
                     };
@@ -643,7 +648,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         let state = match sink.state.lock() {
             Ok(s) => s,
             Err(_) => {
-                log_debug(&debug_path, "ERROR: FolderHookState lock poisoned");
+                log_debug_important(&debug_path, "ERROR: FolderHookState lock poisoned");
                 return;
             }
         };
@@ -657,7 +662,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
 
     // Check if filtering is enabled
     if !filter_enabled {
-        log_debug(&debug_path, "Filter disabled, ignoring message");
+        log_debug_important(&debug_path, "Filter disabled, ignoring message");
         return;
     }
 
@@ -806,14 +811,14 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         let state = match sink.state.lock() {
             Ok(s) => s,
             Err(_) => {
-                log_debug(&debug_path, "ERROR: FolderHookState lock poisoned");
+                log_debug_important(&debug_path, "ERROR: FolderHookState lock poisoned");
                 return;
             }
         };
         let filter_engine = match state.filter_engine.lock() {
             Ok(fe) => fe,
             Err(_) => {
-                log_debug(&debug_path, "ERROR: FilterEngine lock poisoned");
+                log_debug_important(&debug_path, "ERROR: FilterEngine lock poisoned");
                 return;
             }
         };
@@ -829,7 +834,7 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         match filter_engine.classify_raw(&message_bytes) {
             Ok(r) => r,
             Err(e) => {
-                log_debug(&debug_path, &format!("Classify error: {:?}", e));
+                log_debug_important(&debug_path, &format!("Classify error: {:?}", e));
                 return;
             }
         }
@@ -841,10 +846,10 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
         Classification::Ham => "Ham",
     };
 
-    log_debug(&debug_path, &format!(
+    log_debug_important(&debug_path, &format!(
         "  *** CLASSIFICATION: {} ***", classification_name
     ));
-    log_debug(&debug_path, &format!(
+    log_debug_important(&debug_path, &format!(
         "  Score: {:.2}%", result.score_pct
     ));
     log_debug(&debug_path, &format!(
@@ -2361,12 +2366,43 @@ unsafe fn set_variant_property(disp: *mut c_void, name: &str, value: f64) {
 
 // ─── Debug Logging ───────────────────────────────────────────────────────────
 
+/// Update the folder_sink verbosity level from config.
+///
+/// Called when the addin starts up or when config is reloaded.
+/// - `0` = no folder_sink debug logging (silent)
+/// - `1` = important messages only (errors, folder hook setup)
+/// - `2` = full verbose trace (every ItemAdd event, scoring details)
+pub fn set_verbose_level(level: u32) {
+    FOLDER_SINK_VERBOSE.store(level, Ordering::Relaxed);
+}
+
 fn debug_log_path() -> String {
     let data_dir = std::env::var("LOCALAPPDATA").unwrap_or_default();
     format!("{data_dir}\\SpamBayes\\folder_monitor.log")
 }
 
+/// Log a debug message to folder_monitor.log.
+///
+/// Only writes when `FOLDER_SINK_VERBOSE >= 2` (verbose/debug mode).
+/// Use `log_debug_important` for messages that should appear at level 1+.
 fn log_debug(path: &str, msg: &str) {
+    if FOLDER_SINK_VERBOSE.load(Ordering::Relaxed) < 2 {
+        return;
+    }
+    write_log_line(path, msg);
+}
+
+/// Log an important message (errors, lifecycle events) to folder_monitor.log.
+///
+/// Writes when `FOLDER_SINK_VERBOSE >= 1`.
+fn log_debug_important(path: &str, msg: &str) {
+    if FOLDER_SINK_VERBOSE.load(Ordering::Relaxed) < 1 {
+        return;
+    }
+    write_log_line(path, msg);
+}
+
+fn write_log_line(path: &str, msg: &str) {
     use std::io::Write;
     // Format as YYYY-MM-DD HH:MM:SS (approximate from epoch)
     let now = std::time::SystemTime::now()

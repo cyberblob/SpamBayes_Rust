@@ -8,6 +8,7 @@
 //! **Validates: Requirements 1.2–1.8**
 
 use std::f64::consts::PI;
+use std::path::Path;
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -315,7 +316,8 @@ impl GeneralTab {
         });
 
         reset_config_btn.connect_clicked(|_btn| {
-            log::info!("Reset Configuration clicked (TODO: wire to reset logic)");
+            // Wired from ManagerWindow after construction — placeholder for standalone testing.
+            log::info!("Reset Configuration clicked (handler should be overridden by ManagerWindow)");
         });
 
         wizard_btn.connect_clicked({
@@ -497,6 +499,31 @@ impl GeneralTab {
             format!("Unsure managed in '{}'.", name)
         } else {
             "Unsure folder: (not configured)".to_string()
+        }
+    }
+
+    /// Reset configuration by deleting all INI config files.
+    ///
+    /// Removes all config layer files so the next load falls through to
+    /// the hardcoded `AppConfig::default()` values:
+    /// - `default_bayes_customize.ini` (layer 1)
+    /// - `default.ini` (layer 3, the file written by save/wizard)
+    pub fn execute_reset_configuration(data_directory: &Path) {
+        log::info!("Resetting configuration to defaults by removing INI files in {:?}", data_directory);
+
+        let config_files = [
+            data_directory.join("default_bayes_customize.ini"),
+            data_directory.join("default.ini"),
+        ];
+
+        for path in &config_files {
+            if path.exists() {
+                if let Err(e) = std::fs::remove_file(path) {
+                    log::error!("Failed to delete config file {:?}: {e}", path);
+                } else {
+                    log::info!("Deleted config file: {:?}", path);
+                }
+            }
         }
     }
 }

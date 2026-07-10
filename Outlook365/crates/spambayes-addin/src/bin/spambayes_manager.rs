@@ -99,7 +99,7 @@ fn create_training_executor(
         Arc::new(Mutex::new(Box::new(MmapMessageDb::new(msg_db_path))));
 
     // Create logger.
-    let log_path = data_dir.join("spambayes.log");
+    let log_path = data_dir.join("addin_debug.log");
     let logger = Logger::new(&log_path, spambayes_addin::LogLevel::Info)
         .or_else(|_| Logger::new(&Logger::default_path(), spambayes_addin::LogLevel::Info))
         .ok()?;
@@ -225,6 +225,7 @@ fn main() {
             folder_tree,
             executor,
             Some(stats),
+            Some(stats_mgr),
             move || {
                 let _ = done_tx.send(());
             },

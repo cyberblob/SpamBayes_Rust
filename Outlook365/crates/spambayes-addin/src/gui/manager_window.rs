@@ -16,7 +16,7 @@ use gtk4::{
 };
 use gtk4::gdk;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use spambayes_config::AppConfig;
 use crate::gui::folder_browser::FolderProvider;
 use crate::gui::message_boxes;
 use crate::manager_dlg::{ManagerState, ManagerStats};
+use crate::statistics::StatisticsManager;
 
 use super::tabs::{
     AdvancedTab, CalendarTab, FilteringTab, GeneralTab, NotificationsTab, StatisticsTab,
@@ -182,6 +183,8 @@ pub struct ManagerWindow {
     config: RefCell<AppConfig>,
     /// The data directory for config save operations.
     data_directory: PathBuf,
+    /// When true, close-request skips saving (used after config reset).
+    skip_save: Rc<Cell<bool>>,
     /// Callback invoked when the window is closed (sends completion to COM thread).
     on_close: RefCell<Option<Box<dyn FnOnce() + 'static>>>,
     // ─── Tab references for reading values on save ───────────────────────
@@ -207,6 +210,7 @@ impl ManagerWindow {
         stats: &ManagerStats,
         config: &AppConfig,
         folder_provider: Rc<dyn FolderProvider>,
+        statistics_manager: Option<StatisticsManager>,
     ) -> Rc<Self> {
         // Determine data directory
         let data_directory = if config.general.data_directory.is_empty() {
@@ -219,7 +223,7 @@ impl ManagerWindow {
         let general = GeneralTab::new(state, stats, config, folder_provider.as_ref());
         let filtering = FilteringTab::new(state, Rc::clone(&folder_provider));
         let training = TrainingTab::new(state, config, Rc::clone(&folder_provider));
-        let statistics = StatisticsTab::new(stats, None);
+        let statistics = StatisticsTab::new(stats, statistics_manager);
         let notifications = NotificationsTab::new(&config.notification);
         let calendar = CalendarTab::new(&config.calendar);
         let advanced = AdvancedTab::new(config, &data_directory);
@@ -306,6 +310,7 @@ impl ManagerWindow {
             notebook,
             config: RefCell::new(config.clone()),
             data_directory,
+            skip_save: Rc::new(Cell::new(false)),
             on_close: RefCell::new(None),
             general,
             filtering,
@@ -337,6 +342,14 @@ impl ManagerWindow {
             let mgr = Rc::clone(&manager);
             about_btn.connect_clicked(move |_| {
                 mgr.show_about();
+            });
+        }
+
+        // ─── Wire Reset Configuration button ─────────────────────────────
+        {
+            let mgr = Rc::clone(&manager);
+            manager.general.reset_config_btn.connect_clicked(move |_| {
+                mgr.handle_reset_configuration();
             });
         }
 
@@ -395,6 +408,14 @@ impl ManagerWindow {
     ///
     /// **Validates: Requirement 8.1**
     fn handle_close_request(&self) -> glib::Propagation {
+        // If reset was triggered, skip saving and just close
+        if self.skip_save.get() {
+            if let Some(callback) = self.on_close.borrow_mut().take() {
+                callback();
+            }
+            return glib::Propagation::Proceed;
+        }
+
         match self.apply_changes() {
             Ok(()) => {
                 // Save succeeded — invoke the on_close callback and allow close
@@ -415,6 +436,77 @@ impl ManagerWindow {
                 glib::Propagation::Stop
             }
         }
+    }
+
+    /// Handle the "Reset Configuration..." button click.
+    ///
+    /// Shows a confirmation dialog. On confirmation, deletes all config INI
+    /// files, sets `skip_save` so the close handler won't recreate them,
+    /// and closes the window.
+    fn handle_reset_configuration(&self) {
+        use super::tabs::general::GeneralTab;
+
+        // Show confirmation dialog
+        let dialog = gtk4::Window::new();
+        dialog.set_title(Some("Reset Configuration"));
+        dialog.set_default_size(450, 200);
+        dialog.set_modal(true);
+        dialog.set_transient_for(Some(&self.window));
+
+        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        vbox.set_margin_top(20);
+        vbox.set_margin_bottom(20);
+        vbox.set_margin_start(20);
+        vbox.set_margin_end(20);
+
+        let warning = gtk4::Label::new(Some(
+            "This will reset all SpamBayes settings to their default values.\n\n\
+             Your training data will not be affected, but folder assignments,\n\
+             thresholds, and all other settings will be lost.\n\n\
+             The Manager window will close after resetting.",
+        ));
+        warning.set_wrap(true);
+        warning.set_halign(gtk4::Align::Start);
+        vbox.append(&warning);
+
+        let button_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        button_bar.set_halign(gtk4::Align::End);
+        button_bar.set_margin_top(12);
+
+        let reset_btn = gtk4::Button::with_label("Reset");
+        let cancel_btn = gtk4::Button::with_label("Cancel");
+
+        button_bar.append(&reset_btn);
+        button_bar.append(&cancel_btn);
+        vbox.append(&button_bar);
+
+        dialog.set_child(Some(&vbox));
+
+        // Wire Cancel
+        let dialog_close = dialog.clone();
+        cancel_btn.connect_clicked(move |_| {
+            dialog_close.close();
+        });
+
+        // Wire Reset — delete INI files, set skip_save, close manager
+        let data_dir = self.data_directory.clone();
+        let manager_window = self.window.clone();
+        let skip_save_flag = self.skip_save.clone();
+        let dialog_clone = dialog.clone();
+        reset_btn.connect_clicked(move |_| {
+            dialog_clone.close();
+
+            // Delete all config layer files
+            GeneralTab::execute_reset_configuration(&data_dir);
+
+            // Prevent the close handler from re-saving old widget values
+            skip_save_flag.set(true);
+
+            // Close the Manager window (will skip save due to flag)
+            manager_window.close();
+        });
+
+        dialog.present();
     }
 
     /// Validate and save all settings from all tabs.

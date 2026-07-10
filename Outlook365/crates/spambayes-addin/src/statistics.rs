@@ -24,6 +24,12 @@ pub struct SessionStats {
     pub spam_classified: u32,
     pub ham_trained: u32,
     pub spam_trained: u32,
+    /// Messages where the user confirmed the classification was correct.
+    pub correctly_classified: u32,
+    /// Ham/unsure messages the user reclassified as spam (false negatives).
+    pub false_negatives: u32,
+    /// Spam/unsure messages the user reclassified as ham (false positives).
+    pub false_positives: u32,
 }
 
 // ─── Lifetime Statistics ─────────────────────────────────────────────────────
@@ -41,6 +47,15 @@ pub struct LifetimeStats {
     pub total_ham_classified: u64,
     pub total_unsure_classified: u64,
     pub total_spam_classified: u64,
+    /// Lifetime count of messages confirmed as correctly classified.
+    #[serde(default)]
+    pub correctly_classified: u64,
+    /// Lifetime count of false negatives (spam that was classified as ham/unsure).
+    #[serde(default)]
+    pub false_negatives: u64,
+    /// Lifetime count of false positives (ham that was classified as spam/unsure).
+    #[serde(default)]
+    pub false_positives: u64,
 }
 
 // ─── Stats File ──────────────────────────────────────────────────────────────
@@ -232,6 +247,58 @@ impl StatisticsManager {
             inner.lifetime.total_spam_trained = inner.lifetime.total_spam_trained.saturating_sub(1);
         } else {
             inner.lifetime.total_ham_trained = inner.lifetime.total_ham_trained.saturating_sub(1);
+        }
+    }
+
+    /// Record a user correction event for accuracy tracking.
+    ///
+    /// Called when the user manually reclassifies a message (via Spam/Not Spam
+    /// buttons or drag-to-folder). The `original_classification` is what
+    /// SpamBayes assigned, and `user_says_spam` is the user's judgment.
+    ///
+    /// - If the original classification matches the user's judgment, it counts
+    ///   as "correctly classified."
+    /// - If the message was classified as ham/unsure but the user says spam,
+    ///   it's a false negative.
+    /// - If the message was classified as spam/unsure but the user says ham,
+    ///   it's a false positive.
+    ///
+    /// **Validates: Requirements 4.2, 4.4**
+    pub fn on_correction(&self, original_classification: Classification, user_says_spam: bool) {
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Error: statistics lock poisoned in on_correction: {}", e);
+                return;
+            }
+        };
+
+        match (original_classification, user_says_spam) {
+            // User confirms spam was correctly classified as spam.
+            (Classification::Spam, true) => {
+                inner.session.correctly_classified += 1;
+                inner.lifetime.correctly_classified += 1;
+            }
+            // User confirms ham was correctly classified as ham.
+            (Classification::Ham, false) => {
+                inner.session.correctly_classified += 1;
+                inner.lifetime.correctly_classified += 1;
+            }
+            // Classified as ham or unsure, but user says it's spam → false negative.
+            (Classification::Ham | Classification::Unsure, true) => {
+                inner.session.false_negatives += 1;
+                inner.lifetime.false_negatives += 1;
+            }
+            // Classified as spam or unsure, but user says it's ham → false positive.
+            (Classification::Spam | Classification::Unsure, false) => {
+                inner.session.false_positives += 1;
+                inner.lifetime.false_positives += 1;
+            }
+        }
+
+        inner.dirty_count += 1;
+        if inner.dirty_count >= inner.save_interval {
+            Self::save_inner(&mut inner);
         }
     }
 

@@ -12,8 +12,10 @@
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Align, Box as GtkBox, Button, CheckButton, ComboBoxText, Entry,
-    EventControllerFocus, Frame, Label, Orientation, Scale, ScrolledWindow, SpinButton,
+    EventControllerFocus, EventControllerScroll, EventControllerScrollFlags, Frame, Label,
+    Orientation, Scale, ScrolledWindow, SpinButton,
 };
+use gtk4::glib;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -193,6 +195,11 @@ impl FilteringTab {
              Higher values are more strict (fewer false positives)."
         ));
 
+        // Inhibit mouse scroll on the scale so scrolling the page doesn't change the value
+        let spam_scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        spam_scroll_ctrl.connect_scroll(|_, _, _| glib::Propagation::Stop);
+        spam_scale.add_controller(spam_scroll_ctrl);
+
         let spam_entry = Entry::new();
         spam_entry.set_width_chars(6);
         spam_entry.set_text(&format!("{:.1}", state.spam_threshold));
@@ -298,6 +305,11 @@ impl FilteringTab {
         unsure_scale.set_tooltip_text(Some(
             "Set the score above which messages are classified as unsure."
         ));
+
+        // Inhibit mouse scroll on the scale so scrolling the page doesn't change the value
+        let unsure_scroll_ctrl = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        unsure_scroll_ctrl.connect_scroll(|_, _, _| glib::Propagation::Stop);
+        unsure_scale.add_controller(unsure_scroll_ctrl);
 
         let unsure_entry = Entry::new();
         unsure_entry.set_width_chars(6);

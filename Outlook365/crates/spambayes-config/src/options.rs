@@ -216,13 +216,57 @@ impl Default for FilterConfig {
             save_spam_info: true,
             watch_folder_ids: Vec::new(),
             timer_enabled: true,
-            timer_start_delay: 2.0,
-            timer_interval: 1.0,
+            timer_start_delay: 10.0,
+            timer_interval: 4.0,
             timer_only_receive_folders: true,
             spam_auto_cleanup_enabled: false,
             spam_auto_cleanup_days: 30,
             use_cached_scores: false,
             clear_exchange_scl: false,
+        }
+    }
+}
+
+// ─── FilterConfig helper methods ─────────────────────────────────────────────
+
+impl FilterConfig {
+    /// Returns `true` if the unsure folder is configured (i.e., `unsure_folder_id` is `Some`),
+    /// regardless of whether the stored ID matches the current Outlook format.
+    ///
+    /// Logs a warning via `eprintln!` if the folder ID exists but has empty
+    /// `entry_id` or `store_id` strings (corrupted configuration state).
+    #[must_use]
+    pub fn has_unsure_folder_configured(&self) -> bool {
+        match &self.unsure_folder_id {
+            Some(fid) => {
+                if fid.entry_id.0.is_empty() || fid.store_id.0.is_empty() {
+                    eprintln!(
+                        "Warning: unsure_folder_id is configured but has empty entry_id or store_id"
+                    );
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns `true` if the spam folder is configured (i.e., `spam_folder_id` is `Some`),
+    /// regardless of whether the stored ID matches the current Outlook format.
+    ///
+    /// Logs a warning via `eprintln!` if the folder ID exists but has empty
+    /// `entry_id` or `store_id` strings (corrupted configuration state).
+    #[must_use]
+    pub fn has_spam_folder_configured(&self) -> bool {
+        match &self.spam_folder_id {
+            Some(fid) => {
+                if fid.entry_id.0.is_empty() || fid.store_id.0.is_empty() {
+                    eprintln!(
+                        "Warning: spam_folder_id is configured but has empty entry_id or store_id"
+                    );
+                }
+                true
+            }
+            None => false,
         }
     }
 }
@@ -1467,5 +1511,56 @@ spam_threshold = 95.0
         // Main values still loaded for non-overlay keys
         assert_eq!(config.filter.unsure_threshold, 20.0);
         assert!(config.filter.enabled);
+    }
+
+    // ── FilterConfig helper method tests ──
+
+    #[test]
+    fn test_has_unsure_folder_configured_returns_false_when_none() {
+        let config = FilterConfig::default();
+        assert!(!config.has_unsure_folder_configured());
+    }
+
+    #[test]
+    fn test_has_unsure_folder_configured_returns_true_when_some_valid() {
+        use crate::folder_id::{EntryId, StoreId};
+
+        let mut config = FilterConfig::default();
+        config.unsure_folder_id = Some(FolderId::new(
+            StoreId::new("AABB1122"),
+            EntryId::new("CCDD3344"),
+        ));
+        assert!(config.has_unsure_folder_configured());
+    }
+
+    #[test]
+    fn test_has_unsure_folder_configured_returns_true_with_empty_entry_id() {
+        use crate::folder_id::{EntryId, StoreId};
+
+        let mut config = FilterConfig::default();
+        config.unsure_folder_id = Some(FolderId::new(
+            StoreId::new("AABB1122"),
+            EntryId::new(""), // empty entry_id — corrupted state
+        ));
+        // Still returns true (it IS configured, just in a bad state)
+        assert!(config.has_unsure_folder_configured());
+    }
+
+    #[test]
+    fn test_has_spam_folder_configured_returns_false_when_none() {
+        let config = FilterConfig::default();
+        assert!(!config.has_spam_folder_configured());
+    }
+
+    #[test]
+    fn test_has_spam_folder_configured_returns_true_when_some_valid() {
+        use crate::folder_id::{EntryId, StoreId};
+
+        let mut config = FilterConfig::default();
+        config.spam_folder_id = Some(FolderId::new(
+            StoreId::new("1122AABB"),
+            EntryId::new("3344CCDD"),
+        ));
+        assert!(config.has_spam_folder_configured());
     }
 }
