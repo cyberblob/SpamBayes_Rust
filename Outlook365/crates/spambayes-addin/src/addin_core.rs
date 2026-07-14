@@ -72,6 +72,9 @@ const FOLDER_SWITCH_TIMER_ID: usize = 0x5B04;
 /// Timer ID for manager process exit detection and config reload.
 const MANAGER_WATCH_TIMER_ID: usize = 0x5B05;
 
+/// Timer ID for deferred update check (fires once after startup).
+const UPDATE_CHECK_TIMER_ID: usize = 0x5B06;
+
 /// Last known folder EntryID for change detection.
 /// SAFETY: Only accessed from the COM STA thread.
 static mut LAST_FOLDER_ENTRY_ID: Option<String> = None;
@@ -456,6 +459,108 @@ unsafe extern "system" fn manager_watch_timer_proc(
 
     // Reload configuration from disk
     addin.reload_config_from_disk();
+}
+
+/// Timer callback for deferred update check.
+///
+/// Fires once, 10 seconds after OnStartupComplete. Spawns a background thread
+/// to perform the HTTP fetch so the COM STA thread is not blocked. The result
+/// is handled on the background thread (MessageBox is thread-safe on Windows).
+///
+/// Self-kills immediately since it only needs to fire once.
+unsafe extern "system" fn update_check_timer_proc(
+    _hwnd: windows::Win32::Foundation::HWND,
+    _msg: u32,
+    _id_event: usize,
+    _dw_time: u32,
+) {
+    // Kill this timer immediately — it's a one-shot.
+    use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+    use windows::Win32::Foundation::HWND;
+    KillTimer(HWND::default(), UPDATE_CHECK_TIMER_ID).ok();
+
+    let addin = GLOBAL_ADDIN_PTR;
+    if addin.is_null() {
+        return;
+    }
+    let addin = &mut *addin;
+
+    // Check if updates are enabled.
+    let config = match &addin.config {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    if !config.update.enabled {
+        return;
+    }
+
+    let data_dir = AddinCore::get_data_directory();
+    let logger = addin.logger.clone();
+
+    // Spawn a background thread for the HTTP check.
+    // This avoids blocking Outlook's UI thread.
+    std::thread::spawn(move || {
+        let mut checker = crate::updater::UpdateChecker::new(
+            &config,
+            &data_dir,
+            "default",
+            logger,
+        );
+
+        let result = checker.check_for_update();
+
+        // Handle the result (show notification if update available).
+        match result {
+            crate::updater::UpdateCheckResult::UpdateAvailable {
+                current_version,
+                latest_version,
+                download_url,
+                release_notes,
+            } => {
+                if !checker.was_notified() {
+                    crate::updater::show_update_notification(
+                        &current_version,
+                        &latest_version,
+                        &release_notes,
+                        &download_url,
+                    );
+                    checker.mark_notified();
+                }
+            }
+            crate::updater::UpdateCheckResult::BuildUpdateAvailable {
+                version,
+                current_build,
+                latest_build,
+                download_url,
+            } => {
+                if !checker.was_notified() {
+                    crate::updater::show_build_update_notification(
+                        &version,
+                        current_build,
+                        latest_build,
+                        &download_url,
+                    );
+                    checker.mark_notified();
+                }
+            }
+            _ => {}
+        }
+
+        // Persist update state to config file.
+        // We create a minimal config update and save just the Update section.
+        let mut updated_config = config;
+        checker.save_state(&mut updated_config);
+        // Save sparse config (only non-default values) to avoid overwriting
+        // other settings that may have changed concurrently.
+        let update_state_path = data_dir.join("update_state.ini");
+        let ini_content = format!(
+            "[Update]\nlast_check_timestamp = {}\nupdate_notified = {}\n",
+            updated_config.update.last_check_timestamp,
+            if updated_config.update.update_notified { "True" } else { "False" },
+        );
+        let _ = std::fs::write(&update_state_path, ini_content);
+    });
 }
 
 // ─── ext_ConnectMode ─────────────────────────────────────────────────────────
@@ -1457,6 +1562,17 @@ impl AddinCore {
                 writeln!(f, "OnStartupComplete: COMPLETE")
             });
 
+        // Schedule deferred update check (fires 10 seconds after startup).
+        // This gives Outlook time to fully initialize before we make network calls.
+        if self.config.as_ref().map_or(true, |c| c.update.enabled) {
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                use windows::Win32::Foundation::HWND;
+                SetTimer(HWND::default(), UPDATE_CHECK_TIMER_ID, 10_000, Some(update_check_timer_proc));
+            }
+            self.log_verbose("OnStartupComplete: Update check timer scheduled (10s delay)");
+        }
+
         self.log_info("OnStartupComplete: Startup complete");
 
         // Invalidate the ribbon now that config is loaded so button visibility
@@ -1477,6 +1593,7 @@ impl AddinCore {
             use windows::Win32::UI::WindowsAndMessaging::KillTimer;
             use windows::Win32::Foundation::HWND;
             KillTimer(HWND::default(), FOLDER_SWITCH_TIMER_ID).ok();
+            KillTimer(HWND::default(), UPDATE_CHECK_TIMER_ID).ok();
             // Release the IRibbonUI reference
             if !GLOBAL_RIBBON_UI.is_null() {
                 Self::release_dispatch(GLOBAL_RIBBON_UI);

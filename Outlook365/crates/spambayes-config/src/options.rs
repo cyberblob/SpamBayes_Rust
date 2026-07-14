@@ -92,6 +92,7 @@ pub struct AppConfig {
     pub training: TrainingConfig,
     pub notification: NotificationConfig,
     pub calendar: CalendarConfig,
+    pub update: UpdateConfig,
     pub experimental: ExperimentalConfig,
 }
 
@@ -435,6 +436,48 @@ impl Default for CalendarConfig {
     }
 }
 
+// ─── UpdateConfig ─────────────────────────────────────────────────────────────
+
+/// Configuration for the automatic update checker.
+#[derive(Clone, Debug)]
+pub struct UpdateConfig {
+    /// Whether automatic update checking is enabled.
+    /// Default: `true`.
+    pub enabled: bool,
+    /// URL of the version manifest JSON file to check for updates.
+    /// Default: GitHub releases manifest URL.
+    pub update_url: String,
+    /// How often to check for updates, in hours.
+    /// Default: `24` (once per day).
+    pub check_interval_hours: u32,
+    /// Unix timestamp (seconds) of the last successful update check.
+    /// Default: `0` (never checked).
+    pub last_check_timestamp: u64,
+    /// Whether the user has been notified about the latest available version.
+    /// Resets when a new version is detected.
+    /// Default: `false`.
+    pub update_notified: bool,
+    /// The version string of the latest known available update (if any).
+    /// Empty string means no update info cached.
+    pub latest_known_version: String,
+    /// The download URL for the latest known update (if any).
+    pub latest_download_url: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            update_url: "https://raw.githubusercontent.com/cyberblob/SpamBayes_Rust/main/Outlook365/installer/version_manifest.json".to_string(),
+            check_interval_hours: 24,
+            last_check_timestamp: 0,
+            update_notified: false,
+            latest_known_version: String::new(),
+            latest_download_url: String::new(),
+        }
+    }
+}
+
 // ─── ExperimentalConfig ──────────────────────────────────────────────────────
 
 /// Experimental options that may change or be removed in future versions.
@@ -587,6 +630,9 @@ impl AppConfig {
         // ── Calendar section ──
         Self::load_calendar_section(&mut config.calendar, &get);
 
+        // ── Update section ──
+        Self::load_update_section(&mut config.update, &get);
+
         // ── Experimental section ──
         Self::load_experimental_section(&mut config.experimental, &get);
 
@@ -652,6 +698,9 @@ impl AppConfig {
 
         // ── Calendar section ──
         Self::load_calendar_section(&mut config.calendar, &get);
+
+        // ── Update section ──
+        Self::load_update_section(&mut config.update, &get);
 
         // ── Experimental section ──
         Self::load_experimental_section(&mut config.experimental, &get);
@@ -926,6 +975,47 @@ impl AppConfig {
         }
     }
 
+    fn load_update_section(
+        update: &mut UpdateConfig,
+        get: &dyn Fn(&str, &str) -> Option<String>,
+    ) {
+        if let Some(v) = get("Update", "enabled") {
+            match parse_bool(&v) {
+                Some(b) => update.enabled = b,
+                None => eprintln!("Warning: invalid value for [Update] enabled: {v:?}, using default"),
+            }
+        }
+        if let Some(v) = get("Update", "update_url") {
+            if !v.is_empty() {
+                update.update_url = v;
+            }
+        }
+        if let Some(v) = get("Update", "check_interval_hours") {
+            match parse_u32(&v) {
+                Some(n) => update.check_interval_hours = n,
+                None => eprintln!("Warning: invalid value for [Update] check_interval_hours: {v:?}, using default"),
+            }
+        }
+        if let Some(v) = get("Update", "last_check_timestamp") {
+            match v.trim().parse::<u64>() {
+                Ok(n) => update.last_check_timestamp = n,
+                Err(_) => eprintln!("Warning: invalid value for [Update] last_check_timestamp: {v:?}, using default"),
+            }
+        }
+        if let Some(v) = get("Update", "update_notified") {
+            match parse_bool(&v) {
+                Some(b) => update.update_notified = b,
+                None => eprintln!("Warning: invalid value for [Update] update_notified: {v:?}, using default"),
+            }
+        }
+        if let Some(v) = get("Update", "latest_known_version") {
+            update.latest_known_version = v;
+        }
+        if let Some(v) = get("Update", "latest_download_url") {
+            update.latest_download_url = v;
+        }
+    }
+
     fn load_experimental_section(
         experimental: &mut ExperimentalConfig,
         get: &dyn Fn(&str, &str) -> Option<String>,
@@ -1159,6 +1249,33 @@ impl AppConfig {
             data.insert("Calendar".to_string(), calendar);
         }
 
+        // ── Update section ──
+        let mut update = SectionData::new();
+        if self.update.enabled != defaults.update.enabled {
+            update.insert("enabled".to_string(), format_bool(self.update.enabled).to_string());
+        }
+        if self.update.update_url != defaults.update.update_url {
+            update.insert("update_url".to_string(), self.update.update_url.clone());
+        }
+        if self.update.check_interval_hours != defaults.update.check_interval_hours {
+            update.insert("check_interval_hours".to_string(), self.update.check_interval_hours.to_string());
+        }
+        if self.update.last_check_timestamp != defaults.update.last_check_timestamp {
+            update.insert("last_check_timestamp".to_string(), self.update.last_check_timestamp.to_string());
+        }
+        if self.update.update_notified != defaults.update.update_notified {
+            update.insert("update_notified".to_string(), format_bool(self.update.update_notified).to_string());
+        }
+        if self.update.latest_known_version != defaults.update.latest_known_version {
+            update.insert("latest_known_version".to_string(), self.update.latest_known_version.clone());
+        }
+        if self.update.latest_download_url != defaults.update.latest_download_url {
+            update.insert("latest_download_url".to_string(), self.update.latest_download_url.clone());
+        }
+        if !update.is_empty() {
+            data.insert("Update".to_string(), update);
+        }
+
         // ── Experimental section ──
         let mut experimental = SectionData::new();
         if self.experimental.timer_start_delay != defaults.experimental.timer_start_delay {
@@ -1316,6 +1433,17 @@ impl AppConfig {
         calendar.insert("calendar_filtering_enabled".to_string(), format_bool(self.calendar.calendar_filtering_enabled).to_string());
         calendar.insert("calendar_spam_action".to_string(), self.calendar.calendar_spam_action.to_ini_str().to_string());
         data.insert("Calendar".to_string(), calendar);
+
+        // ── Update section ──
+        let mut update = SectionData::new();
+        update.insert("enabled".to_string(), format_bool(self.update.enabled).to_string());
+        update.insert("update_url".to_string(), self.update.update_url.clone());
+        update.insert("check_interval_hours".to_string(), self.update.check_interval_hours.to_string());
+        update.insert("last_check_timestamp".to_string(), self.update.last_check_timestamp.to_string());
+        update.insert("update_notified".to_string(), format_bool(self.update.update_notified).to_string());
+        update.insert("latest_known_version".to_string(), self.update.latest_known_version.clone());
+        update.insert("latest_download_url".to_string(), self.update.latest_download_url.clone());
+        data.insert("Update".to_string(), update);
 
         // ── Experimental section ──
         let mut experimental = SectionData::new();

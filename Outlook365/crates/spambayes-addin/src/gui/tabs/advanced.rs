@@ -368,6 +368,20 @@ impl AdvancedTab {
         env_box.append(&version_label);
         env_box.append(&arch_label);
         env_box.append(&build_date_label);
+
+        // "Check for Update" button within the environment section.
+        let update_btn = Button::with_label("Check for Update");
+        update_btn.set_halign(Align::Start);
+        update_btn.set_margin_top(8);
+        update_btn.set_tooltip_text(Some(
+            "Check if a newer version of SpamBayes is available for download.",
+        ));
+        let update_url = config.update.update_url.clone();
+        update_btn.connect_clicked(move |btn| {
+            Self::check_for_update(btn, &update_url);
+        });
+        env_box.append(&update_btn);
+
         env_frame.set_child(Some(&env_box));
         content_box.append(&env_frame);
 
@@ -458,6 +472,219 @@ impl AdvancedTab {
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────
+
+    /// Perform an update check and show the result to the user.
+    ///
+    /// Fetches the remote version manifest and compares against the running
+    /// version. Shows a dialog with the result (up-to-date, or new version
+    /// available with a download button).
+    fn check_for_update(btn: &Button, update_url: &str) {
+        use crate::version_manifest::{self, VersionManifest, CURRENT_VERSION, CURRENT_BUILD_NUMBER};
+
+        let parent_window = btn
+            .root()
+            .and_then(|root| root.downcast::<Window>().ok());
+
+        // Fetch manifest synchronously (acceptable for a user-triggered button click).
+        let result = ureq::get(update_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .call();
+
+        let manifest = match result {
+            Ok(response) => {
+                if response.status() != 200 {
+                    Self::show_update_result(
+                        parent_window.as_ref(),
+                        "Update Check Failed",
+                        &format!("Server returned HTTP {}", response.status()),
+                    );
+                    return;
+                }
+                match response.into_string() {
+                    Ok(body) => match VersionManifest::from_json(&body) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            Self::show_update_result(
+                                parent_window.as_ref(),
+                                "Update Check Failed",
+                                &format!("Invalid version manifest: {e}"),
+                            );
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        Self::show_update_result(
+                            parent_window.as_ref(),
+                            "Update Check Failed",
+                            &format!("Failed to read response: {e}"),
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                Self::show_update_result(
+                    parent_window.as_ref(),
+                    "Update Check Failed",
+                    &format!("Network error: {e}"),
+                );
+                return;
+            }
+        };
+
+        // Compare against current version.
+        let status = version_manifest::check_update_status(&manifest);
+
+        match status {
+            version_manifest::UpdateStatus::UpToDate => {
+                Self::show_update_result(
+                    parent_window.as_ref(),
+                    "Up to Date",
+                    &format!(
+                        "You are running the latest version.\n\nVersion: {}\nBuild: {}",
+                        CURRENT_VERSION, CURRENT_BUILD_NUMBER
+                    ),
+                );
+            }
+            version_manifest::UpdateStatus::NewVersionAvailable {
+                current,
+                latest,
+                download_url,
+                release_notes,
+            } => {
+                let notes_section = if release_notes.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\nWhat's new: {release_notes}")
+                };
+                Self::show_update_with_download(
+                    parent_window.as_ref(),
+                    "Update Available",
+                    &format!(
+                        "A new version is available!\n\nCurrent: {current}\nLatest: {latest}{notes_section}"
+                    ),
+                    &download_url,
+                );
+            }
+            version_manifest::UpdateStatus::NewBuildAvailable {
+                version,
+                current_build,
+                latest_build,
+                download_url,
+            } => {
+                Self::show_update_with_download(
+                    parent_window.as_ref(),
+                    "Build Update Available",
+                    &format!(
+                        "A newer build of {version} is available.\n\n\
+                         Your build: {current_build}\nLatest build: {latest_build}\n\n\
+                         This is a maintenance update with bug fixes."
+                    ),
+                    &download_url,
+                );
+            }
+        }
+    }
+
+    /// Show a simple informational dialog with a title and message.
+    fn show_update_result(parent: Option<&Window>, title: &str, message: &str) {
+        let dialog = Window::new();
+        dialog.set_title(Some(title));
+        dialog.set_default_size(380, 180);
+        dialog.set_modal(true);
+        if let Some(parent_win) = parent {
+            dialog.set_transient_for(Some(parent_win));
+        }
+
+        let vbox = GtkBox::new(Orientation::Vertical, 12);
+        vbox.set_margin_top(16);
+        vbox.set_margin_bottom(16);
+        vbox.set_margin_start(16);
+        vbox.set_margin_end(16);
+
+        let label = Label::new(Some(message));
+        label.set_wrap(true);
+        label.set_halign(Align::Start);
+        vbox.append(&label);
+
+        let close_btn = Button::with_label("OK");
+        close_btn.set_halign(Align::End);
+        let dialog_ref = dialog.clone();
+        close_btn.connect_clicked(move |_| {
+            dialog_ref.close();
+        });
+        vbox.append(&close_btn);
+
+        dialog.set_child(Some(&vbox));
+        dialog.present();
+    }
+
+    /// Show an update-available dialog with a "Download" button.
+    fn show_update_with_download(
+        parent: Option<&Window>,
+        title: &str,
+        message: &str,
+        download_url: &str,
+    ) {
+        let dialog = Window::new();
+        dialog.set_title(Some(title));
+        dialog.set_default_size(420, 220);
+        dialog.set_modal(true);
+        if let Some(parent_win) = parent {
+            dialog.set_transient_for(Some(parent_win));
+        }
+
+        let vbox = GtkBox::new(Orientation::Vertical, 12);
+        vbox.set_margin_top(16);
+        vbox.set_margin_bottom(16);
+        vbox.set_margin_start(16);
+        vbox.set_margin_end(16);
+
+        let label = Label::new(Some(message));
+        label.set_wrap(true);
+        label.set_halign(Align::Start);
+        vbox.append(&label);
+
+        let btn_box = GtkBox::new(Orientation::Horizontal, 8);
+        btn_box.set_halign(Align::End);
+
+        let download_btn = Button::with_label("Download");
+        download_btn.set_tooltip_text(Some("Open the download page in your browser."));
+        let url = download_url.to_string();
+        let dialog_ref = dialog.clone();
+        download_btn.connect_clicked(move |_| {
+            Self::open_url(&url);
+            dialog_ref.close();
+        });
+        btn_box.append(&download_btn);
+
+        let close_btn = Button::with_label("Close");
+        let dialog_ref2 = dialog.clone();
+        close_btn.connect_clicked(move |_| {
+            dialog_ref2.close();
+        });
+        btn_box.append(&close_btn);
+
+        vbox.append(&btn_box);
+        dialog.set_child(Some(&vbox));
+        dialog.present();
+    }
+
+    /// Open a URL in the default browser.
+    fn open_url(url: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(url)
+                .spawn();
+        }
+    }
 
     /// Open the data folder in the system file explorer.
     fn open_data_folder(path: &Path) {

@@ -97,6 +97,8 @@ pub mod tooltip_manager;
 pub mod train;
 #[cfg(feature = "gui")]
 pub mod training_bridge;
+pub mod updater;
+pub mod version_manifest;
 pub mod wizard;
 
 use std::ffi::c_void;

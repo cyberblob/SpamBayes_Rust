@@ -28,6 +28,12 @@ fn main() {
     );
 
     println!("cargo:rustc-env=SPAMBAYES_BUILD_ID={build_id}");
+    // Also embed the crate version from Cargo.toml as a compile-time constant.
+    // This allows the updater to compare the running version against a remote manifest.
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+    println!("cargo:rustc-env=SPAMBAYES_VERSION={version}");
+    // Embed the raw build number (Unix timestamp) for fine-grained build comparison.
+    println!("cargo:rustc-env=SPAMBAYES_BUILD_NUMBER={now}");
     // Tell Cargo to always re-run this build script so the timestamp updates
     // on every build. Using a non-existent file means "always dirty".
     println!("cargo:rerun-if-changed=__always_rebuild__");
