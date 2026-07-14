@@ -1768,9 +1768,10 @@ impl AddinCore {
             }
         };
 
-        // Process each selected item
+        // Process each selected item in REVERSE order so that moving/removing
+        // an item doesn't shift the indices of the items we haven't processed yet.
         let mut trained_count = 0u32;
-        for i in 1..=count {
+        for i in (1..=count).rev() {
             let item = match crate::com_invoke::dispatch_invoke_method(
                 selection, "Item", &[crate::com_invoke::VariantArg::I4(i)]
             ) {
