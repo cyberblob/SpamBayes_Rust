@@ -405,6 +405,16 @@ pub struct ManagerState {
     /// Spam training folder IDs.
     pub spam_training_folder_ids: Vec<FolderId>,
 
+    /// Whether spam auto-cleanup is enabled.
+    ///
+    /// **Validates: Requirement 18.1**
+    pub spam_auto_cleanup_enabled: bool,
+
+    /// Number of days to keep spam before automatic deletion.
+    ///
+    /// **Validates: Requirement 18.2**
+    pub spam_auto_cleanup_days: u32,
+
     /// Whether the state has been modified from the original config.
     dirty: bool,
 }
@@ -429,6 +439,8 @@ impl ManagerState {
             ham_folder_id: config.filter.ham_folder_id.clone(),
             ham_training_folder_ids: config.training.ham_folder_ids.clone(),
             spam_training_folder_ids: config.training.spam_folder_ids.clone(),
+            spam_auto_cleanup_enabled: config.filter.spam_auto_cleanup_enabled,
+            spam_auto_cleanup_days: config.filter.spam_auto_cleanup_days,
             dirty: false,
         }
     }
@@ -451,6 +463,8 @@ impl ManagerState {
         config.filter.ham_folder_id = self.ham_folder_id.clone();
         config.training.ham_folder_ids = self.ham_training_folder_ids.clone();
         config.training.spam_folder_ids = self.spam_training_folder_ids.clone();
+        config.filter.spam_auto_cleanup_enabled = self.spam_auto_cleanup_enabled;
+        config.filter.spam_auto_cleanup_days = self.spam_auto_cleanup_days;
     }
 
     /// Mark the state as modified.
@@ -564,6 +578,27 @@ impl ManagerState {
     pub fn set_spam_training_folders(&mut self, folders: Vec<FolderId>) {
         self.spam_training_folder_ids = folders;
         self.dirty = true;
+    }
+
+    /// Set spam auto-cleanup enabled and mark dirty.
+    ///
+    /// **Validates: Requirement 18.1**
+    pub fn set_spam_auto_cleanup_enabled(&mut self, enabled: bool) {
+        if self.spam_auto_cleanup_enabled != enabled {
+            self.spam_auto_cleanup_enabled = enabled;
+            self.dirty = true;
+        }
+    }
+
+    /// Set spam auto-cleanup retention days and mark dirty.
+    ///
+    /// **Validates: Requirement 18.2**
+    pub fn set_spam_auto_cleanup_days(&mut self, days: u32) {
+        let clamped = days.clamp(1, 365);
+        if self.spam_auto_cleanup_days != clamped {
+            self.spam_auto_cleanup_days = clamped;
+            self.dirty = true;
+        }
     }
 
     // ─── Validation Helpers ──────────────────────────────────────────────
@@ -1989,5 +2024,148 @@ mod tests {
             state.is_threshold_valid(),
             "Thresholds should be valid when spam=90, unsure=15"
         );
+    }
+
+    // ─── Spam Auto-Cleanup Tests (Req 18) ────────────────────────────────
+
+    #[test]
+    fn test_state_from_config_loads_cleanup_defaults() {
+        let config = AppConfig::default();
+        let state = ManagerState::from_config(&config);
+
+        assert!(!state.spam_auto_cleanup_enabled);
+        assert_eq!(state.spam_auto_cleanup_days, 30);
+    }
+
+    #[test]
+    fn test_state_from_config_loads_cleanup_enabled() {
+        let mut config = make_test_config();
+        config.filter.spam_auto_cleanup_enabled = true;
+        config.filter.spam_auto_cleanup_days = 14;
+
+        let state = ManagerState::from_config(&config);
+
+        assert!(state.spam_auto_cleanup_enabled);
+        assert_eq!(state.spam_auto_cleanup_days, 14);
+    }
+
+    #[test]
+    fn test_apply_to_config_writes_cleanup_fields() {
+        let mut config = make_test_config();
+        config.filter.spam_auto_cleanup_enabled = true;
+        config.filter.spam_auto_cleanup_days = 7;
+
+        let state = ManagerState::from_config(&config);
+        let mut target = AppConfig::default();
+        state.apply_to_config(&mut target);
+
+        assert!(target.filter.spam_auto_cleanup_enabled);
+        assert_eq!(target.filter.spam_auto_cleanup_days, 7);
+    }
+
+    #[test]
+    fn test_apply_to_config_writes_cleanup_disabled() {
+        let config = make_test_config(); // defaults: disabled, 30 days
+        let state = ManagerState::from_config(&config);
+
+        let mut target = AppConfig::default();
+        target.filter.spam_auto_cleanup_enabled = true; // pre-set to true
+        target.filter.spam_auto_cleanup_days = 99;
+
+        state.apply_to_config(&mut target);
+
+        assert!(!target.filter.spam_auto_cleanup_enabled);
+        assert_eq!(target.filter.spam_auto_cleanup_days, 30);
+    }
+
+    #[test]
+    fn test_set_cleanup_enabled_marks_dirty() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_enabled(true);
+        assert!(state.is_dirty());
+        assert!(state.spam_auto_cleanup_enabled);
+    }
+
+    #[test]
+    fn test_set_cleanup_enabled_same_not_dirty() {
+        let config = make_test_config(); // default: disabled
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_enabled(false);
+        assert!(!state.is_dirty());
+    }
+
+    #[test]
+    fn test_set_cleanup_days_marks_dirty() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_days(14);
+        assert!(state.is_dirty());
+        assert_eq!(state.spam_auto_cleanup_days, 14);
+    }
+
+    #[test]
+    fn test_set_cleanup_days_same_not_dirty() {
+        let config = make_test_config(); // default: 30 days
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_days(30);
+        assert!(!state.is_dirty());
+    }
+
+    #[test]
+    fn test_set_cleanup_days_clamps_to_minimum() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_days(0);
+        assert_eq!(state.spam_auto_cleanup_days, 1);
+    }
+
+    #[test]
+    fn test_set_cleanup_days_clamps_to_maximum() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_days(500);
+        assert_eq!(state.spam_auto_cleanup_days, 365);
+    }
+
+    #[test]
+    fn test_set_cleanup_days_boundary_values() {
+        let config = make_test_config();
+        let mut state = ManagerState::from_config(&config);
+
+        state.set_spam_auto_cleanup_days(1);
+        assert_eq!(state.spam_auto_cleanup_days, 1);
+
+        state.set_spam_auto_cleanup_days(365);
+        assert_eq!(state.spam_auto_cleanup_days, 365);
+    }
+
+    #[test]
+    fn test_cleanup_roundtrip_through_config() {
+        // Simulate: load config → modify in GUI → apply → reload
+        let mut config = make_test_config();
+        config.filter.spam_auto_cleanup_enabled = false;
+        config.filter.spam_auto_cleanup_days = 30;
+
+        let mut state = ManagerState::from_config(&config);
+
+        // User enables cleanup and sets 7 days
+        state.set_spam_auto_cleanup_enabled(true);
+        state.set_spam_auto_cleanup_days(7);
+
+        // Apply back to config
+        let mut saved_config = AppConfig::default();
+        state.apply_to_config(&mut saved_config);
+
+        // Reload from saved config
+        let reloaded_state = ManagerState::from_config(&saved_config);
+        assert!(reloaded_state.spam_auto_cleanup_enabled);
+        assert_eq!(reloaded_state.spam_auto_cleanup_days, 7);
     }
 }

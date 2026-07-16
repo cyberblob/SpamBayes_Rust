@@ -210,3 +210,272 @@ fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    // ─── days_to_date Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn days_to_date_unix_epoch() {
+        // Day 0 = 1970-01-01
+        let (y, m, d) = days_to_date(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_date_known_date_2000_01_01() {
+        // 2000-01-01 is day 10957 since epoch
+        let (y, m, d) = days_to_date(10957);
+        assert_eq!((y, m, d), (2000, 1, 1));
+    }
+
+    #[test]
+    fn days_to_date_known_date_2024_02_29() {
+        // 2024 is a leap year. 2024-02-29 is day 19782
+        // Days from 1970-01-01 to 2024-01-01 = 19723
+        // Jan has 31 days, Feb 1-29 = 28 more days → 19723 + 31 + 28 = 19782
+        let (y, m, d) = days_to_date(19782);
+        assert_eq!((y, m, d), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_date_known_date_2025_07_16() {
+        // 2025-07-16: days from 1970-01-01 to 2025-01-01 = 20089
+        // Jan=31, Feb=28, Mar=31, Apr=30, May=31, Jun=30, Jul 1-16=15
+        // 20089 + 31 + 28 + 31 + 30 + 31 + 30 + 15 = 20285
+        let (y, m, d) = days_to_date(20285);
+        assert_eq!((y, m, d), (2025, 7, 16));
+    }
+
+    #[test]
+    fn days_to_date_end_of_year() {
+        // 1970-12-31 is day 364
+        let (y, m, d) = days_to_date(364);
+        assert_eq!((y, m, d), (1970, 12, 31));
+    }
+
+    #[test]
+    fn days_to_date_leap_year_boundary() {
+        // 1972 is first leap year after epoch. 1972-03-01
+        // Days: 1970=365, 1971=365, 1972 Jan=31, Feb=29 → 365+365+31+29 = 790
+        let (y, m, d) = days_to_date(790);
+        assert_eq!((y, m, d), (1972, 3, 1));
+    }
+
+    // ─── LogLevel::from_u8 Tests ─────────────────────────────────────────
+
+    #[test]
+    fn log_level_from_u8_error() {
+        assert_eq!(LogLevel::from_u8(0), LogLevel::Error);
+    }
+
+    #[test]
+    fn log_level_from_u8_info() {
+        assert_eq!(LogLevel::from_u8(1), LogLevel::Info);
+    }
+
+    #[test]
+    fn log_level_from_u8_verbose() {
+        assert_eq!(LogLevel::from_u8(2), LogLevel::Verbose);
+    }
+
+    #[test]
+    fn log_level_from_u8_unknown_defaults_to_verbose() {
+        // Any value >= 2 maps to Verbose
+        assert_eq!(LogLevel::from_u8(3), LogLevel::Verbose);
+        assert_eq!(LogLevel::from_u8(255), LogLevel::Verbose);
+    }
+
+    // ─── verbosity_to_level Tests ────────────────────────────────────────
+
+    #[test]
+    fn verbosity_to_level_zero_is_error() {
+        assert_eq!(Logger::verbosity_to_level(0), LogLevel::Error);
+    }
+
+    #[test]
+    fn verbosity_to_level_one_is_info() {
+        assert_eq!(Logger::verbosity_to_level(1), LogLevel::Info);
+    }
+
+    #[test]
+    fn verbosity_to_level_two_is_verbose() {
+        assert_eq!(Logger::verbosity_to_level(2), LogLevel::Verbose);
+    }
+
+    #[test]
+    fn verbosity_to_level_high_value_is_verbose() {
+        assert_eq!(Logger::verbosity_to_level(100), LogLevel::Verbose);
+    }
+
+    // ─── Logger Level Filtering Tests ────────────────────────────────────
+
+    #[test]
+    fn logger_filters_verbose_when_level_is_error() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_filter");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_filter.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let logger = Logger::new(&log_path, LogLevel::Error).unwrap();
+
+        // Log at all levels
+        logger.error("test", "error message");
+        logger.info("test", "info message");
+        logger.verbose("test", "verbose message");
+
+        // Read back
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("error message"), "error should be logged");
+        assert!(!contents.contains("info message"), "info should be filtered");
+        assert!(!contents.contains("verbose message"), "verbose should be filtered");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logger_passes_info_and_error_when_level_is_info() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_info");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_info.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let logger = Logger::new(&log_path, LogLevel::Info).unwrap();
+
+        logger.error("mod", "err_msg");
+        logger.info("mod", "info_msg");
+        logger.verbose("mod", "verbose_msg");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("err_msg"));
+        assert!(contents.contains("info_msg"));
+        assert!(!contents.contains("verbose_msg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logger_passes_all_when_level_is_verbose() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_verbose");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_verbose.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let logger = Logger::new(&log_path, LogLevel::Verbose).unwrap();
+
+        logger.error("m", "e");
+        logger.info("m", "i");
+        logger.verbose("m", "v");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("[ERROR]"));
+        assert!(contents.contains("[INFO]"));
+        assert!(contents.contains("[VERBOSE]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logger_set_level_changes_filtering_at_runtime() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_setlevel");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_setlevel.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let logger = Logger::new(&log_path, LogLevel::Error).unwrap();
+
+        logger.info("m", "before_upgrade");
+        logger.set_level(LogLevel::Info);
+        logger.info("m", "after_upgrade");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(!contents.contains("before_upgrade"));
+        assert!(contents.contains("after_upgrade"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logger_current_level_reflects_set_level() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_current");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_current.log");
+
+        let logger = Logger::new(&log_path, LogLevel::Error).unwrap();
+        assert_eq!(logger.current_level(), LogLevel::Error);
+
+        logger.set_level(LogLevel::Verbose);
+        assert_eq!(logger.current_level(), LogLevel::Verbose);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── Log Entry Format Tests ──────────────────────────────────────────
+
+    #[test]
+    fn log_entry_contains_module_name() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_module");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_module.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let logger = Logger::new(&log_path, LogLevel::Verbose).unwrap();
+        logger.info("my_module", "hello world");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("[my_module]"));
+        assert!(contents.contains("hello world"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_entry_has_timestamp_format() {
+        let dir = std::env::temp_dir().join("spambayes_logger_test_ts");
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("test_ts.log");
+        let _ = std::fs::remove_file(&log_path);
+
+        let logger = Logger::new(&log_path, LogLevel::Verbose).unwrap();
+        logger.info("t", "x");
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        // Should match pattern: [YYYY-MM-DD HH:MM:SS]
+        let line = contents.lines().next().unwrap();
+        assert!(line.starts_with('['));
+        // Check timestamp portion length: [YYYY-MM-DD HH:MM:SS] = 21 chars
+        let ts_end = line.find(']').unwrap();
+        let ts = &line[1..ts_end];
+        assert_eq!(ts.len(), 19, "timestamp should be 19 chars: {ts}");
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], " ");
+        assert_eq!(&ts[13..14], ":");
+        assert_eq!(&ts[16..17], ":");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── default_path Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn default_path_ends_with_expected_filename() {
+        let path = Logger::default_path();
+        assert!(path.ends_with("addin_debug.log"));
+    }
+
+    #[test]
+    fn default_path_contains_spambayes_dir() {
+        let path = Logger::default_path();
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.contains("SpamBayes"),
+            "default path should contain 'SpamBayes': {path_str}"
+        );
+    }
+}

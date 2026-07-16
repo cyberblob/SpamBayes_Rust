@@ -75,6 +75,9 @@ const MANAGER_WATCH_TIMER_ID: usize = 0x5B05;
 /// Timer ID for deferred update check (fires once after startup).
 const UPDATE_CHECK_TIMER_ID: usize = 0x5B06;
 
+/// Timer ID for deferred spam auto-cleanup (fires once after startup).
+const CLEANUP_TIMER_ID: usize = 0x5B07;
+
 /// Last known folder EntryID for change detection.
 /// SAFETY: Only accessed from the COM STA thread.
 static mut LAST_FOLDER_ENTRY_ID: Option<String> = None;
@@ -561,6 +564,68 @@ unsafe extern "system" fn update_check_timer_proc(
         );
         let _ = std::fs::write(&update_state_path, ini_content);
     });
+}
+
+/// Timer callback for deferred spam auto-cleanup (fires once after startup).
+///
+/// Runs `cleanup_old_spam` on the configured spam folder to delete messages
+/// exceeding the retention period. Self-kills immediately (one-shot).
+///
+/// **Validates: Requirement 18.1**
+unsafe extern "system" fn cleanup_timer_proc(
+    _hwnd: windows::Win32::Foundation::HWND,
+    _msg: u32,
+    _id_event: usize,
+    _dw_time: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+    use windows::Win32::Foundation::HWND;
+
+    // Kill this timer immediately — it's a one-shot.
+    KillTimer(HWND::default(), CLEANUP_TIMER_ID).ok();
+
+    let addin = GLOBAL_ADDIN_PTR;
+    if addin.is_null() {
+        return;
+    }
+    let addin = &mut *addin;
+
+    let config = match &addin.config {
+        Some(c) => c.clone(),
+        None => return,
+    };
+
+    if !config.filter.spam_auto_cleanup_enabled {
+        addin.log_verbose("cleanup_timer_proc: auto-cleanup disabled, skipping");
+        return;
+    }
+
+    addin.log_info(&format!(
+        "cleanup_timer_proc: running spam auto-cleanup (retention={} days)",
+        config.filter.spam_auto_cleanup_days
+    ));
+
+    // Build a MAPI-based CleanupProvider and invoke the filter engine's cleanup.
+    let filter_engine = match &addin.filter_engine {
+        Some(fe) => fe,
+        None => {
+            addin.log_verbose("cleanup_timer_proc: no filter engine, skipping");
+            return;
+        }
+    };
+
+    let mut provider = crate::folder_sink::MapiCleanupProvider::new(addin.application);
+    match filter_engine.cleanup_old_spam(&mut provider) {
+        Ok(result) => {
+            addin.log_info(&format!(
+                "cleanup_timer_proc: complete — deleted={}, skipped={}, errors={}",
+                result.deleted_count, result.skipped_count, result.error_count
+            ));
+        }
+        Err(e) => {
+            addin.log_error(&format!("cleanup_timer_proc: cleanup failed: {:?}", e));
+        }
+    }
 }
 
 // ─── ext_ConnectMode ─────────────────────────────────────────────────────────
@@ -1571,6 +1636,17 @@ impl AddinCore {
                 SetTimer(HWND::default(), UPDATE_CHECK_TIMER_ID, 10_000, Some(update_check_timer_proc));
             }
             self.log_verbose("OnStartupComplete: Update check timer scheduled (10s delay)");
+        }
+
+        // Schedule deferred spam auto-cleanup (fires 15 seconds after startup).
+        // Gives folder hooks time to connect before scanning the spam folder.
+        if self.config.as_ref().map_or(false, |c| c.filter.spam_auto_cleanup_enabled) {
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                use windows::Win32::Foundation::HWND;
+                SetTimer(HWND::default(), CLEANUP_TIMER_ID, 15_000, Some(cleanup_timer_proc));
+            }
+            self.log_verbose("OnStartupComplete: Spam auto-cleanup timer scheduled (15s delay)");
         }
 
         self.log_info("OnStartupComplete: Startup complete");

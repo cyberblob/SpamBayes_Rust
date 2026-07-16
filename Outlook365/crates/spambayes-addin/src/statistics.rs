@@ -752,4 +752,198 @@ mod tests {
             "lifetime ham count should equal total concurrent calls"
         );
     }
+
+    // ─── on_untrained Tests (Requirement 9.5) ────────────────────────────
+
+    #[test]
+    fn test_on_untrained_spam_decrements_lifetime() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_trained(true); // spam +1
+        mgr.on_trained(true); // spam +1
+        assert_eq!(mgr.lifetime_stats().total_spam_trained, 2);
+
+        mgr.on_untrained(true); // spam -1
+        assert_eq!(mgr.lifetime_stats().total_spam_trained, 1);
+    }
+
+    #[test]
+    fn test_on_untrained_ham_decrements_lifetime() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_trained(false); // ham +1
+        mgr.on_trained(false); // ham +1
+        mgr.on_trained(false); // ham +1
+        assert_eq!(mgr.lifetime_stats().total_ham_trained, 3);
+
+        mgr.on_untrained(false); // ham -1
+        assert_eq!(mgr.lifetime_stats().total_ham_trained, 2);
+    }
+
+    #[test]
+    fn test_on_untrained_saturates_at_zero() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        // Never trained — untrain should floor at zero, not underflow
+        mgr.on_untrained(true);
+        assert_eq!(mgr.lifetime_stats().total_spam_trained, 0);
+
+        mgr.on_untrained(false);
+        assert_eq!(mgr.lifetime_stats().total_ham_trained, 0);
+    }
+
+    #[test]
+    fn test_on_untrained_does_not_affect_session_trained() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_trained(true); // session +1, lifetime +1
+        mgr.on_untrained(true); // lifetime -1, session unchanged
+
+        // Session still shows the train (it's a session count of actions taken)
+        let session = mgr.session_stats();
+        assert_eq!(session.spam_trained, 1);
+
+        // Lifetime reflects the correction
+        let lifetime = mgr.lifetime_stats();
+        assert_eq!(lifetime.total_spam_trained, 0);
+    }
+
+    // ─── on_correction Tests (Requirements 4.2, 4.4) ─────────────────────
+
+    #[test]
+    fn test_on_correction_spam_confirmed_as_spam() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Spam, true);
+
+        let session = mgr.session_stats();
+        assert_eq!(session.correctly_classified, 1);
+        assert_eq!(session.false_positives, 0);
+        assert_eq!(session.false_negatives, 0);
+
+        let lifetime = mgr.lifetime_stats();
+        assert_eq!(lifetime.correctly_classified, 1);
+    }
+
+    #[test]
+    fn test_on_correction_ham_confirmed_as_ham() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Ham, false);
+
+        let session = mgr.session_stats();
+        assert_eq!(session.correctly_classified, 1);
+        assert_eq!(session.false_positives, 0);
+        assert_eq!(session.false_negatives, 0);
+    }
+
+    #[test]
+    fn test_on_correction_ham_but_user_says_spam_is_false_negative() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Ham, true);
+
+        let session = mgr.session_stats();
+        assert_eq!(session.correctly_classified, 0);
+        assert_eq!(session.false_negatives, 1);
+        assert_eq!(session.false_positives, 0);
+
+        let lifetime = mgr.lifetime_stats();
+        assert_eq!(lifetime.false_negatives, 1);
+    }
+
+    #[test]
+    fn test_on_correction_spam_but_user_says_ham_is_false_positive() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Spam, false);
+
+        let session = mgr.session_stats();
+        assert_eq!(session.correctly_classified, 0);
+        assert_eq!(session.false_positives, 1);
+        assert_eq!(session.false_negatives, 0);
+
+        let lifetime = mgr.lifetime_stats();
+        assert_eq!(lifetime.false_positives, 1);
+    }
+
+    #[test]
+    fn test_on_correction_unsure_user_says_spam_is_false_negative() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Unsure, true);
+
+        let session = mgr.session_stats();
+        assert_eq!(session.false_negatives, 1);
+        assert_eq!(session.false_positives, 0);
+        assert_eq!(session.correctly_classified, 0);
+    }
+
+    #[test]
+    fn test_on_correction_unsure_user_says_ham_is_false_positive() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Unsure, false);
+
+        let session = mgr.session_stats();
+        assert_eq!(session.false_positives, 1);
+        assert_eq!(session.false_negatives, 0);
+        assert_eq!(session.correctly_classified, 0);
+    }
+
+    #[test]
+    fn test_on_correction_triggers_auto_save() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let stats_path = dir.path().join("spambayes_stats.json");
+        let mgr = StatisticsManager::new(dir.path(), 2); // save every 2 events
+
+        mgr.on_correction(Classification::Spam, true); // dirty=1
+        // Not yet saved — check file still has zeros
+        let contents = fs::read_to_string(&stats_path).unwrap();
+        let saved: StatsFile = serde_json::from_str(&contents).unwrap();
+        assert_eq!(saved.lifetime.correctly_classified, 0);
+
+        mgr.on_correction(Classification::Ham, false); // dirty=2 → auto-save
+        let contents = fs::read_to_string(&stats_path).unwrap();
+        let saved: StatsFile = serde_json::from_str(&contents).unwrap();
+        assert_eq!(saved.lifetime.correctly_classified, 2);
+    }
+
+    #[test]
+    fn test_on_correction_accumulates_across_multiple_calls() {
+        let (mgr, _dir) = manager_in_tmp(100);
+
+        mgr.on_correction(Classification::Spam, true);   // correct
+        mgr.on_correction(Classification::Ham, false);   // correct
+        mgr.on_correction(Classification::Ham, true);    // false negative
+        mgr.on_correction(Classification::Spam, false);  // false positive
+        mgr.on_correction(Classification::Unsure, true); // false negative
+
+        let session = mgr.session_stats();
+        assert_eq!(session.correctly_classified, 2);
+        assert_eq!(session.false_negatives, 2);
+        assert_eq!(session.false_positives, 1);
+
+        let lifetime = mgr.lifetime_stats();
+        assert_eq!(lifetime.correctly_classified, 2);
+        assert_eq!(lifetime.false_negatives, 2);
+        assert_eq!(lifetime.false_positives, 1);
+    }
+
+    #[test]
+    fn test_accuracy_persists_through_reset() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let mgr = StatisticsManager::new(dir.path(), 100);
+
+        mgr.on_correction(Classification::Spam, true);
+        mgr.on_correction(Classification::Ham, true); // false negative
+        mgr.save();
+
+        mgr.reset_lifetime();
+
+        let lifetime = mgr.lifetime_stats();
+        assert_eq!(lifetime.correctly_classified, 0);
+        assert_eq!(lifetime.false_negatives, 0);
+        assert_eq!(lifetime.false_positives, 0);
+    }
 }

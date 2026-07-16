@@ -320,8 +320,8 @@ mod tests {
     fn load_only_default_file_overrides_builtin_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let chain = with_fake_appdata(tmp.path(), || {
-            // Create data directory and default config file
-            let data_dir = tmp.path().join("SpamBayes").join("testprofile");
+            // Create data directory (SpamBayes/ — flat, no profile subdirectory)
+            let data_dir = tmp.path().join("SpamBayes");
             fs::create_dir_all(&data_dir).unwrap();
             fs::write(
                 data_dir.join("default_bayes_customize.ini"),
@@ -342,7 +342,7 @@ mod tests {
     fn load_both_files_profile_overrides_default() {
         let tmp = tempfile::tempdir().unwrap();
         let chain = with_fake_appdata(tmp.path(), || {
-            let data_dir = tmp.path().join("SpamBayes").join("testprofile");
+            let data_dir = tmp.path().join("SpamBayes");
             fs::create_dir_all(&data_dir).unwrap();
 
             // Default sets spam_threshold to 50 and unsure_threshold to 25
@@ -372,7 +372,7 @@ mod tests {
     fn load_only_profile_file_uses_profile_plus_builtin_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let chain = with_fake_appdata(tmp.path(), || {
-            let data_dir = tmp.path().join("SpamBayes").join("testprofile");
+            let data_dir = tmp.path().join("SpamBayes");
             fs::create_dir_all(&data_dir).unwrap();
 
             // Only the profile file exists
@@ -535,7 +535,7 @@ mod tests {
     fn config_accessor_returns_merged_config() {
         let tmp = tempfile::tempdir().unwrap();
         let chain = with_fake_appdata(tmp.path(), || {
-            let data_dir = tmp.path().join("SpamBayes").join("testprofile");
+            let data_dir = tmp.path().join("SpamBayes");
             fs::create_dir_all(&data_dir).unwrap();
 
             fs::write(
@@ -558,7 +558,7 @@ mod tests {
             ConfigChain::load("My Profile").unwrap()
         });
 
-        let data_dir = tmp.path().join("SpamBayes").join("my_profile");
+        let data_dir = tmp.path().join("SpamBayes");
         assert_eq!(
             chain.profile_config_path(),
             data_dir.join("my_profile_bayes_customize.ini")

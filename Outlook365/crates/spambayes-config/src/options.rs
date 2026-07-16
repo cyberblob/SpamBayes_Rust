@@ -1473,8 +1473,8 @@ mod tests {
         assert_eq!(config.filter.ham_action, FilterAction::Untouched);
         assert!(config.filter.save_spam_info);
         assert!(config.filter.timer_enabled);
-        assert_eq!(config.filter.timer_start_delay, 2.0);
-        assert_eq!(config.filter.timer_interval, 1.0);
+        assert_eq!(config.filter.timer_start_delay, 10.0);
+        assert_eq!(config.filter.timer_interval, 4.0);
         assert!(config.filter.timer_only_receive_folders);
         assert_eq!(config.filter.spam_auto_cleanup_days, 30);
         assert!(!config.filter.spam_auto_cleanup_enabled);
@@ -1690,5 +1690,130 @@ spam_threshold = 95.0
             EntryId::new("3344CCDD"),
         ));
         assert!(config.has_spam_folder_configured());
+    }
+
+    // ── Spam Auto-Cleanup INI Roundtrip Tests ────────────────────────────
+
+    #[test]
+    fn test_save_and_load_roundtrip_cleanup_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.filter.spam_auto_cleanup_enabled = true;
+        config.filter.spam_auto_cleanup_days = 14;
+
+        config.save(dir.path(), "cleanup_test").unwrap();
+        let loaded = AppConfig::load(dir.path(), "cleanup_test").unwrap();
+
+        assert!(loaded.filter.spam_auto_cleanup_enabled);
+        assert_eq!(loaded.filter.spam_auto_cleanup_days, 14);
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip_cleanup_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.filter.spam_auto_cleanup_enabled = false;
+        config.filter.spam_auto_cleanup_days = 30;
+
+        config.save(dir.path(), "cleanup_disabled_test").unwrap();
+        let loaded = AppConfig::load(dir.path(), "cleanup_disabled_test").unwrap();
+
+        assert!(!loaded.filter.spam_auto_cleanup_enabled);
+        assert_eq!(loaded.filter.spam_auto_cleanup_days, 30);
+    }
+
+    #[test]
+    fn test_sparse_save_includes_cleanup_when_non_default() {
+        let mut config = AppConfig::default();
+        config.filter.spam_auto_cleanup_enabled = true;
+        config.filter.spam_auto_cleanup_days = 7;
+
+        let sparse = config.to_sparse_ini_data();
+        let filter_section = sparse.get("Filter").expect("Filter section should exist");
+
+        assert_eq!(
+            filter_section.get("spam_auto_cleanup_enabled"),
+            Some(&"True".to_string())
+        );
+        assert_eq!(
+            filter_section.get("spam_auto_cleanup_days"),
+            Some(&"7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sparse_save_excludes_cleanup_when_default() {
+        let config = AppConfig::default();
+        let sparse = config.to_sparse_ini_data();
+
+        // No Filter section at all if everything is default
+        if let Some(filter_section) = sparse.get("Filter") {
+            assert!(
+                filter_section.get("spam_auto_cleanup_enabled").is_none(),
+                "default cleanup_enabled should not appear in sparse INI"
+            );
+            assert!(
+                filter_section.get("spam_auto_cleanup_days").is_none(),
+                "default cleanup_days should not appear in sparse INI"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_cleanup_from_ini_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_content = "\
+[Filter]
+spam_auto_cleanup_enabled = True
+spam_auto_cleanup_days = 60
+";
+        std::fs::write(dir.path().join("cleanup_ini.ini"), ini_content).unwrap();
+        let config = AppConfig::load(dir.path(), "cleanup_ini").unwrap();
+
+        assert!(config.filter.spam_auto_cleanup_enabled);
+        assert_eq!(config.filter.spam_auto_cleanup_days, 60);
+    }
+
+    #[test]
+    fn test_load_cleanup_invalid_days_uses_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_content = "\
+[Filter]
+spam_auto_cleanup_enabled = True
+spam_auto_cleanup_days = not_a_number
+";
+        std::fs::write(dir.path().join("bad_days.ini"), ini_content).unwrap();
+        let config = AppConfig::load(dir.path(), "bad_days").unwrap();
+
+        assert!(config.filter.spam_auto_cleanup_enabled);
+        assert_eq!(config.filter.spam_auto_cleanup_days, 30); // default
+    }
+
+    #[test]
+    fn test_load_cleanup_invalid_enabled_uses_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_content = "\
+[Filter]
+spam_auto_cleanup_enabled = maybe
+spam_auto_cleanup_days = 7
+";
+        std::fs::write(dir.path().join("bad_enabled.ini"), ini_content).unwrap();
+        let config = AppConfig::load(dir.path(), "bad_enabled").unwrap();
+
+        assert!(!config.filter.spam_auto_cleanup_enabled); // default
+        assert_eq!(config.filter.spam_auto_cleanup_days, 7);
+    }
+
+    #[test]
+    fn test_from_ini_data_loads_cleanup_fields() {
+        let mut data = IniData::new();
+        let mut filter = SectionData::new();
+        filter.insert("spam_auto_cleanup_enabled".to_string(), "True".to_string());
+        filter.insert("spam_auto_cleanup_days".to_string(), "21".to_string());
+        data.insert("Filter".to_string(), filter);
+
+        let config = AppConfig::from_ini_data(&data);
+        assert!(config.filter.spam_auto_cleanup_enabled);
+        assert_eq!(config.filter.spam_auto_cleanup_days, 21);
     }
 }

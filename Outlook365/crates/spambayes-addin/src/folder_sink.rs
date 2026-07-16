@@ -2541,3 +2541,153 @@ unsafe fn get_score_value(mail_item: *mut c_void, score_field: &str) -> Option<f
 
     value_str.and_then(|s| s.parse::<f64>().ok())
 }
+
+// ─── MapiCleanupProvider (Spam Auto-Cleanup) ─────────────────────────────────
+
+use crate::filter::{CleanupMessage, CleanupProvider, FieldValue};
+use spambayes_mapi::MsgStoreError;
+
+/// A MAPI-based cleanup message wrapping an Outlook MailItem COM pointer.
+///
+/// Implements [`CleanupMessage`] by reading the cleanup timestamp from
+/// UserProperties and calling MailItem.Delete().
+struct MapiCleanupMessage {
+    /// The MailItem IDispatch pointer.
+    mail_item: *mut c_void,
+}
+
+impl CleanupMessage for MapiCleanupMessage {
+    fn get_field(&self, name: &str) -> Option<FieldValue> {
+        unsafe {
+            let user_props = dispatch_get(self.mail_item, "UserProperties").ok()?;
+            if user_props.is_null() {
+                return None;
+            }
+            let prop = dispatch_invoke_with_bstr(user_props, "Find", name);
+            release_dispatch(user_props);
+            if prop.is_null() {
+                return None;
+            }
+            let value_str = dispatch_get_string(prop, "Value");
+            release_dispatch(prop);
+            // Try to parse as integer (timestamp) first, then float
+            value_str.and_then(|s| {
+                if let Ok(i) = s.parse::<i64>() {
+                    Some(FieldValue::Integer(i))
+                } else if let Ok(f) = s.parse::<f64>() {
+                    Some(FieldValue::Float(f))
+                } else {
+                    Some(FieldValue::String(s))
+                }
+            })
+        }
+    }
+
+    fn delete(&mut self) -> Result<(), MsgStoreError> {
+        unsafe {
+            match crate::com_invoke::dispatch_invoke_method(self.mail_item, "Delete", &[]) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(MsgStoreError::ReadOnly("cleanup delete failed".to_string())),
+            }
+        }
+    }
+}
+
+/// MAPI-based provider for the spam auto-cleanup operation.
+///
+/// Opens the spam folder via the Outlook Object Model and enumerates
+/// messages for cleanup scanning.
+pub struct MapiCleanupProvider {
+    /// The Outlook Application pointer (for accessing MAPI namespace).
+    app_ptr: Option<*mut c_void>,
+}
+
+impl MapiCleanupProvider {
+    /// Create a new provider. `app_ptr` is the stored Application IDispatch.
+    pub fn new(app_ptr: Option<*mut c_void>) -> Self {
+        Self { app_ptr }
+    }
+}
+
+impl CleanupProvider for MapiCleanupProvider {
+    fn get_spam_folder_messages(
+        &self,
+        folder_id: &FolderId,
+    ) -> Result<Vec<Box<dyn CleanupMessage>>, MsgStoreError> {
+        unsafe {
+            // Get a fresh Outlook.Application via CoCreateInstance
+            let app = get_outlook_application();
+            if app.is_null() {
+                // Fallback to stored pointer
+                let app = match self.app_ptr {
+                    Some(p) if !p.is_null() => p,
+                    _ => return Err(MsgStoreError::ReadOnly("cannot get Outlook Application".to_string())),
+                };
+                return self.enumerate_folder(app, folder_id, false);
+            }
+            let result = self.enumerate_folder(app, folder_id, true);
+            result
+        }
+    }
+}
+
+impl MapiCleanupProvider {
+    /// Enumerate messages in a folder. If `release_app` is true, releases the app pointer when done.
+    unsafe fn enumerate_folder(
+        &self,
+        app: *mut c_void,
+        folder_id: &FolderId,
+        release_app: bool,
+    ) -> Result<Vec<Box<dyn CleanupMessage>>, MsgStoreError> {
+        let namespace = match crate::com_invoke::dispatch_invoke_method(
+            app, "GetNamespace", &[VariantArg::BStr("MAPI")]
+        ) {
+            Ok(p) if !p.is_null() => p,
+            _ => {
+                if release_app { release_dispatch(app); }
+                return Err(MsgStoreError::ReadOnly("cannot get MAPI namespace".to_string()));
+            }
+        };
+
+        let folder = match dispatch_invoke_2bstr(
+            namespace,
+            "GetFolderFromID",
+            &folder_id.entry_id.0,
+            &folder_id.store_id.0,
+        ) {
+            Some(p) if !p.is_null() => p,
+            _ => {
+                release_dispatch(namespace);
+                if release_app { release_dispatch(app); }
+                return Err(MsgStoreError::ReadOnly("GetFolderFromID failed".to_string()));
+            }
+        };
+
+        let items = match dispatch_get(folder, "Items") {
+            Ok(p) if !p.is_null() => p,
+            _ => {
+                release_dispatch(folder);
+                release_dispatch(namespace);
+                if release_app { release_dispatch(app); }
+                return Err(MsgStoreError::ReadOnly("cannot get Items collection".to_string()));
+            }
+        };
+
+        let count = get_items_count(items).unwrap_or(0);
+        let mut messages: Vec<Box<dyn CleanupMessage>> = Vec::new();
+
+        for i in 1..=count {
+            let item = get_items_item(items, i);
+            if !item.is_null() {
+                messages.push(Box::new(MapiCleanupMessage { mail_item: item }));
+            }
+        }
+
+        release_dispatch(items);
+        release_dispatch(folder);
+        release_dispatch(namespace);
+        if release_app { release_dispatch(app); }
+
+        Ok(messages)
+    }
+}

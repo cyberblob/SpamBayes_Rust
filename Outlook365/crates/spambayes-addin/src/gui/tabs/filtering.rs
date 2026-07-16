@@ -485,17 +485,17 @@ impl FilteringTab {
         cleanup_enabled.set_tooltip_text(Some(
             "Enable automatic deletion of old spam messages to keep your mailbox tidy."
         ));
-        cleanup_enabled.set_active(false); // Default: disabled
+        cleanup_enabled.set_active(state.spam_auto_cleanup_enabled);
 
         let cleanup_days_row = GtkBox::new(Orientation::Horizontal, 8);
         cleanup_days_row.set_valign(Align::Center);
 
-        let cleanup_adj = Adjustment::new(30.0, 1.0, 365.0, 1.0, 7.0, 0.0);
+        let cleanup_adj = Adjustment::new(f64::from(state.spam_auto_cleanup_days), 1.0, 365.0, 1.0, 7.0, 0.0);
         let cleanup_days_spin = SpinButton::new(Some(&cleanup_adj), 1.0, 0);
         cleanup_days_spin.set_tooltip_text(Some(
             "Number of days to keep spam before automatically deleting it."
         ));
-        cleanup_days_spin.set_sensitive(false); // Disabled until checkbox is checked
+        cleanup_days_spin.set_sensitive(state.spam_auto_cleanup_enabled);
 
         let cleanup_days_label = Label::new(Some("days"));
         cleanup_days_label.set_halign(Align::Start);

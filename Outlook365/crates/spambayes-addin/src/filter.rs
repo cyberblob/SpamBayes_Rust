@@ -2475,4 +2475,136 @@ mod tests {
         assert_eq!(result.skipped_count, 1);
         assert_eq!(result.error_count, 1);
     }
+
+    // ─── Cleanup Config-Driven Behavior Tests ────────────────────────────
+
+    #[test]
+    fn cleanup_respects_custom_retention_period() {
+        // User sets 7 days via the Manager GUI checkbox/spinner
+        let config = FilterConfig {
+            spam_auto_cleanup_enabled: true,
+            spam_auto_cleanup_days: 7,
+            spam_folder_id: Some(make_spam_folder_id()),
+            ..FilterConfig::default()
+        };
+        let engine = make_engine(config);
+
+        // Message is 8 days old — should be deleted with 7-day retention
+        let eight_days_ago = now_secs() - (8 * 86400);
+        // Message is 6 days old — should be kept with 7-day retention
+        let six_days_ago = now_secs() - (6 * 86400);
+
+        let messages: Vec<Box<dyn CleanupMessage>> = vec![
+            Box::new(MockCleanupMessage::new().with_timestamp(eight_days_ago)),
+            Box::new(MockCleanupMessage::new().with_timestamp(six_days_ago)),
+        ];
+        let mut provider = MockCleanupProvider::new(messages);
+
+        let result = engine.cleanup_old_spam(&mut provider).unwrap();
+
+        assert_eq!(result.deleted_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.error_count, 0);
+    }
+
+    #[test]
+    fn cleanup_with_max_retention_365_days() {
+        let config = FilterConfig {
+            spam_auto_cleanup_enabled: true,
+            spam_auto_cleanup_days: 365,
+            spam_folder_id: Some(make_spam_folder_id()),
+            ..FilterConfig::default()
+        };
+        let engine = make_engine(config);
+
+        // Message 366 days old — should be deleted
+        let old = now_secs() - (366 * 86400);
+        // Message 364 days old — should be kept
+        let recent = now_secs() - (364 * 86400);
+
+        let messages: Vec<Box<dyn CleanupMessage>> = vec![
+            Box::new(MockCleanupMessage::new().with_timestamp(old)),
+            Box::new(MockCleanupMessage::new().with_timestamp(recent)),
+        ];
+        let mut provider = MockCleanupProvider::new(messages);
+
+        let result = engine.cleanup_old_spam(&mut provider).unwrap();
+
+        assert_eq!(result.deleted_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.error_count, 0);
+    }
+
+    #[test]
+    fn cleanup_with_minimum_retention_1_day() {
+        let config = FilterConfig {
+            spam_auto_cleanup_enabled: true,
+            spam_auto_cleanup_days: 1,
+            spam_folder_id: Some(make_spam_folder_id()),
+            ..FilterConfig::default()
+        };
+        let engine = make_engine(config);
+
+        // Message 2 days old — should be deleted
+        let two_days_ago = now_secs() - (2 * 86400);
+        // Message 12 hours old — should be kept (less than 1 full day)
+        let twelve_hours_ago = now_secs() - (12 * 3600);
+
+        let messages: Vec<Box<dyn CleanupMessage>> = vec![
+            Box::new(MockCleanupMessage::new().with_timestamp(two_days_ago)),
+            Box::new(MockCleanupMessage::new().with_timestamp(twelve_hours_ago)),
+        ];
+        let mut provider = MockCleanupProvider::new(messages);
+
+        let result = engine.cleanup_old_spam(&mut provider).unwrap();
+
+        assert_eq!(result.deleted_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.error_count, 0);
+    }
+
+    #[test]
+    fn cleanup_empty_folder_returns_zero_counts() {
+        let config = FilterConfig {
+            spam_auto_cleanup_enabled: true,
+            spam_auto_cleanup_days: 30,
+            spam_folder_id: Some(make_spam_folder_id()),
+            ..FilterConfig::default()
+        };
+        let engine = make_engine(config);
+
+        let messages: Vec<Box<dyn CleanupMessage>> = vec![];
+        let mut provider = MockCleanupProvider::new(messages);
+
+        let result = engine.cleanup_old_spam(&mut provider).unwrap();
+
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.error_count, 0);
+    }
+
+    #[test]
+    fn cleanup_enabled_flag_controls_execution() {
+        // Even with a valid folder and old messages, disabled = no-op
+        let config = FilterConfig {
+            spam_auto_cleanup_enabled: false,
+            spam_auto_cleanup_days: 1,
+            spam_folder_id: Some(make_spam_folder_id()),
+            ..FilterConfig::default()
+        };
+        let engine = make_engine(config);
+
+        let very_old = now_secs() - (9999 * 86400);
+        let messages: Vec<Box<dyn CleanupMessage>> = vec![
+            Box::new(MockCleanupMessage::new().with_timestamp(very_old)),
+        ];
+        let mut provider = MockCleanupProvider::new(messages);
+
+        let result = engine.cleanup_old_spam(&mut provider).unwrap();
+
+        // Disabled — nothing deleted
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.error_count, 0);
+    }
 }
