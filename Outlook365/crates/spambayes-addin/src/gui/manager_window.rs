@@ -648,7 +648,7 @@ impl ManagerWindow {
         about.set_transient_for(Some(&self.window));
         about.set_modal(true);
         about.set_program_name(Some("SpamBayes X64"));
-        about.set_version(Some("0.3.0a1"));
+        about.set_version(Some(env!("CARGO_PKG_VERSION")));
         about.set_comments(Some(
             "Anti-spam Classifier for Microsoft Outlook\n\n\
              A Bayesian anti-spam filter integrated with Microsoft Outlook.\n\

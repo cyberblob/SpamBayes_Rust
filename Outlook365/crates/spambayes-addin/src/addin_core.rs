@@ -590,26 +590,37 @@ unsafe extern "system" fn cleanup_timer_proc(
     }
     let addin = &mut *addin;
 
+    addin.log_info("cleanup_timer_proc: FIRED");
+
     let config = match &addin.config {
         Some(c) => c.clone(),
-        None => return,
+        None => {
+            addin.log_error("cleanup_timer_proc: no config available, aborting");
+            return;
+        }
     };
 
     if !config.filter.spam_auto_cleanup_enabled {
-        addin.log_verbose("cleanup_timer_proc: auto-cleanup disabled, skipping");
+        addin.log_info("cleanup_timer_proc: auto-cleanup disabled in config, skipping");
         return;
     }
 
+    if !config.filter.enabled {
+        addin.log_info("cleanup_timer_proc: SpamBayes filtering is disabled, skipping cleanup");
+        return;
+    }
+
+    let spam_folder_configured = config.filter.spam_folder_id.is_some();
     addin.log_info(&format!(
-        "cleanup_timer_proc: running spam auto-cleanup (retention={} days)",
-        config.filter.spam_auto_cleanup_days
+        "cleanup_timer_proc: running (retention={} days, spam_folder_configured={})",
+        config.filter.spam_auto_cleanup_days, spam_folder_configured
     ));
 
     // Build a MAPI-based CleanupProvider and invoke the filter engine's cleanup.
     let filter_engine = match &addin.filter_engine {
         Some(fe) => fe,
         None => {
-            addin.log_verbose("cleanup_timer_proc: no filter engine, skipping");
+            addin.log_error("cleanup_timer_proc: no filter engine available, aborting");
             return;
         }
     };
@@ -618,12 +629,12 @@ unsafe extern "system" fn cleanup_timer_proc(
     match filter_engine.cleanup_old_spam(&mut provider) {
         Ok(result) => {
             addin.log_info(&format!(
-                "cleanup_timer_proc: complete — deleted={}, skipped={}, errors={}",
+                "cleanup_timer_proc: COMPLETE — deleted={}, skipped={}, errors={}",
                 result.deleted_count, result.skipped_count, result.error_count
             ));
         }
         Err(e) => {
-            addin.log_error(&format!("cleanup_timer_proc: cleanup failed: {:?}", e));
+            addin.log_error(&format!("cleanup_timer_proc: cleanup FAILED: {:?}", e));
         }
     }
 }
@@ -1640,13 +1651,20 @@ impl AddinCore {
 
         // Schedule deferred spam auto-cleanup (fires 15 seconds after startup).
         // Gives folder hooks time to connect before scanning the spam folder.
-        if self.config.as_ref().map_or(false, |c| c.filter.spam_auto_cleanup_enabled) {
+        // Only schedules if BOTH the master filter is enabled AND cleanup is enabled.
+        if self.config.as_ref().map_or(false, |c| c.filter.enabled && c.filter.spam_auto_cleanup_enabled) {
+            let days = self.config.as_ref().map_or(30, |c| c.filter.spam_auto_cleanup_days);
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::SetTimer;
                 use windows::Win32::Foundation::HWND;
                 SetTimer(HWND::default(), CLEANUP_TIMER_ID, 15_000, Some(cleanup_timer_proc));
             }
-            self.log_verbose("OnStartupComplete: Spam auto-cleanup timer scheduled (15s delay)");
+            self.log_info(&format!(
+                "OnStartupComplete: Spam auto-cleanup timer scheduled (15s delay, retention={} days)",
+                days
+            ));
+        } else {
+            self.log_info("OnStartupComplete: Spam auto-cleanup is DISABLED, timer not scheduled");
         }
 
         self.log_info("OnStartupComplete: Startup complete");
@@ -1896,6 +1914,35 @@ impl AddinCore {
             return;
         }
         let addin = &*GLOBAL_ADDIN_PTR;
+
+        // Gate: do not train or move when filtering is disabled.
+        // Without active folder hooks, Exchange server-side rules can move
+        // the message back to the watched folder and nothing will catch the
+        // bounce-back, causing user confusion.
+        let filter_enabled = addin.config.as_ref().map_or(false, |c| c.filter.enabled);
+        if !filter_enabled {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&debug_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f,
+                    "train_as_{}: BLOCKED — filter.enabled is false, cannot score/move", label
+                ) });
+            // Warn the user that SpamBayes filtering must be enabled first.
+            {
+                use windows::core::PCWSTR;
+                use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+                let title: Vec<u16> = "SpamBayes\0".encode_utf16().collect();
+                let msg: Vec<u16> = "SpamBayes filtering is currently disabled.\n\n\
+                    The Spam/Not Spam buttons are inactive until filtering is enabled.\n\
+                    Please open the SpamBayes Manager and enable filtering first.\0"
+                    .encode_utf16().collect();
+                MessageBoxW(
+                    None,
+                    PCWSTR(msg.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            return;
+        }
 
         let app_ptr = if !POLL_APP_PTR.is_null() {
             POLL_APP_PTR
@@ -3304,6 +3351,13 @@ impl AddinCore {
             }
         }
 
+        // Update the filter engine's config so cleanup_old_spam and thresholds
+        // reflect the latest settings without requiring an Outlook restart.
+        if let Some(fe) = &mut self.filter_engine {
+            fe.set_config(new_config.filter.clone());
+            self.log_verbose("reload_config_from_disk: FilterEngine config updated");
+        }
+
         // Apply the new verbosity level to the logger.
         self.apply_verbosity_from_config();
 
@@ -3324,6 +3378,22 @@ impl AddinCore {
             new_config.filter.spam_auto_cleanup_days,
             new_config.general.verbose,
         ));
+
+        // If spam auto-cleanup was just enabled (via Manager GUI), schedule the
+        // cleanup timer now. This handles the case where the user enables cleanup
+        // after Outlook has already started (the startup-time check missed it).
+        // Only schedules if BOTH the master filter is enabled AND cleanup is enabled.
+        if new_config.filter.enabled && new_config.filter.spam_auto_cleanup_enabled {
+            unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                use windows::Win32::Foundation::HWND;
+                SetTimer(HWND::default(), CLEANUP_TIMER_ID, 5_000, Some(cleanup_timer_proc));
+            }
+            self.log_info(&format!(
+                "reload_config_from_disk: scheduling cleanup timer (retention={} days)",
+                new_config.filter.spam_auto_cleanup_days
+            ));
+        }
 
         self.log_info(&format!(
             "reload_config_from_disk: complete (filter.enabled={}, calendar.enabled={}, spam_threshold={:.1})",

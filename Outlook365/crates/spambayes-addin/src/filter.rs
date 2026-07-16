@@ -732,6 +732,12 @@ impl FilterEngine {
         // Get all messages from the spam folder.
         let mut messages = provider.get_spam_folder_messages(&spam_folder_id)?;
 
+        if let Some(logger) = &self.logger {
+            logger.log(crate::LogLevel::Info, "filter", &format!(
+                "cleanup_old_spam: found {} messages in spam folder", messages.len()
+            ));
+        }
+
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
@@ -743,9 +749,31 @@ impl FilterEngine {
         };
 
         for msg in &mut messages {
-            // Requirement 18.2: Get the cleanup timestamp field.
-            let timestamp = if let Some(FieldValue::Integer(ts)) = msg.get_field(CLEANUP_FIELD) { ts } else {
-                // Requirement 18.3: Skip messages without timestamp.
+            // Determine the message age. Try SpamBayesCleanupTimestamp first
+            // (set when the filter engine moves a message to spam), then fall
+            // back to ReceivedTime (always available on Outlook messages).
+            // This ensures messages that were moved to spam before the cleanup
+            // feature was enabled (or on Exchange stores where custom properties
+            // can't be saved) are still eligible for deletion.
+            let timestamp = if let Some(FieldValue::Integer(ts)) = msg.get_field(CLEANUP_FIELD) {
+                if let Some(logger) = &self.logger {
+                    logger.verbose("filter", &format!(
+                        "cleanup_old_spam: using CleanupTimestamp={}", ts
+                    ));
+                }
+                ts
+            } else if let Some(FieldValue::Integer(ts)) = msg.get_field("ReceivedTime") {
+                if let Some(logger) = &self.logger {
+                    logger.verbose("filter", &format!(
+                        "cleanup_old_spam: using ReceivedTime fallback={}", ts
+                    ));
+                }
+                ts
+            } else {
+                // No timestamp available at all — skip.
+                if let Some(logger) = &self.logger {
+                    logger.verbose("filter", "cleanup_old_spam: no timestamp or ReceivedTime, skipping");
+                }
                 result.skipped_count += 1;
                 continue;
             };

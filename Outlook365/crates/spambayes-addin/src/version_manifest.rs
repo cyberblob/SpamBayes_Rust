@@ -29,18 +29,18 @@ pub const CURRENT_BUILD_ID: &str = env!("SPAMBAYES_BUILD_ID");
 /// Example JSON:
 /// ```json
 /// {
-///   "version": "0.3.0-alpha.2",
+///   "version": "0.3.0-alpha.3",
 ///   "build_number": 1752500000,
 ///   "release_date": "2026-07-14",
 ///   "download_url": "https://github.com/cyberblob/SpamBayes_Rust/releases/latest",
-///   "installer_url": "https://github.com/cyberblob/SpamBayes_Rust/releases/download/v0.3.0-alpha.2/SpamBayes_Outlook_Setup_0.3.0a2.exe",
+///   "installer_url": "https://github.com/cyberblob/SpamBayes_Rust/releases/download/v0.3.0-alpha.3/SpamBayes_Outlook_Setup_0.3.0a3.exe",
 ///   "release_notes": "Bug fixes and performance improvements.",
 ///   "min_version": "0.2.0"
 /// }
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionManifest {
-    /// The latest available semantic version (e.g., "0.3.0-alpha.2").
+    /// The latest available semantic version (e.g., "0.3.0-alpha.3").
     pub version: String,
     /// The build number (Unix timestamp) of the latest release.
     /// Used for detecting rebuilds of the same version.
@@ -284,11 +284,11 @@ mod tests {
     #[test]
     fn test_parse_manifest_json() {
         let json = r#"{
-            "version": "0.3.0-alpha.2",
+            "version": "0.3.0-alpha.3",
             "build_number": 1752500000,
             "release_date": "2026-07-14",
             "download_url": "https://github.com/cyberblob/SpamBayes_Rust/releases/latest",
-            "installer_url": "https://github.com/cyberblob/SpamBayes_Rust/releases/download/v0.3.0-alpha.2/Setup.exe",
+            "installer_url": "https://github.com/cyberblob/SpamBayes_Rust/releases/download/v0.3.0-alpha.3/Setup.exe",
             "release_notes": "Bug fixes.",
             "min_version": "0.2.0"
         }"#;
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn test_parse_manifest_minimal_json() {
         // Only required fields.
-        let json = r#"{"version": "1.0.0", "build_number": 12345}"#;
+        let json = r#"{"version": "0.3.0-alpha.3", "build_number": 12345}"#;
         let manifest = VersionManifest::from_json(json).unwrap();
         assert_eq!(manifest.version, "1.0.0");
         assert_eq!(manifest.build_number, 12345);

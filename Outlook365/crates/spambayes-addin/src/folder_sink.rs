@@ -2559,6 +2559,13 @@ struct MapiCleanupMessage {
 impl CleanupMessage for MapiCleanupMessage {
     fn get_field(&self, name: &str) -> Option<FieldValue> {
         unsafe {
+            // ReceivedTime is a standard MailItem property (not UserProperty).
+            // Outlook returns it as a string like "7/10/2025 3:45:00 PM" via
+            // IDispatch. We read it as a string and convert to a Unix timestamp.
+            if name == "ReceivedTime" {
+                return self.get_received_time_as_timestamp();
+            }
+
             let user_props = dispatch_get(self.mail_item, "UserProperties").ok()?;
             if user_props.is_null() {
                 return None;
@@ -2591,6 +2598,159 @@ impl CleanupMessage for MapiCleanupMessage {
             }
         }
     }
+}
+
+impl MapiCleanupMessage {
+    /// Read MailItem.ReceivedTime and convert the OLE Automation date to a
+    /// Unix timestamp (seconds since 1970-01-01).
+    ///
+    /// Outlook's ReceivedTime is a VT_DATE internally (days since 1899-12-30).
+    /// We read it via PropertyAccessor using the MAPI property tag for
+    /// PR_MESSAGE_DELIVERY_TIME, which reliably returns as a float even on
+    /// Exchange stores.
+    unsafe fn get_received_time_as_timestamp(&self) -> Option<FieldValue> {
+        // Use PropertyAccessor.GetProperty with the MAPI schema for
+        // PR_MESSAGE_DELIVERY_TIME (0x0E060040 = PT_SYSTIME).
+        // This returns a VT_DATE (OLE Automation double) reliably.
+        let prop_accessor = dispatch_get(self.mail_item, "PropertyAccessor").ok()?;
+        if prop_accessor.is_null() {
+            return None;
+        }
+
+        // PR_MESSAGE_DELIVERY_TIME schema — works on all store types
+        let schema = "http://schemas.microsoft.com/mapi/proptag/0x0E060040";
+
+        let dispid = get_dispid_on(prop_accessor, "GetProperty")?;
+        let vtbl = *(prop_accessor as *const *const IDispatchVtbl);
+
+        let mut schema_variant = Variant::default();
+        schema_variant.vt = 8; // VT_BSTR
+        let bstr = sys_alloc_string_local(schema);
+        *(schema_variant.data.as_mut_ptr().cast::<*mut u16>()) = bstr;
+
+        let mut params = DispParams {
+            rgvarg: &raw mut schema_variant,
+            rgdispid_named_args: ptr::null_mut(),
+            c_args: 1,
+            c_named_args: 0,
+        };
+
+        let mut result = Variant::default();
+        let hr = ((*vtbl).invoke)(
+            prop_accessor,
+            dispid,
+            &GUID::from_u128(0),
+            0,
+            1, // DISPATCH_METHOD
+            &raw mut params,
+            &raw mut result,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+
+        SysFreeString(bstr);
+        release_dispatch(prop_accessor);
+
+        if hr.0 != 0 {
+            return None;
+        }
+
+        // VT_DATE = 7 (OLE Automation date as f64: days since 1899-12-30)
+        if result.vt == 7 {
+            let ole_date = *(result.data.as_ptr().cast::<f64>());
+            if ole_date > 0.0 {
+                // OLE date epoch: 1899-12-30 → Unix epoch: 1970-01-01 = 25569 days
+                let unix_timestamp = ((ole_date - 25569.0) * 86400.0) as i64;
+                return Some(FieldValue::Integer(unix_timestamp));
+            }
+        }
+
+        // VT_BSTR = 8 (sometimes returned as a date string)
+        if result.vt == 8 {
+            let bstr_ptr = *(result.data.as_ptr().cast::<*const u16>());
+            if !bstr_ptr.is_null() {
+                let len_ptr = (bstr_ptr as *const u8).sub(4) as *const u32;
+                let byte_len = *len_ptr as usize;
+                let char_len = byte_len / 2;
+                let slice = std::slice::from_raw_parts(bstr_ptr, char_len);
+                let s = String::from_utf16_lossy(slice);
+                SysFreeString(bstr_ptr as *mut u16);
+
+                // Try parsing as OLE date float
+                if let Ok(ole_date) = s.parse::<f64>() {
+                    if ole_date > 0.0 {
+                        let unix_timestamp = ((ole_date - 25569.0) * 86400.0) as i64;
+                        return Some(FieldValue::Integer(unix_timestamp));
+                    }
+                }
+
+                // Try parsing as date string
+                if let Some(ts) = parse_outlook_date_string(&s) {
+                    return Some(FieldValue::Integer(ts));
+                }
+            }
+        }
+
+        // VT_R8 = 5 (double — some stores return this instead of VT_DATE)
+        if result.vt == 5 {
+            let ole_date = *(result.data.as_ptr().cast::<f64>());
+            if ole_date > 0.0 {
+                let unix_timestamp = ((ole_date - 25569.0) * 86400.0) as i64;
+                return Some(FieldValue::Integer(unix_timestamp));
+            }
+        }
+
+        None
+    }
+}
+
+/// Parse a date string from Outlook into a Unix timestamp.
+///
+/// Handles common formats:
+/// - "M/D/YYYY H:MM:SS AM/PM" (US locale)
+/// - "D/M/YYYY H:MM:SS" (EU locale)
+/// - "YYYY-MM-DD HH:MM:SS" (ISO)
+///
+/// Returns None if the string can't be parsed.
+fn parse_outlook_date_string(s: &str) -> Option<i64> {
+    // Try ISO format first: "YYYY-MM-DD..."
+    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        let year: i64 = s[0..4].parse().ok()?;
+        let month: i64 = s[5..7].parse().ok()?;
+        let day: i64 = s[8..10].parse().ok()?;
+        if year >= 1970 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+            return Some(date_to_unix_timestamp(year, month, day));
+        }
+    }
+
+    // Try US format: "M/D/YYYY..." (split on space to get date portion)
+    let date_part = s.split_whitespace().next()?;
+    let parts: Vec<&str> = date_part.split('/').collect();
+    if parts.len() == 3 {
+        let month: i64 = parts[0].parse().ok()?;
+        let day: i64 = parts[1].parse().ok()?;
+        let year: i64 = parts[2].parse().ok()?;
+        if year >= 1970 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+            return Some(date_to_unix_timestamp(year, month, day));
+        }
+    }
+
+    None
+}
+
+/// Convert a year/month/day to a Unix timestamp (seconds since 1970-01-01 00:00:00 UTC).
+/// Uses a simplified calculation (ignores time-of-day).
+fn date_to_unix_timestamp(year: i64, month: i64, day: i64) -> i64 {
+    // Days from 1970-01-01 to the given date using a standard algorithm.
+    let mut y = year;
+    let mut m = month;
+    if m <= 2 {
+        y -= 1;
+        m += 12;
+    }
+    // Modified Julian Day Number calculation
+    let days = 365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day - 719469;
+    days * 86400
 }
 
 /// MAPI-based provider for the spam auto-cleanup operation.
