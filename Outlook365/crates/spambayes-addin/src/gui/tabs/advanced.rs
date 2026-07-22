@@ -10,9 +10,9 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Align, Box as GtkBox, Button, CheckButton, Entry, EventControllerFocus,
-    EventControllerScroll, EventControllerScrollFlags, Frame, Label, Orientation, Scale,
-    ScrolledWindow, Window,
+    Adjustment, Align, Box as GtkBox, Button, CheckButton, DropDown, Entry,
+    EventControllerFocus, EventControllerScroll, EventControllerScrollFlags, Frame, Label,
+    Orientation, Scale, ScrolledWindow, StringList, Window,
 };
 use gtk4::glib;
 
@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use spambayes_config::AppConfig;
+use spambayes_config::{AppConfig, UpdateCheckInterval};
 
 // ─── AdvancedValues ──────────────────────────────────────────────────────────
 
@@ -28,11 +28,13 @@ use spambayes_config::AppConfig;
 #[derive(Clone, Debug)]
 pub struct AdvancedValues {
     pub timer_enabled: bool,
+    pub timer_wait_for_sync: bool,
     pub timer_start_delay: f64,
     pub timer_interval: f64,
     pub timer_only_receive_folders: bool,
     pub verbose: u32,
     pub save_spam_info: bool,
+    pub update_check_interval: UpdateCheckInterval,
 }
 
 // ─── AdvancedTab ─────────────────────────────────────────────────────────────
@@ -51,6 +53,8 @@ pub struct AdvancedTab {
     // ─── Timer controls (Req 7.1) ────────────────────────────────────────
     /// "Enable background filtering" checkbox.
     pub timer_enable_check: CheckButton,
+    /// "Wait for sync before filtering" checkbox.
+    pub wait_for_sync_check: CheckButton,
     /// "Processing start delay" scale (0–60 seconds).
     pub start_delay_scale: Scale,
     /// "Processing start delay" entry (editable, synced with scale).
@@ -67,6 +71,10 @@ pub struct AdvancedTab {
     pub verbose: Rc<Cell<u32>>,
     /// Current save_spam_info state (updated when diagnostics dialog saves).
     pub save_spam_info: Rc<Cell<bool>>,
+
+    // ─── Update settings ─────────────────────────────────────────────────
+    /// "Check for updates" interval dropdown (Weekly / Monthly).
+    pub update_interval_dropdown: DropDown,
 }
 
 impl AdvancedTab {
@@ -103,6 +111,16 @@ impl AdvancedTab {
             "Enable automatic background filtering of messages at regular intervals.",
         ));
         timer_box.append(&timer_enable_check);
+
+        // Wait for sync checkbox
+        let wait_for_sync_check =
+            CheckButton::with_label("Wait for sync before filtering");
+        wait_for_sync_check.set_active(config.filter.timer_wait_for_sync);
+        wait_for_sync_check.set_tooltip_text(Some(
+            "Wait for Outlook to finish syncing before starting background filtering.",
+        ));
+        wait_for_sync_check.set_sensitive(config.filter.timer_enabled);
+        timer_box.append(&wait_for_sync_check);
 
         // Start delay row
         let start_delay_label = Label::new(Some("Processing start delay:"));
@@ -204,6 +222,7 @@ impl AdvancedTab {
         interval_label.set_sensitive(timer_controls_sensitive);
         interval_row.set_sensitive(timer_controls_sensitive);
         only_receive_check.set_sensitive(timer_controls_sensitive);
+        wait_for_sync_check.set_sensitive(timer_controls_sensitive);
 
         {
             let sd_label = start_delay_label.clone();
@@ -211,6 +230,7 @@ impl AdvancedTab {
             let iv_label = interval_label.clone();
             let iv_row = interval_row.clone();
             let or_check = only_receive_check.clone();
+            let wfs_check = wait_for_sync_check.clone();
             timer_enable_check.connect_toggled(move |checkbox| {
                 let active = checkbox.is_active();
                 sd_label.set_sensitive(active);
@@ -218,6 +238,7 @@ impl AdvancedTab {
                 iv_label.set_sensitive(active);
                 iv_row.set_sensitive(active);
                 or_check.set_sensitive(active);
+                wfs_check.set_sensitive(active);
             });
         }
 
@@ -382,6 +403,26 @@ impl AdvancedTab {
         });
         env_box.append(&update_btn);
 
+        // "Check for updates" interval dropdown.
+        let interval_row = GtkBox::new(Orientation::Horizontal, 8);
+        interval_row.set_margin_top(8);
+        let interval_label = Label::new(Some("Check for updates:"));
+        interval_label.set_halign(Align::Start);
+        let interval_model = StringList::new(&["Weekly", "Monthly"]);
+        let update_interval_dropdown = DropDown::new(Some(interval_model), gtk4::Expression::NONE);
+        update_interval_dropdown.set_tooltip_text(Some(
+            "How often SpamBayes checks for new versions.",
+        ));
+        // Select the current config value (0 = Weekly, 1 = Monthly).
+        let selected_idx = match config.update.check_interval {
+            UpdateCheckInterval::Weekly => 0,
+            UpdateCheckInterval::Monthly => 1,
+        };
+        update_interval_dropdown.set_selected(selected_idx);
+        interval_row.append(&interval_label);
+        interval_row.append(&update_interval_dropdown);
+        env_box.append(&interval_row);
+
         env_frame.set_child(Some(&env_box));
         content_box.append(&env_frame);
 
@@ -448,6 +489,7 @@ impl AdvancedTab {
         Self {
             container,
             timer_enable_check,
+            wait_for_sync_check,
             start_delay_scale,
             start_delay_entry,
             interval_scale,
@@ -455,19 +497,26 @@ impl AdvancedTab {
             only_receive_check,
             verbose,
             save_spam_info,
+            update_interval_dropdown,
         }
     }
 
     /// Read the current advanced config values from the widgets.
     #[must_use]
     pub fn read_values(&self) -> AdvancedValues {
+        let update_check_interval = match self.update_interval_dropdown.selected() {
+            0 => UpdateCheckInterval::Weekly,
+            _ => UpdateCheckInterval::Monthly,
+        };
         AdvancedValues {
             timer_enabled: self.timer_enable_check.is_active(),
+            timer_wait_for_sync: self.wait_for_sync_check.is_active(),
             timer_start_delay: self.start_delay_scale.value(),
             timer_interval: self.interval_scale.value(),
             timer_only_receive_folders: self.only_receive_check.is_active(),
             verbose: self.verbose.get(),
             save_spam_info: self.save_spam_info.get(),
+            update_check_interval,
         }
     }
 

@@ -63,6 +63,7 @@ pub use ini_parser::{IniData, IniFile, SectionData, merge_ini_data};
 pub use options::{
     AppConfig, CalendarConfig, CalendarSpamAction, ExperimentalConfig, FilterAction, FilterConfig,
     FilterNowConfig, GeneralConfig, MessageReadState, NotificationConfig, TrainingConfig,
+    UpdateCheckInterval,
 };
 pub use migration::{detect_python_config, migrate_python_config, rust_config_exists, try_migrate};
 pub use profile::sanitize_profile_name;

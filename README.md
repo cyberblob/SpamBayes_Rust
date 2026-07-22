@@ -2,7 +2,7 @@
 
 A native Rust implementation of the SpamBayes Outlook COM add-in. This is a ground-up rewrite of the original Python SpamBayes Outlook2000 plugin, compiled to a standalone 64-bit DLL that loads directly into Microsoft Outlook without requiring a Python runtime.
 
-**Version:** 0.3.0-alpha.3
+**Version:** 0.3.0-alpha.4
 
 ## Overview
 
@@ -117,7 +117,7 @@ cargo test --target x86_64-pc-windows-msvc
 target/x86_64-pc-windows-msvc/release/spambayes_addin.dll     # COM DLL (loaded by Outlook)
 target/x86_64-pc-windows-msvc/release/spambayes_manager.exe   # GTK4 Manager GUI
 target/x86_64-pc-windows-msvc/release/spambayes_clues.exe     # Show Clues viewer
-installer/output/SpamBayes_Outlook_Setup_0.3.0a3.exe           # Installer
+installer/output/SpamBayes_Outlook_Setup_0.3.0a4.exe           # Installer
 ```
 
 ### Key Dependencies
@@ -140,7 +140,7 @@ installer/output/SpamBayes_Outlook_Setup_0.3.0a3.exe           # Installer
 
 ### Via Installer (Recommended)
 
-Run `SpamBayes_Outlook_Setup_0.3.0a3.exe` as Administrator. The installer will:
+Run `SpamBayes_Outlook_Setup_0.3.0a4.exe` as Administrator. The installer will:
 1. Install the DLL, Manager, and Clues viewer to `C:\Program Files\SpamBayes\`
 2. Bundle GTK4 runtime DLLs alongside the executables
 3. Register the COM add-in via `regsvr32` (64-bit)

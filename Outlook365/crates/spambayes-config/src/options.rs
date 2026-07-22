@@ -197,6 +197,16 @@ pub struct FilterConfig {
     /// Only effective on Exchange/Outlook.com/Hotmail stores.
     /// Default: `false`.
     pub clear_exchange_scl: bool,
+    /// Whether to wait for Outlook's initial sync to complete before
+    /// starting background filtering.
+    ///
+    /// When enabled, the add-in listens for `SyncObject.SyncEnd` and
+    /// queues incoming messages until sync completes. This prevents
+    /// filtering partially-downloaded messages during startup.
+    ///
+    /// Falls back to quiescence-based detection if `SyncEnd` never fires.
+    /// Default: `true`.
+    pub timer_wait_for_sync: bool,
 }
 
 impl Default for FilterConfig {
@@ -224,6 +234,7 @@ impl Default for FilterConfig {
             spam_auto_cleanup_days: 30,
             use_cached_scores: false,
             clear_exchange_scl: false,
+            timer_wait_for_sync: true,
         }
     }
 }
@@ -436,6 +447,55 @@ impl Default for CalendarConfig {
     }
 }
 
+// ─── UpdateCheckInterval ──────────────────────────────────────────────────────
+
+/// How often to check for updates.
+///
+/// Default: `Monthly`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateCheckInterval {
+    /// Check once per week (every 168 hours).
+    Weekly,
+    /// Check once per month (every 720 hours / 30 days).
+    Monthly,
+}
+
+impl UpdateCheckInterval {
+    /// Return the interval as seconds.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        match self {
+            Self::Weekly => 7 * 24 * 3600,   // 604 800
+            Self::Monthly => 30 * 24 * 3600, // 2 592 000
+        }
+    }
+
+    /// Serialize to INI string value.
+    #[must_use]
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+        }
+    }
+
+    /// Parse from INI string value.
+    /// Falls back to `Monthly` for unrecognised values.
+    #[must_use]
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim() {
+            "Weekly" | "weekly" => Self::Weekly,
+            _ => Self::Monthly,
+        }
+    }
+}
+
+impl Default for UpdateCheckInterval {
+    fn default() -> Self {
+        Self::Monthly
+    }
+}
+
 // ─── UpdateConfig ─────────────────────────────────────────────────────────────
 
 /// Configuration for the automatic update checker.
@@ -447,9 +507,9 @@ pub struct UpdateConfig {
     /// URL of the version manifest JSON file to check for updates.
     /// Default: GitHub releases manifest URL.
     pub update_url: String,
-    /// How often to check for updates, in hours.
-    /// Default: `24` (once per day).
-    pub check_interval_hours: u32,
+    /// How often to check for updates.
+    /// Default: `Monthly`.
+    pub check_interval: UpdateCheckInterval,
     /// Unix timestamp (seconds) of the last successful update check.
     /// Default: `0` (never checked).
     pub last_check_timestamp: u64,
@@ -469,7 +529,7 @@ impl Default for UpdateConfig {
         Self {
             enabled: true,
             update_url: "https://raw.githubusercontent.com/cyberblob/SpamBayes_Rust/main/Outlook365/installer/version_manifest.json".to_string(),
-            check_interval_hours: 24,
+            check_interval: UpdateCheckInterval::Monthly,
             last_check_timestamp: 0,
             update_notified: false,
             latest_known_version: String::new(),
@@ -847,6 +907,12 @@ impl AppConfig {
                 None => eprintln!("Warning: invalid value for [Filter] clear_exchange_scl: {v:?}, using default"),
             }
         }
+        if let Some(v) = get("Filter", "timer_wait_for_sync") {
+            match parse_bool(&v) {
+                Some(b) => filter.timer_wait_for_sync = b,
+                None => eprintln!("Warning: invalid value for [Filter] timer_wait_for_sync: {v:?}, using default"),
+            }
+        }
     }
 
     fn load_filter_now_section(
@@ -991,10 +1057,15 @@ impl AppConfig {
             }
         }
         if let Some(v) = get("Update", "check_interval_hours") {
-            match parse_u32(&v) {
-                Some(n) => update.check_interval_hours = n,
-                None => eprintln!("Warning: invalid value for [Update] check_interval_hours: {v:?}, using default"),
+            // Legacy: old numeric hours value — always map to Monthly since we're
+            // moving away from frequent checks.
+            if parse_u32(&v).is_none() {
+                eprintln!("Warning: invalid value for [Update] check_interval_hours: {v:?}, using default");
             }
+            // Intentionally ignore the numeric value — Monthly is the new default.
+        }
+        if let Some(v) = get("Update", "check_interval") {
+            update.check_interval = UpdateCheckInterval::from_ini_str(&v);
         }
         if let Some(v) = get("Update", "last_check_timestamp") {
             match v.trim().parse::<u64>() {
@@ -1161,6 +1232,9 @@ impl AppConfig {
         if self.filter.clear_exchange_scl != defaults.filter.clear_exchange_scl {
             filter.insert("clear_exchange_scl".to_string(), format_bool(self.filter.clear_exchange_scl).to_string());
         }
+        if self.filter.timer_wait_for_sync != defaults.filter.timer_wait_for_sync {
+            filter.insert("timer_wait_for_sync".to_string(), format_bool(self.filter.timer_wait_for_sync).to_string());
+        }
         if !filter.is_empty() {
             data.insert("Filter".to_string(), filter);
         }
@@ -1257,8 +1331,8 @@ impl AppConfig {
         if self.update.update_url != defaults.update.update_url {
             update.insert("update_url".to_string(), self.update.update_url.clone());
         }
-        if self.update.check_interval_hours != defaults.update.check_interval_hours {
-            update.insert("check_interval_hours".to_string(), self.update.check_interval_hours.to_string());
+        if self.update.check_interval != defaults.update.check_interval {
+            update.insert("check_interval".to_string(), self.update.check_interval.to_ini_str().to_string());
         }
         if self.update.last_check_timestamp != defaults.update.last_check_timestamp {
             update.insert("last_check_timestamp".to_string(), self.update.last_check_timestamp.to_string());
@@ -1396,6 +1470,7 @@ impl AppConfig {
         filter.insert("spam_auto_cleanup_days".to_string(), self.filter.spam_auto_cleanup_days.to_string());
         filter.insert("use_cached_scores".to_string(), format_bool(self.filter.use_cached_scores).to_string());
         filter.insert("clear_exchange_scl".to_string(), format_bool(self.filter.clear_exchange_scl).to_string());
+        filter.insert("timer_wait_for_sync".to_string(), format_bool(self.filter.timer_wait_for_sync).to_string());
         data.insert("Filter".to_string(), filter);
 
         // ── Filter_Now section ──
@@ -1438,7 +1513,7 @@ impl AppConfig {
         let mut update = SectionData::new();
         update.insert("enabled".to_string(), format_bool(self.update.enabled).to_string());
         update.insert("update_url".to_string(), self.update.update_url.clone());
-        update.insert("check_interval_hours".to_string(), self.update.check_interval_hours.to_string());
+        update.insert("check_interval".to_string(), self.update.check_interval.to_ini_str().to_string());
         update.insert("last_check_timestamp".to_string(), self.update.last_check_timestamp.to_string());
         update.insert("update_notified".to_string(), format_bool(self.update.update_notified).to_string());
         update.insert("latest_known_version".to_string(), self.update.latest_known_version.clone());

@@ -34,7 +34,7 @@ use crate::version_manifest::{self, UpdateStatus, VersionManifest};
 pub struct UpdateChecker {
     /// URL to fetch the version manifest from.
     update_url: String,
-    /// Check interval in seconds (converted from config hours).
+    /// Check interval in seconds (derived from config enum).
     check_interval_secs: u64,
     /// Unix timestamp of the last successful check.
     last_check_timestamp: u64,
@@ -83,7 +83,7 @@ impl UpdateChecker {
     ) -> Self {
         Self {
             update_url: config.update.update_url.clone(),
-            check_interval_secs: u64::from(config.update.check_interval_hours) * 3600,
+            check_interval_secs: config.update.check_interval.as_secs(),
             last_check_timestamp: config.update.last_check_timestamp,
             already_notified: config.update.update_notified,
             data_dir: data_dir.to_path_buf(),
@@ -404,7 +404,7 @@ mod tests {
         let mut config = AppConfig::default();
         // Set last check to "just now".
         config.update.last_check_timestamp = current_unix_timestamp();
-        config.update.check_interval_hours = 24;
+        config.update.check_interval = spambayes_config::UpdateCheckInterval::Weekly;
 
         let dir = std::path::PathBuf::from(".");
         let checker = UpdateChecker::new(&config, &dir, "default", None);
@@ -415,10 +415,10 @@ mod tests {
     #[test]
     fn test_is_check_due_expired() {
         let mut config = AppConfig::default();
-        // Set last check to 25 hours ago.
+        // Set last check to 8 days ago (exceeds weekly interval).
         let now = current_unix_timestamp();
-        config.update.last_check_timestamp = now.saturating_sub(25 * 3600);
-        config.update.check_interval_hours = 24;
+        config.update.last_check_timestamp = now.saturating_sub(8 * 24 * 3600);
+        config.update.check_interval = spambayes_config::UpdateCheckInterval::Weekly;
 
         let dir = std::path::PathBuf::from(".");
         let checker = UpdateChecker::new(&config, &dir, "default", None);

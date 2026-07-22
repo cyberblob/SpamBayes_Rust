@@ -10,12 +10,31 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Reentrancy guard: prevents processing a new event while a dialog is open.
-/// Only one calendar prompt (or filter action) runs at a time on the STA thread.
-static PROCESSING_EVENT: AtomicBool = AtomicBool::new(false);
+/// Reentrancy guard and event queue for ItemAdd processing.
+/// When COM pumps messages during handle_item_add (e.g., during a
+/// dispatch_get_string call), new ItemAdd events can fire reentrantly.
+/// Instead of dropping them, we queue them and process after the current
+/// event finishes. This ensures no events are lost during multi-select
+/// operations.
+struct EventQueue {
+    /// Whether we are currently inside handle_item_add processing.
+    processing: bool,
+    /// Queued events: (sink_ptr, mail_item_ptr) — mail_item has been AddRef'd.
+    pending: std::collections::VecDeque<(*mut c_void, *mut c_void)>,
+}
+
+// SAFETY: EventQueue is only accessed from the COM STA thread.
+unsafe impl Send for EventQueue {}
+unsafe impl Sync for EventQueue {}
+
+static EVENT_QUEUE: std::sync::LazyLock<Mutex<EventQueue>> =
+    std::sync::LazyLock::new(|| Mutex::new(EventQueue {
+        processing: false,
+        pending: std::collections::VecDeque::new(),
+    }));
 
 /// Global verbosity level for folder_sink debug logging.
 /// Updated from config.general.verbose when folder hooks are set up or config is reloaded.
@@ -41,6 +60,33 @@ static RECENTLY_MOVED: std::sync::LazyLock<Mutex<std::collections::HashMap<Strin
 static RECENTLY_FILTERED: std::sync::LazyLock<Mutex<std::collections::HashMap<String, f64>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Queue of messages held pending sync completion.
+///
+/// When `timer_wait_for_sync` is enabled and `is_sync_complete()` returns
+/// false, arriving messages are AddRef'd and stored here. Once sync
+/// completes (or times out), `drain_sync_queue` processes them all.
+///
+/// Each entry is (sink_state, mail_item_ptr, folder_name, calendar_only).
+/// The mail_item has been AddRef'd and must be Release'd after processing.
+static SYNC_PENDING_QUEUE: std::sync::LazyLock<Mutex<Vec<SyncPendingItem>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// An item queued while waiting for sync to complete.
+struct SyncPendingItem {
+    /// Shared state for the folder hook.
+    state: Arc<Mutex<FolderHookState>>,
+    /// The MailItem IDispatch pointer (AddRef'd).
+    mail_item: *mut c_void,
+    /// Folder name for logging.
+    folder_name: String,
+    /// Whether this is a calendar-only hook.
+    calendar_only: bool,
+}
+
+// SAFETY: SyncPendingItem holds COM pointers only accessed on the STA thread.
+unsafe impl Send for SyncPendingItem {}
+unsafe impl Sync for SyncPendingItem {}
+
 /// Record that a message was moved by user action (to skip re-filtering).
 /// `is_ham` = true means "Not Spam" (should stay in watch folder if it bounces back).
 /// `is_ham` = false means "Spam" (should be re-moved to spam if it bounces back).
@@ -64,6 +110,21 @@ fn was_user_moved_as_ham(mail_item: *mut c_void) -> bool {
         if let Some(k) = key {
             if let Ok(map) = RECENTLY_MOVED.lock() {
                 return map.get(&k).copied() == Some(true);
+            }
+        }
+    }
+    false
+}
+
+/// Check if a message was recently moved by user action as spam (Spam button).
+/// Returns true only for spam moves — these should be re-moved to spam folder
+/// if Exchange bounces them back to the watch folder.
+fn was_user_moved_as_spam(mail_item: *mut c_void) -> bool {
+    unsafe {
+        let key = get_message_identity(mail_item);
+        if let Some(k) = key {
+            if let Ok(map) = RECENTLY_MOVED.lock() {
+                return map.get(&k).copied() == Some(false);
             }
         }
     }
@@ -111,7 +172,9 @@ fn get_filter_moved_score(mail_item: *mut c_void) -> Option<f64> {
 
 /// Get a stable identity for a message that survives moves.
 /// Uses InternetMessageId (Message-ID header) which is unique and immutable.
-/// Falls back to Subject + SenderName + Size as a composite key.
+/// Falls back to Subject + SenderName + ConversationIndex as a composite key.
+/// ConversationIndex contains a timestamp + GUID that is unique per message,
+/// unlike Subject + SenderName alone which collides for bulk spam.
 unsafe fn get_message_identity(mail_item: *mut c_void) -> Option<String> {
     // Try PR_INTERNET_MESSAGE_ID first (most reliable, doesn't change on move)
     if let Some(msg_id) = dispatch_get_string(mail_item, "InternetMessageId") {
@@ -119,13 +182,16 @@ unsafe fn get_message_identity(mail_item: *mut c_void) -> Option<String> {
             return Some(msg_id);
         }
     }
-    // Fallback: composite key from Subject + SenderName + Size
+    // Fallback: composite key including ConversationIndex for uniqueness.
+    // ConversationIndex is a hex string with an embedded timestamp + GUID,
+    // making it unique even when Subject and SenderName are identical.
     let subject = dispatch_get_string(mail_item, "Subject").unwrap_or_default();
     let sender = dispatch_get_string(mail_item, "SenderName").unwrap_or_default();
-    if subject.is_empty() && sender.is_empty() {
+    let conv_index = dispatch_get_string(mail_item, "ConversationIndex").unwrap_or_default();
+    if subject.is_empty() && sender.is_empty() && conv_index.is_empty() {
         return None;
     }
-    Some(format!("{}|{}", subject, sender))
+    Some(format!("{}|{}|{}", subject, sender, conv_index))
 }
 
 use windows::core::{GUID, HRESULT, PCWSTR};
@@ -453,10 +519,65 @@ unsafe extern "system" fn folder_sink_invoke(
         return HRESULT(0);
     }
 
+    // Event queue: if we're already inside handle_item_add (reentrant call via
+    // STA message pump), queue this event for later processing instead of
+    // dropping it. This ensures multi-select operations don't lose events.
+    {
+        let mut queue = match EVENT_QUEUE.lock() {
+            Ok(q) => q,
+            Err(_) => {
+                log_debug(&debug_path, "[folder_sink_invoke] EVENT_QUEUE lock poisoned, processing directly");
+                handle_item_add(sink, mail_item);
+                return HRESULT(0);
+            }
+        };
+
+        if queue.processing {
+            // Already inside handle_item_add — queue this event.
+            // AddRef the mail_item so it stays alive until we process it.
+            addref_dispatch(mail_item);
+            queue.pending.push_back((this, mail_item));
+            log_debug(&debug_path, &format!(
+                "[folder_sink_invoke] Queued event (queue size: {})", queue.pending.len()
+            ));
+            return HRESULT(0);
+        }
+
+        // Mark as processing — we'll handle this event now.
+        queue.processing = true;
+    }
+
     log_debug(&debug_path, "[folder_sink_invoke] Dispatching to handle_item_add");
 
-    // Process the new item
+    // Process the current item.
     handle_item_add(sink, mail_item);
+
+    // Drain the queue: process any events that arrived while we were busy.
+    loop {
+        let next = {
+            let mut queue = match EVENT_QUEUE.lock() {
+                Ok(q) => q,
+                Err(_) => break,
+            };
+            queue.pending.pop_front()
+        };
+
+        match next {
+            Some((queued_sink_ptr, queued_mail_item)) => {
+                log_debug(&debug_path, "[folder_sink_invoke] Processing queued event");
+                let queued_sink = &*(queued_sink_ptr as *const FolderItemsSink);
+                handle_item_add(queued_sink, queued_mail_item);
+                // Release the AddRef we took when queuing.
+                release_dispatch(queued_mail_item);
+            }
+            None => break,
+        }
+    }
+
+    // Clear the processing flag.
+    if let Ok(mut queue) = EVENT_QUEUE.lock() {
+        queue.processing = false;
+    }
 
     HRESULT(0) // S_OK
 }
@@ -470,21 +591,32 @@ unsafe extern "system" fn folder_sink_invoke(
 unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
     let debug_path = debug_log_path();
 
-    // Reentrancy guard: if we're already processing an event (e.g., showing a
-    // dialog), skip this one. COM can pump messages while a MessageBox is open,
-    // causing new ItemAdd events to fire.
-    if PROCESSING_EVENT.swap(true, Ordering::SeqCst) {
-        log_debug(&debug_path, "  [SKIPPED] Already processing an event (reentrancy guard)");
-        return;
-    }
-    // Ensure the flag is cleared when we exit, even on early returns.
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            PROCESSING_EVENT.store(false, Ordering::SeqCst);
+    // ── Sync suppression gate ───────────────────────────────────────────────
+    // When timer_wait_for_sync is enabled and sync hasn't completed yet,
+    // queue the message for later processing instead of filtering now.
+    if !crate::sync_sink::is_sync_complete() {
+        let wait_for_sync = match sink.state.lock() {
+            Ok(s) => s.config.filter.timer_wait_for_sync,
+            Err(_) => false,
+        };
+        if wait_for_sync {
+            // AddRef the mail_item so it stays alive while queued.
+            addref_dispatch(mail_item);
+            if let Ok(mut queue) = SYNC_PENDING_QUEUE.lock() {
+                queue.push(SyncPendingItem {
+                    state: Arc::clone(&sink.state),
+                    mail_item,
+                    folder_name: sink.folder_name.clone(),
+                    calendar_only: sink.calendar_only,
+                });
+                log_debug_important(&debug_path, &format!(
+                    "Sync not complete, queueing message (queue size: {})",
+                    queue.len()
+                ));
+            }
+            return;
         }
     }
-    let _guard = Guard;
 
     // Get message properties for logging
     let raw_subject = dispatch_get_string(mail_item, "Subject");
@@ -724,10 +856,27 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
     }
 
     // Skip messages that were just moved by user as ham (Not Spam button).
-    // Spam moves that bounce back are handled by the score-check above
-    // which will re-move them to the correct folder.
     if was_user_moved_as_ham(mail_item) {
         log_debug(&debug_path, "  Message was recently moved by user as ham, skipping");
+        clear_user_moved(mail_item);
+        return;
+    }
+
+    // Handle spam moves that bounced back from Exchange.
+    // When use_cached_scores is false, the score-based bounce detection above
+    // is skipped. This explicit check catches user-initiated spam moves that
+    // Exchange bounced back to the watch folder and re-moves them to spam.
+    if was_user_moved_as_spam(mail_item) {
+        log_debug(&debug_path, "  User-moved spam bounced back from Exchange, re-moving to spam folder");
+        let spam_dest = filter_config.spam_folder_id.clone();
+        if let Some(dest) = &spam_dest {
+            if filter_config.clear_exchange_scl {
+                clear_scl_on_item(mail_item, &debug_path);
+            }
+            move_item_to_folder(mail_item, dest, &debug_path);
+        } else {
+            log_debug(&debug_path, "  No spam folder configured, cannot re-move");
+        }
         clear_user_moved(mail_item);
         return;
     }
@@ -1715,6 +1864,63 @@ pub unsafe fn setup_folder_hooks(
     hooks
 }
 
+/// Drain the sync-pending queue and process all held messages.
+///
+/// Called when `SyncEnd` fires or when the sync timeout expires.
+/// Each queued message is processed through `handle_item_add` and then
+/// Released (to balance the AddRef when queued).
+///
+/// # Safety
+/// Must be called from the COM STA thread.
+pub unsafe fn drain_sync_queue() {
+    let debug_path = debug_log_path();
+
+    let items: Vec<SyncPendingItem> = {
+        match SYNC_PENDING_QUEUE.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => {
+                log_debug_important(&debug_path, "drain_sync_queue: SYNC_PENDING_QUEUE lock poisoned");
+                return;
+            }
+        }
+    };
+
+    let count = items.len();
+    if count == 0 {
+        log_debug_important(&debug_path, "drain_sync_queue: no queued messages to process");
+        return;
+    }
+
+    log_debug_important(&debug_path, &format!(
+        "drain_sync_queue: processing {} queued messages", count
+    ));
+
+    for item in items {
+        // Build a temporary sink reference to reuse handle_item_add.
+        let temp_sink = FolderItemsSink {
+            vtbl: &raw const FOLDER_SINK_VTBL,
+            ref_count: AtomicU32::new(1),
+            state: item.state,
+            folder_name: item.folder_name,
+            calendar_only: item.calendar_only,
+        };
+        handle_item_add(&temp_sink, item.mail_item);
+        // Release the AddRef we took when queuing.
+        release_dispatch(item.mail_item);
+        // Don't drop temp_sink's ref_count to zero (it's stack-allocated, not Box'd).
+        // The AtomicU32 is just a value; FolderItemsSink doesn't implement Drop.
+    }
+
+    log_debug_important(&debug_path, &format!(
+        "drain_sync_queue: finished processing {} messages", count
+    ));
+}
+
+/// Returns the number of messages currently queued pending sync completion.
+pub fn sync_queue_len() -> usize {
+    SYNC_PENDING_QUEUE.lock().map(|q| q.len()).unwrap_or(0)
+}
+
 /// Scan existing items in watched folders and filter any that haven't been scored.
 ///
 /// Called once after folder hooks are established to process messages that
@@ -2148,6 +2354,18 @@ unsafe fn release_dispatch(ptr: *mut c_void) {
     let release: unsafe extern "system" fn(*mut c_void) -> u32 =
         std::mem::transmute((*vtbl)[2]);
     release(ptr);
+}
+
+/// AddRef a COM dispatch pointer (increment reference count).
+/// Used when queuing a mail_item pointer for deferred processing.
+unsafe fn addref_dispatch(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    let vtbl = *(ptr as *const *const [usize; 3]);
+    let addref: unsafe extern "system" fn(*mut c_void) -> u32 =
+        std::mem::transmute((*vtbl)[1]);
+    addref(ptr);
 }
 
 /// Get a DISPID by name on a raw IDispatch pointer.

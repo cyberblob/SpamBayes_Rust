@@ -561,11 +561,13 @@ impl ManagerWindow {
 
         // Advanced tab: timer settings
         config.filter.timer_enabled = advanced_values.timer_enabled;
+        config.filter.timer_wait_for_sync = advanced_values.timer_wait_for_sync;
         config.filter.timer_start_delay = advanced_values.timer_start_delay;
         config.filter.timer_interval = advanced_values.timer_interval;
         config.filter.timer_only_receive_folders = advanced_values.timer_only_receive_folders;
         config.general.verbose = advanced_values.verbose;
         config.filter.save_spam_info = advanced_values.save_spam_info;
+        config.update.check_interval = advanced_values.update_check_interval;
 
         // Training tab
         config.training.ham_folder_ids = self.training.ham_folder_ids.borrow().clone();
@@ -706,14 +708,26 @@ fn dirs_or_default() -> PathBuf {
 ///
 /// GTK4's `present()` doesn't always bring the window to the foreground on
 /// Windows due to the OS's focus-stealing prevention policy. This function
-/// finds the window by its title and uses `SetForegroundWindow` to force it
-/// to the front.
+/// finds the window by its title and uses multiple Win32 techniques to
+/// reliably bring it to the front:
+///
+/// 1. `AllowSetForegroundWindow` is called by the parent process (addin)
+///    before this code runs, granting the foreground token.
+/// 2. We attach our thread input to the current foreground thread so
+///    Windows considers us "related" to the foreground.
+/// 3. We call `BringWindowToTop` + `SetForegroundWindow`.
+/// 4. We detach thread input to clean up.
 ///
 /// Called from a `glib::idle_add_local_once` to ensure the window is fully
 /// realized before we attempt to find its HWND.
 fn bring_window_to_foreground(window: &Window) {
     use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, FindWindowW, GetForegroundWindow,
+        GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_SHOW,
+    };
 
     let title = window.title();
     let title_str = title.as_deref().unwrap_or("SpamBayes Manager");
@@ -721,8 +735,35 @@ fn bring_window_to_foreground(window: &Window) {
 
     unsafe {
         let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(title_wide.as_ptr()));
-        if let Ok(hwnd) = hwnd {
-            let _ = SetForegroundWindow(hwnd);
+        let hwnd = match hwnd {
+            Ok(h) if h != HWND::default() => h,
+            _ => return,
+        };
+
+        // Get the thread that currently owns the foreground window.
+        let foreground_hwnd = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground_hwnd, None);
+        let our_thread = GetCurrentThreadId();
+
+        let attached = if foreground_thread != 0 && foreground_thread != our_thread {
+            // Attach our input queue to the foreground thread so Windows
+            // treats our SetForegroundWindow call as coming from the
+            // foreground application.
+            AttachThreadInput(our_thread, foreground_thread, true).as_bool()
+        } else {
+            false
+        };
+
+        // Ensure the window is visible (not minimized).
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        // Bring to top of Z-order.
+        let _ = BringWindowToTop(hwnd);
+        // Request foreground activation.
+        let _ = SetForegroundWindow(hwnd);
+
+        if attached {
+            // Detach thread input to restore normal input processing.
+            let _ = AttachThreadInput(our_thread, foreground_thread, false);
         }
     }
 }

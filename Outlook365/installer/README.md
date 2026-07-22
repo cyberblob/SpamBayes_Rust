@@ -46,7 +46,7 @@ For a proper Windows Setup wizard with Add/Remove Programs integration:
    ```
    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\spambayes_outlook.iss
    ```
-5. Output: `installer\output\SpamBayes_Outlook_Setup_0.3.0a3.exe`
+5. Output: `installer\output\SpamBayes_Outlook_Setup_0.3.0a4.exe`
 
 ### What the InnoSetup installer does
 

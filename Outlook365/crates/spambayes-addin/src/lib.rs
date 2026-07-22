@@ -91,6 +91,7 @@ pub mod notification;
 pub mod registry;
 pub mod ribbon;
 pub mod statistics;
+pub mod sync_sink;
 pub mod timer;
 pub mod toolbar;
 pub mod tooltip_manager;

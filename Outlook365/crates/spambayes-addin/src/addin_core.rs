@@ -78,6 +78,9 @@ const UPDATE_CHECK_TIMER_ID: usize = 0x5B06;
 /// Timer ID for deferred spam auto-cleanup (fires once after startup).
 const CLEANUP_TIMER_ID: usize = 0x5B07;
 
+/// Timer ID for sync-completion timeout fallback (fires once, 60s after hook setup).
+const SYNC_TIMEOUT_TIMER_ID: usize = 0x5B08;
+
 /// Last known folder EntryID for change detection.
 /// SAFETY: Only accessed from the COM STA thread.
 static mut LAST_FOLDER_ENTRY_ID: Option<String> = None;
@@ -639,6 +642,41 @@ unsafe extern "system" fn cleanup_timer_proc(
     }
 }
 
+/// Timer callback for the sync-completion timeout fallback.
+///
+/// If `SyncEnd` hasn't fired within 60 seconds of hook setup, this timer
+/// fires and forces sync complete, then drains any queued messages.
+/// Self-kills immediately (one-shot).
+unsafe extern "system" fn sync_timeout_timer_proc(
+    _hwnd: windows::Win32::Foundation::HWND,
+    _msg: u32,
+    _id_event: usize,
+    _dw_time: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+    use windows::Win32::Foundation::HWND;
+
+    // Kill this timer immediately — it's a one-shot.
+    KillTimer(HWND::default(), SYNC_TIMEOUT_TIMER_ID).ok();
+
+    // If sync already completed (SyncEnd fired before timeout), nothing to do.
+    if crate::sync_sink::is_sync_complete() {
+        return;
+    }
+
+    let addin = GLOBAL_ADDIN_PTR;
+    if !addin.is_null() {
+        let addin = &*addin;
+        addin.log_info(
+            "sync_timeout_timer_proc: SyncEnd not received within timeout, forcing sync complete"
+        );
+    }
+
+    // Force sync complete and drain the queue.
+    crate::sync_sink::force_sync_complete();
+    crate::folder_sink::drain_sync_queue();
+}
+
 // ─── ext_ConnectMode ─────────────────────────────────────────────────────────
 
 /// Connection mode passed to `OnConnection`.
@@ -826,6 +864,8 @@ pub struct AddinCore {
     folder_hooks: Vec<crate::folder_sink::FolderHook>,
     /// Shared state for folder event sinks.
     folder_hook_state: Option<Arc<Mutex<crate::folder_sink::FolderHookState>>>,
+    /// Active sync event hook for detecting Outlook sync completion.
+    sync_hook: Option<crate::sync_sink::SyncHook>,
     /// GTK4 runtime for native GUI dialogs (None if GTK4 DLLs unavailable).
     gtk_runtime: Option<std::process::Child>,
 }
@@ -862,6 +902,7 @@ impl AddinCore {
             initialized: false,
             folder_hooks: Vec::new(),
             folder_hook_state: None,
+            sync_hook: None,
             gtk_runtime: None,
         });
         // Increment global DLL lock count for this COM object.
@@ -1492,6 +1533,17 @@ impl AddinCore {
             "OnDisconnection: disconnecting {} folder hooks",
             self.folder_hooks.len()
         ));
+        // Disconnect sync hook first (stop listening for SyncEnd).
+        if let Some(mut hook) = self.sync_hook.take() {
+            self.log_verbose("OnDisconnection: disconnecting sync hook");
+            hook.disconnect();
+        }
+        // Kill the sync timeout timer if still pending.
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+            use windows::Win32::Foundation::HWND;
+            KillTimer(HWND::default(), SYNC_TIMEOUT_TIMER_ID).ok();
+        }
         for hook in &mut self.folder_hooks {
             hook.disconnect();
         }
@@ -1855,6 +1907,13 @@ impl AddinCore {
                     {
                         Ok(child) => {
                             log::info!("Launched SpamBayes Manager (PID {})", child.id());
+                            // Grant the child process permission to steal foreground focus.
+                            // Without this, Windows blocks SetForegroundWindow in the child
+                            // because only the current foreground owner can transfer the token.
+                            {
+                                use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+                                let _ = AllowSetForegroundWindow(child.id());
+                            }
                             addin.gtk_runtime = Some(child);
                             // Start timer to detect manager exit and reload config
                             use windows::Win32::UI::WindowsAndMessaging::SetTimer;
@@ -3698,7 +3757,35 @@ impl AddinCore {
 
         self.folder_hook_state = Some(Arc::clone(&state));
 
-        // Setup the hooks
+        // ── Sync-wait logic ─────────────────────────────────────────────────
+        // If timer_wait_for_sync is enabled, reset the sync state and try to
+        // connect to SyncObject.SyncEnd before setting up folder hooks.
+        // This way, messages arriving during initial sync are queued.
+        if config.filter.timer_wait_for_sync {
+            crate::sync_sink::reset_sync_state();
+
+            let sync_hook = unsafe { crate::sync_sink::setup_sync_hook(app_ptr) };
+            match sync_hook {
+                Some(hook) => {
+                    self.sync_hook = Some(hook);
+                    self.log_info("setup_folder_hooks: SyncEnd hook established, filtering deferred until sync completes");
+                    // Start the timeout fallback timer (60 seconds).
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                        use windows::Win32::Foundation::HWND;
+                        SetTimer(HWND::default(), SYNC_TIMEOUT_TIMER_ID, 60_000, Some(sync_timeout_timer_proc));
+                    }
+                }
+                None => {
+                    // SyncObject not available — no send/receive groups or unsupported.
+                    // Fall back: mark sync complete immediately (no suppression).
+                    crate::sync_sink::force_sync_complete();
+                    self.log_info("setup_folder_hooks: SyncObject unavailable, proceeding without sync wait");
+                }
+            }
+        }
+
+        // Setup the folder hooks
         let hooks = unsafe {
             crate::folder_sink::setup_folder_hooks(
                 app_ptr,
@@ -3716,6 +3803,9 @@ impl AddinCore {
 
         // Scan existing items in the watched folders to catch messages
         // that arrived before the add-in started.
+        // If sync wait is active, scan_existing_items will queue messages
+        // via handle_item_add's sync gate — they'll be processed when
+        // SyncEnd fires (or the timeout expires).
         if hook_count > 0 {
             if let Some(state) = &self.folder_hook_state {
                 unsafe {
