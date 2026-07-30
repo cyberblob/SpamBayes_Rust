@@ -828,6 +828,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                     if filter_config.clear_exchange_scl {
                         clear_scl_on_item(mail_item, &debug_path);
                     }
+                    // Set cleanup timestamp via PropertyAccessor (Exchange-compatible)
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    set_cleanup_timestamp_via_property_accessor(mail_item, now_secs, &debug_path);
                     move_item_to_folder(mail_item, dest, &debug_path);
                 }
                 return;
@@ -873,6 +878,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
             if filter_config.clear_exchange_scl {
                 clear_scl_on_item(mail_item, &debug_path);
             }
+            // Set cleanup timestamp via PropertyAccessor (Exchange-compatible)
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            set_cleanup_timestamp_via_property_accessor(mail_item, now_secs, &debug_path);
             move_item_to_folder(mail_item, dest, &debug_path);
         } else {
             log_debug(&debug_path, "  No spam folder configured, cannot re-move");
@@ -894,6 +904,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 if filter_config.clear_exchange_scl {
                     clear_scl_on_item(mail_item, &debug_path);
                 }
+                // Set cleanup timestamp via PropertyAccessor (Exchange-compatible)
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                set_cleanup_timestamp_via_property_accessor(mail_item, now_secs, &debug_path);
                 move_item_to_folder(mail_item, dest, &debug_path);
             }
             return;
@@ -1094,6 +1109,11 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                             if filter_config.clear_exchange_scl && is_online_store {
                                 clear_scl_on_item(mail_item, &debug_path);
                             }
+                            // Set cleanup timestamp via PropertyAccessor (Exchange-compatible)
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs() as i64);
+                            set_cleanup_timestamp_via_property_accessor(mail_item, now_secs, &debug_path);
                             move_item_to_folder(mail_item, dest_folder_id, &debug_path);
                         } else {
                             log_debug(&debug_path, "  Calendar spam action: MOVE but no spam folder configured, leaving in place");
@@ -1150,6 +1170,13 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 if filter_config.clear_exchange_scl && is_online_store {
                     clear_scl_on_item(mail_item, &debug_path);
                 }
+                // Set cleanup timestamp via PropertyAccessor for spam messages (Exchange-compatible)
+                if result.classification == Classification::Spam {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    set_cleanup_timestamp_via_property_accessor(mail_item, now_secs, &debug_path);
+                }
                 move_item_to_folder(mail_item, dest_folder_id, &debug_path);
             } else {
                 log_debug(&debug_path, &format!(
@@ -1170,6 +1197,13 @@ unsafe fn handle_item_add(sink: &FolderItemsSink, mail_item: *mut c_void) {
                 // bouncing the message back after we copy it.
                 if filter_config.clear_exchange_scl && is_online_store {
                     clear_scl_on_item(mail_item, &debug_path);
+                }
+                // Set cleanup timestamp via PropertyAccessor for spam messages (Exchange-compatible)
+                if result.classification == Classification::Spam {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    set_cleanup_timestamp_via_property_accessor(mail_item, now_secs, &debug_path);
                 }
                 copy_item_to_folder(mail_item, dest_folder_id, &debug_path);
             } else {
@@ -1492,6 +1526,97 @@ unsafe fn clear_scl_on_item(mail_item: *mut c_void, debug_path: &str) {
     } else {
         log_debug(debug_path, &format!(
             "  clear_scl: SetProperty failed (HRESULT={:#X}) — Exchange may not support this property",
+            hr.0 as u32
+        ));
+    }
+}
+
+/// Persist the spam cleanup timestamp on a MailItem via PropertyAccessor.
+///
+/// Writes the `SpamBayesCleanupTimestamp` named property using
+/// `PropertyAccessor.SetProperty` with the MAPI named property schema in
+/// the `PS_PUBLIC_STRINGS` namespace. The timestamp is stored as a VT_BSTR
+/// (decimal string of Unix epoch seconds) for maximum compatibility with
+/// Exchange/OST stores where `UserProperties` writes are silently lost
+/// after sync.
+///
+/// This function follows the same pattern as `clear_scl_on_item`.
+///
+/// # Safety
+/// `mail_item` must be a valid, non-null IDispatch pointer to a MailItem.
+pub(crate) unsafe fn set_cleanup_timestamp_via_property_accessor(
+    mail_item: *mut c_void,
+    timestamp: i64,
+    debug_path: &str,
+) {
+    // Get PropertyAccessor from the MailItem
+    let prop_accessor = match dispatch_get(mail_item, "PropertyAccessor") {
+        Ok(p) if !p.is_null() => p,
+        _ => {
+            log_debug(debug_path, "  set_cleanup_ts: cannot get PropertyAccessor");
+            return;
+        }
+    };
+
+    // Named property schema in PS_PUBLIC_STRINGS namespace
+    let schema = "http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/SpamBayesCleanupTimestamp";
+
+    let dispid = match get_dispid_on(prop_accessor, "SetProperty") {
+        Some(id) => id,
+        None => {
+            log_debug(debug_path, "  set_cleanup_ts: cannot resolve SetProperty DISPID");
+            release_dispatch(prop_accessor);
+            return;
+        }
+    };
+
+    let vtbl = *(prop_accessor as *const *const IDispatchVtblRaw);
+
+    // Build arguments: SetProperty(SchemaName, Value)
+    // COM args are in reverse order: Value first (index 0), SchemaName second (index 1)
+    let bstr_schema = sys_alloc_string_local(schema);
+    let timestamp_str = timestamp.to_string();
+    let bstr_value = sys_alloc_string_local(&timestamp_str);
+
+    let mut args = [Variant::default(), Variant::default()];
+    // arg[0] = Value (VT_BSTR — timestamp as decimal string)
+    args[0].vt = 8; // VT_BSTR
+    *(args[0].data.as_mut_ptr().cast::<*mut u16>()) = bstr_value;
+    // arg[1] = SchemaName (VT_BSTR)
+    args[1].vt = 8; // VT_BSTR
+    *(args[1].data.as_mut_ptr().cast::<*mut u16>()) = bstr_schema;
+
+    let mut params = DispParams {
+        rgvarg: args.as_mut_ptr(),
+        rgdispid_named_args: ptr::null_mut(),
+        c_args: 2,
+        c_named_args: 0,
+    };
+
+    let hr = ((*vtbl).invoke)(
+        prop_accessor,
+        dispid,
+        &GUID::from_u128(0),
+        0,
+        1, // DISPATCH_METHOD
+        &raw mut params,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+    );
+
+    SysFreeString(bstr_value);
+    SysFreeString(bstr_schema);
+    release_dispatch(prop_accessor);
+
+    if hr.0 == 0 {
+        log_debug(debug_path, &format!(
+            "  set_cleanup_ts: SpamBayesCleanupTimestamp set to {} via PropertyAccessor",
+            timestamp
+        ));
+    } else {
+        log_debug(debug_path, &format!(
+            "  set_cleanup_ts: SetProperty failed (HRESULT={:#X})",
             hr.0 as u32
         ));
     }
@@ -2784,6 +2909,16 @@ impl CleanupMessage for MapiCleanupMessage {
                 return self.get_received_time_as_timestamp();
             }
 
+            // SpamBayesCleanupTimestamp: try PropertyAccessor first (persists
+            // on Exchange/OST stores), then fall back to UserProperties.Find
+            // for backwards compatibility with PST stores or older messages.
+            if name == "SpamBayesCleanupTimestamp" {
+                if let Some(val) = self.get_cleanup_timestamp_via_property_accessor() {
+                    return Some(val);
+                }
+                // Fall through to UserProperties.Find for legacy messages
+            }
+
             let user_props = dispatch_get(self.mail_item, "UserProperties").ok()?;
             if user_props.is_null() {
                 return None;
@@ -2819,6 +2954,106 @@ impl CleanupMessage for MapiCleanupMessage {
 }
 
 impl MapiCleanupMessage {
+    /// Read `SpamBayesCleanupTimestamp` via PropertyAccessor.GetProperty using
+    /// the PS_PUBLIC_STRINGS named property schema.
+    ///
+    /// The write side (task 3.1) stores the value as VT_BSTR containing a
+    /// decimal string of the Unix timestamp. This reader handles:
+    /// - VT_BSTR (8): parse the string as i64
+    /// - VT_R8 (5): cast the double to i64
+    /// - VT_I4 (3): read as i32, widen to i64
+    /// - VT_I8 (20): read directly as i64
+    ///
+    /// Returns `None` if PropertyAccessor is unavailable or the property is
+    /// not found (e.g., on PST stores or messages written before the fix).
+    unsafe fn get_cleanup_timestamp_via_property_accessor(&self) -> Option<FieldValue> {
+        let prop_accessor = dispatch_get(self.mail_item, "PropertyAccessor").ok()?;
+        if prop_accessor.is_null() {
+            return None;
+        }
+
+        let schema = "http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/SpamBayesCleanupTimestamp";
+
+        let dispid = match get_dispid_on(prop_accessor, "GetProperty") {
+            Some(id) => id,
+            None => {
+                release_dispatch(prop_accessor);
+                return None;
+            }
+        };
+
+        let vtbl = *(prop_accessor as *const *const IDispatchVtblRaw);
+
+        let mut schema_variant = Variant::default();
+        schema_variant.vt = 8; // VT_BSTR
+        let bstr = sys_alloc_string_local(schema);
+        *(schema_variant.data.as_mut_ptr().cast::<*mut u16>()) = bstr;
+
+        let mut params = DispParams {
+            rgvarg: &raw mut schema_variant,
+            rgdispid_named_args: ptr::null_mut(),
+            c_args: 1,
+            c_named_args: 0,
+        };
+
+        let mut result = Variant::default();
+        let hr = ((*vtbl).invoke)(
+            prop_accessor,
+            dispid,
+            &GUID::from_u128(0),
+            0,
+            1, // DISPATCH_METHOD
+            &raw mut params,
+            &raw mut result,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
+
+        SysFreeString(bstr);
+        release_dispatch(prop_accessor);
+
+        if hr.0 != 0 {
+            // Property not found or other error — fall back to UserProperties
+            return None;
+        }
+
+        // VT_BSTR (8): decimal string of Unix timestamp (written by task 3.1)
+        if result.vt == 8 {
+            let bstr_ptr = *(result.data.as_ptr().cast::<*const u16>());
+            if !bstr_ptr.is_null() {
+                let len_ptr = (bstr_ptr as *const u8).sub(4) as *const u32;
+                let byte_len = *len_ptr as usize;
+                let char_len = byte_len / 2;
+                let slice = std::slice::from_raw_parts(bstr_ptr, char_len);
+                let s = String::from_utf16_lossy(slice);
+                SysFreeString(bstr_ptr as *mut u16);
+                if let Ok(ts) = s.parse::<i64>() {
+                    return Some(FieldValue::Integer(ts));
+                }
+            }
+        }
+
+        // VT_R8 (5): double — cast to i64
+        if result.vt == 5 {
+            let val = *(result.data.as_ptr().cast::<f64>());
+            return Some(FieldValue::Integer(val as i64));
+        }
+
+        // VT_I4 (3): 32-bit integer — widen to i64
+        if result.vt == 3 {
+            let val = *(result.data.as_ptr().cast::<i32>());
+            return Some(FieldValue::Integer(val as i64));
+        }
+
+        // VT_I8 (20): 64-bit integer — read directly
+        if result.vt == 20 {
+            let val = *(result.data.as_ptr().cast::<i64>());
+            return Some(FieldValue::Integer(val));
+        }
+
+        None
+    }
+
     /// Read MailItem.ReceivedTime and convert the OLE Automation date to a
     /// Unix timestamp (seconds since 1970-01-01).
     ///

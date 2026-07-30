@@ -75,7 +75,7 @@ const MANAGER_WATCH_TIMER_ID: usize = 0x5B05;
 /// Timer ID for deferred update check (fires once after startup).
 const UPDATE_CHECK_TIMER_ID: usize = 0x5B06;
 
-/// Timer ID for deferred spam auto-cleanup (fires once after startup).
+/// Timer ID for deferred spam auto-cleanup (recurring every 4 hours after startup).
 const CLEANUP_TIMER_ID: usize = 0x5B07;
 
 /// Timer ID for sync-completion timeout fallback (fires once, 60s after hook setup).
@@ -84,6 +84,11 @@ const SYNC_TIMEOUT_TIMER_ID: usize = 0x5B08;
 /// Last known folder EntryID for change detection.
 /// SAFETY: Only accessed from the COM STA thread.
 static mut LAST_FOLDER_ENTRY_ID: Option<String> = None;
+
+/// Timestamp of last cleanup run (epoch seconds) for re-scheduling guard.
+/// Prevents rapid re-fires when config is saved multiple times in succession.
+/// SAFETY: Atomic — safe to access from any context (STA thread in practice).
+static CLEANUP_LAST_RUN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Global pointer to the AddinCore instance for timer callbacks.
 /// SAFETY: Only accessed from the COM STA thread.
@@ -553,39 +558,61 @@ unsafe extern "system" fn update_check_timer_proc(
             _ => {}
         }
 
-        // Persist update state to config file.
-        // We create a minimal config update and save just the Update section.
+        // Persist update state to the profile INI so it's loaded on next startup.
+        // We read-merge-write just the [Update] section to avoid clobbering
+        // other settings that may have changed concurrently.
         let mut updated_config = config;
         checker.save_state(&mut updated_config);
-        // Save sparse config (only non-default values) to avoid overwriting
-        // other settings that may have changed concurrently.
-        let update_state_path = data_dir.join("update_state.ini");
-        let ini_content = format!(
-            "[Update]\nlast_check_timestamp = {}\nupdate_notified = {}\n",
-            updated_config.update.last_check_timestamp,
-            if updated_config.update.update_notified { "True" } else { "False" },
+
+        let profile_ini_path = data_dir.join("default.ini");
+        let mut existing_data = match spambayes_config::IniFile::read(&profile_ini_path) {
+            Ok(data) => data,
+            Err(_) => spambayes_config::IniData::new(),
+        };
+
+        // Build a minimal IniData with only the Update section fields we changed.
+        let mut update_section = spambayes_config::SectionData::new();
+        update_section.insert(
+            "last_check_timestamp".to_string(),
+            updated_config.update.last_check_timestamp.to_string(),
         );
-        let _ = std::fs::write(&update_state_path, ini_content);
+        update_section.insert(
+            "update_notified".to_string(),
+            if updated_config.update.update_notified { "True" } else { "False" }.to_string(),
+        );
+        let mut update_overlay = spambayes_config::IniData::new();
+        update_overlay.insert("Update".to_string(), update_section);
+
+        spambayes_config::merge_ini_data(&mut existing_data, &update_overlay);
+        let _ = spambayes_config::IniFile::write(&profile_ini_path, &existing_data);
     });
 }
 
-/// Timer callback for deferred spam auto-cleanup (fires once after startup).
+/// Timer callback for deferred spam auto-cleanup (recurring every 4 hours).
 ///
 /// Runs `cleanup_old_spam` on the configured spam folder to delete messages
-/// exceeding the retention period. Self-kills immediately (one-shot).
+/// exceeding the retention period. Re-schedules itself for the next 4-hour
+/// interval after each successful run.
 ///
-/// **Validates: Requirement 18.1**
+/// **Validates: Requirement 18.1, 2.4**
 unsafe extern "system" fn cleanup_timer_proc(
     _hwnd: windows::Win32::Foundation::HWND,
     _msg: u32,
     _id_event: usize,
     _dw_time: u32,
 ) {
-    use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
     use windows::Win32::Foundation::HWND;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Kill this timer immediately — it's a one-shot.
+    // Kill current timer — will re-schedule at end.
     KillTimer(HWND::default(), CLEANUP_TIMER_ID).ok();
+
+    // Track last run time for the config-reload guard
+    CLEANUP_LAST_RUN.store(
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let addin = GLOBAL_ADDIN_PTR;
     if addin.is_null() {
@@ -640,6 +667,10 @@ unsafe extern "system" fn cleanup_timer_proc(
             addin.log_error(&format!("cleanup_timer_proc: cleanup FAILED: {:?}", e));
         }
     }
+
+    // Re-schedule for next run in 4 hours (14_400_000 ms)
+    SetTimer(HWND::default(), CLEANUP_TIMER_ID, 4 * 60 * 60 * 1000, Some(cleanup_timer_proc));
+    addin.log_info("cleanup_timer_proc: re-scheduled for next run in 4 hours");
 }
 
 /// Timer callback for the sync-completion timeout fallback.
@@ -3442,16 +3473,26 @@ impl AddinCore {
         // cleanup timer now. This handles the case where the user enables cleanup
         // after Outlook has already started (the startup-time check missed it).
         // Only schedules if BOTH the master filter is enabled AND cleanup is enabled.
+        // Guard: only schedule if cleanup hasn't run within the last hour to prevent
+        // rapid re-fires on repeated config saves.
         if new_config.filter.enabled && new_config.filter.spam_auto_cleanup_enabled {
-            unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::SetTimer;
-                use windows::Win32::Foundation::HWND;
-                SetTimer(HWND::default(), CLEANUP_TIMER_ID, 5_000, Some(cleanup_timer_proc));
+            let last_run = CLEANUP_LAST_RUN.load(std::sync::atomic::Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            if now - last_run > 3600 {
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                    use windows::Win32::Foundation::HWND;
+                    SetTimer(HWND::default(), CLEANUP_TIMER_ID, 5_000, Some(cleanup_timer_proc));
+                }
+                self.log_info(&format!(
+                    "reload_config_from_disk: scheduling cleanup timer (retention={} days)",
+                    new_config.filter.spam_auto_cleanup_days
+                ));
+            } else {
+                self.log_info("reload_config_from_disk: cleanup skipped (ran recently)");
             }
-            self.log_info(&format!(
-                "reload_config_from_disk: scheduling cleanup timer (retention={} days)",
-                new_config.filter.spam_auto_cleanup_days
-            ));
         }
 
         self.log_info(&format!(

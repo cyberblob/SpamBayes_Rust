@@ -43,3 +43,4 @@ crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+proptest = { workspace = true }
