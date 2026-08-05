@@ -9,6 +9,7 @@
 
 use std::f64::consts::PI;
 use std::path::Path;
+use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -18,6 +19,7 @@ use gtk4::{
 
 use spambayes_config::AppConfig;
 
+use crate::gui::filter_now_dialog::FilterNowDialog;
 use crate::gui::folder_browser::{FolderBrowserDialog, FolderProvider};
 use crate::gui::wizard_window::WizardWindow;
 use crate::manager_dlg::{ManagerState, ManagerStats};
@@ -96,6 +98,9 @@ pub struct GeneralTab {
     #[allow(dead_code)]
     config: AppConfig,
 
+    /// Folder provider for launching the Filter Now dialog.
+    folder_provider: Rc<dyn FolderProvider>,
+
     // ─── Dynamic labels ──────────────────────────────────────────────────
     /// "Database has X good and Y spam." label.
     db_status_label: Label,
@@ -140,11 +145,11 @@ impl GeneralTab {
     /// * `state` – Current manager state (filter enabled, folder IDs, etc.)
     /// * `stats` – Classifier statistics (ham/spam trained counts)
     /// * `config` – Application configuration (used for launching the wizard)
-    /// * `folder_provider` – Provider for resolving folder IDs to display names
+    /// * `folder_provider` – Provider for resolving folder IDs to display names and for Filter Now dialog
     ///
     /// **Validates: Requirements 1.2–1.8**
     #[must_use]
-    pub fn new(state: &ManagerState, stats: &ManagerStats, config: &AppConfig, folder_provider: &dyn FolderProvider) -> Self {
+    pub fn new(state: &ManagerState, stats: &ManagerStats, config: &AppConfig, folder_provider: Rc<dyn FolderProvider>) -> Self {
         // ─── Main vertical layout ────────────────────────────────────────
         let content_box = GtkBox::new(Orientation::Vertical, 12);
         content_box.set_margin_top(16);
@@ -233,16 +238,16 @@ impl GeneralTab {
         filter_box.append(&status_row);
 
         // Folder name labels
-        let watched_folder_label = Label::new(Some(&Self::format_watched_folders(state, folder_provider)));
+        let watched_folder_label = Label::new(Some(&Self::format_watched_folders(state, folder_provider.as_ref())));
         watched_folder_label.set_halign(Align::Start);
         watched_folder_label.set_wrap(true);
         filter_box.append(&watched_folder_label);
 
-        let spam_folder_label = Label::new(Some(&Self::format_spam_folder(state, folder_provider)));
+        let spam_folder_label = Label::new(Some(&Self::format_spam_folder(state, folder_provider.as_ref())));
         spam_folder_label.set_halign(Align::Start);
         filter_box.append(&spam_folder_label);
 
-        let unsure_folder_label = Label::new(Some(&Self::format_unsure_folder(state, folder_provider)));
+        let unsure_folder_label = Label::new(Some(&Self::format_unsure_folder(state, folder_provider.as_ref())));
         unsure_folder_label.set_halign(Align::Start);
         filter_box.append(&unsure_folder_label);
 
@@ -310,9 +315,15 @@ impl GeneralTab {
         button_row.append(&wizard_btn);
         content_box.append(&button_row);
 
-        // ─── Wire button signals (placeholder logging) ───────────────────
-        run_filter_btn.connect_clicked(|_btn| {
-            log::info!("Run Filter Now clicked (TODO: implement in task 10.x)");
+        // ─── Wire button signals ─────────────────────────────────────────
+        run_filter_btn.connect_clicked({
+            let config = config.clone();
+            let provider = Rc::clone(&folder_provider);
+            move |_btn| {
+                log::info!("Run Filter Now clicked — launching FilterNowDialog");
+                let dialog = FilterNowDialog::new(&config, Rc::clone(&provider));
+                dialog.present();
+            }
         });
 
         reset_config_btn.connect_clicked(|_btn| {
@@ -356,6 +367,7 @@ impl GeneralTab {
         Self {
             container,
             config: config.clone(),
+            folder_provider,
             db_status_label,
             imbalance_label,
             filter_status_label,

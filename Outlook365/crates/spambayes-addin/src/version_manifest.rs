@@ -294,7 +294,7 @@ mod tests {
         }"#;
 
         let manifest = VersionManifest::from_json(json).unwrap();
-        assert_eq!(manifest.version, "0.3.0-alpha.2");
+        assert_eq!(manifest.version, "0.3.0-alpha.5");
         assert_eq!(manifest.build_number, 1752500000);
         assert_eq!(manifest.release_date, "2026-07-14");
         assert!(!manifest.download_url.is_empty());
@@ -308,7 +308,7 @@ mod tests {
         // Only required fields.
         let json = r#"{"version": "0.3.0-alpha.5", "build_number": 12345}"#;
         let manifest = VersionManifest::from_json(json).unwrap();
-        assert_eq!(manifest.version, "1.0.0");
+        assert_eq!(manifest.version, "0.3.0-alpha.5");
         assert_eq!(manifest.build_number, 12345);
         assert!(manifest.download_url.is_empty());
         assert!(manifest.installer_url.is_empty());

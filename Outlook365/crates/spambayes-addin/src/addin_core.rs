@@ -236,10 +236,14 @@ unsafe extern "system" fn button_poll_timer_proc(
             AddinCore::launch_manager();
         }
         "SpamBayesCommand.DeleteAsSpam" => {
-            // TODO: handle spam button
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                AddinCore::train_selected_as_spam();
+            }));
         }
         "SpamBayesCommand.RecoverFromSpam" => {
-            // TODO: handle not-spam button
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                AddinCore::train_selected_as_ham();
+            }));
         }
         _ => {}
     }

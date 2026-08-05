@@ -41,9 +41,11 @@ use crate::tooltip_manager::TooltipManager;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EndDialog, MessageBoxW, SetDlgItemTextW, MB_ICONERROR, MB_OK, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_INITDIALOG,
+    EndDialog, GetDlgItem, GetWindowLongPtrW, MessageBoxW, SetDlgItemTextW,
+    SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, MB_ICONERROR, MB_OK, SW_HIDE, SW_SHOW,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_INITDIALOG,
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -644,26 +646,27 @@ impl ConfigWizard {
     ) -> isize {
         match msg {
             WM_INITDIALOG => {
-                // Store the wizard pointer in the dialog's user data.
-                // In a real implementation we'd use SetWindowLongPtrW.
+                // Store the wizard pointer in window user data for later retrieval.
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, _lparam.0);
 
                 // Create tooltip manager and register wizard tooltips.
                 let instance = GetModuleHandleW(None).unwrap_or_default();
                 let tooltip_mgr = TooltipManager::new(hwnd, instance.into());
                 tooltip_mgr.register_tooltips(hwnd, WIZARD_TOOLTIPS);
 
-                // Store the tooltip manager on the ConfigWizard instance.
-                // In a full implementation, retrieve the wizard pointer from
-                // lparam (passed via CreateDialogParamW) and store the manager:
-                // let wizard = &mut *(_lparam.0 as *mut ConfigWizard);
-                // wizard.tooltip_manager = Some(tooltip_mgr);
-                //
-                // For now, the tooltip_mgr lives until the dialog closes
-                // because the ConfigWizard owns it via the struct field.
+                // Store tooltip manager on the ConfigWizard instance.
                 let wizard_ptr = _lparam.0 as *mut ConfigWizard;
                 if !wizard_ptr.is_null() {
+                    (*wizard_ptr).hwnd = hwnd;
                     (*wizard_ptr).tooltip_manager = Some(tooltip_mgr);
                 }
+
+                // Set initial button states: Back disabled on Welcome page,
+                // Finish hidden until last page, Next visible.
+                Self::update_button_states(hwnd, WizardPage::Welcome);
+
+                // Set initial page help text.
+                Self::update_page_help_text(hwnd, WizardPage::Welcome);
 
                 1 // Return TRUE to accept default focus
             }
@@ -671,11 +674,31 @@ impl ConfigWizard {
                 let control_id = (wparam.0 & 0xFFFF) as u16;
                 match control_id {
                     IDC_BACK => {
-                        // Navigate to previous page
+                        // Navigate to previous page.
+                        let wizard_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+                            as *mut ConfigWizard;
+                        if !wizard_ptr.is_null() {
+                            let wizard = &mut *wizard_ptr;
+                            if wizard.state.go_back() {
+                                let page = wizard.state.current_page();
+                                Self::update_page_help_text(hwnd, page);
+                                Self::update_button_states(hwnd, page);
+                            }
+                        }
                         0
                     }
                     IDC_NEXT => {
-                        // Navigate to next page
+                        // Navigate to next page.
+                        let wizard_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+                            as *mut ConfigWizard;
+                        if !wizard_ptr.is_null() {
+                            let wizard = &mut *wizard_ptr;
+                            if wizard.state.advance() {
+                                let page = wizard.state.current_page();
+                                Self::update_page_help_text(hwnd, page);
+                                Self::update_button_states(hwnd, page);
+                            }
+                        }
                         0
                     }
                     IDC_CANCEL => {
@@ -693,10 +716,8 @@ impl ConfigWizard {
             }
             WM_DESTROY => {
                 // Destroy tooltip manager to clean up the tooltip control window.
-                let wizard_ptr = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-                ) as *mut ConfigWizard;
+                let wizard_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+                    as *mut ConfigWizard;
                 if !wizard_ptr.is_null() {
                     if let Some(ref tooltip_mgr) = (*wizard_ptr).tooltip_manager {
                         tooltip_mgr.destroy();
@@ -712,10 +733,8 @@ impl ConfigWizard {
             WM_HELP => {
                 // Show page-specific help for the current wizard step.
                 // Retrieve the wizard pointer from user data to get the current page.
-                let wizard_ptr = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
-                ) as *const ConfigWizard;
+                let wizard_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+                    as *const ConfigWizard;
                 if !wizard_ptr.is_null() {
                     let entry = Self::help_entry_for_page((*wizard_ptr).state.current_page);
                     show_help(hwnd, entry);
@@ -770,9 +789,6 @@ impl ConfigWizard {
     /// # Safety
     ///
     /// Caller must ensure `hwnd` is a valid dialog window handle.
-    // TODO: Call this function from the page transition logic (IDC_NEXT / IDC_BACK
-    // handlers) once the full wizard dialog implementation is in place.
-    #[allow(dead_code)]
     unsafe fn update_page_help_text(hwnd: HWND, page: WizardPage) {
         let entry = Self::help_entry_for_page(page);
         let wide: Vec<u16> = entry
@@ -785,6 +801,38 @@ impl ConfigWizard {
             i32::from(IDC_WIZARD_PAGE_DESCRIPTION),
             PCWSTR::from_raw(wide.as_ptr()),
         );
+    }
+
+    /// Update wizard navigation button states based on the current page.
+    ///
+    /// - **Back** is disabled on the Welcome page (no previous page).
+    /// - **Next** is hidden on the Finish page (replaced by Finish button).
+    /// - **Finish** is shown only on the Finish page.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `hwnd` is a valid dialog window handle.
+    unsafe fn update_button_states(hwnd: HWND, page: WizardPage) {
+        let back_hwnd = GetDlgItem(hwnd, i32::from(IDC_BACK));
+        let next_hwnd = GetDlgItem(hwnd, i32::from(IDC_NEXT));
+        let finish_hwnd = GetDlgItem(hwnd, i32::from(IDC_FINISH));
+
+        // Back button: disabled on Welcome (first page), enabled otherwise.
+        if let Ok(h) = back_hwnd {
+            let _ = EnableWindow(h, page != WizardPage::Welcome);
+        }
+
+        // Next button: hidden on Finish page, visible on all others.
+        if let Ok(h) = next_hwnd {
+            let show = if page == WizardPage::Finish { SW_HIDE } else { SW_SHOW };
+            let _ = ShowWindow(h, show);
+        }
+
+        // Finish button: visible only on Finish page, hidden otherwise.
+        if let Ok(h) = finish_hwnd {
+            let show = if page == WizardPage::Finish { SW_SHOW } else { SW_HIDE };
+            let _ = ShowWindow(h, show);
+        }
     }
 }
 

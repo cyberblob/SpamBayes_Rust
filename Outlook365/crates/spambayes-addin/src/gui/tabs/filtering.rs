@@ -20,7 +20,7 @@ use gtk4::glib;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use spambayes_config::{FilterAction, FolderId};
+use spambayes_config::{AppConfig, FilterAction, FolderId};
 
 use crate::gui::folder_browser::{FolderBrowserDialog, FolderProvider, SelectionMode};
 use crate::help_content::errors;
@@ -123,11 +123,12 @@ impl FilteringTab {
     /// # Arguments
     ///
     /// * `state` – Current manager state (thresholds, actions, folder IDs)
+    /// * `config` – Application config (used for mark-as-read initial state)
     /// * `folder_provider` – Provider for folder hierarchy data (used by browse buttons)
     ///
     /// **Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.8**
     #[must_use]
-    pub fn new(state: &ManagerState, folder_provider: Rc<dyn FolderProvider>) -> Self {
+    pub fn new(state: &ManagerState, config: &AppConfig, folder_provider: Rc<dyn FolderProvider>) -> Self {
         // ─── Main vertical layout ────────────────────────────────────────
         let content_box = GtkBox::new(Orientation::Vertical, 12);
         content_box.set_margin_top(16);
@@ -270,10 +271,9 @@ impl FilteringTab {
             spam_folder_browse_clone.set_sensitive(sensitive);
         });
 
-        // Mark as read checkbox
-        // TODO: Wire to config when ManagerState is extended with spam_mark_as_read
+        // Mark as read checkbox — initialized from config
         let spam_mark_read = CheckButton::with_label("Mark spam as read");
-        spam_mark_read.set_active(false); // Default: not marked as read
+        spam_mark_read.set_active(config.filter.spam_mark_as_read);
         spam_mark_read.set_tooltip_text(Some(
             "Automatically mark messages classified as spam as read."
         ));
@@ -381,10 +381,9 @@ impl FilteringTab {
             unsure_folder_browse_clone.set_sensitive(sensitive);
         });
 
-        // Mark as read checkbox
-        // TODO: Wire to config when ManagerState is extended with unsure_mark_as_read
+        // Mark as read checkbox — initialized from config
         let unsure_mark_read = CheckButton::with_label("Mark possible spam as read");
-        unsure_mark_read.set_active(false); // Default: not marked as read
+        unsure_mark_read.set_active(config.filter.unsure_mark_as_read);
         unsure_mark_read.set_tooltip_text(Some(
             "Automatically mark messages classified as unsure as read."
         ));
@@ -458,10 +457,9 @@ impl FilteringTab {
             ham_folder_browse_clone.set_sensitive(sensitive);
         });
 
-        // Mark as read checkbox
-        // TODO: Wire to config when ManagerState is extended with ham_mark_as_read
+        // Mark as read checkbox — initialized from config
         let ham_mark_read = CheckButton::with_label("Mark good messages as read");
-        ham_mark_read.set_active(false); // Default: not marked as read
+        ham_mark_read.set_active(config.filter.ham_mark_as_read);
         ham_mark_read.set_tooltip_text(Some(
             "Automatically mark messages classified as good (ham) as read."
         ));
@@ -478,7 +476,6 @@ impl FilteringTab {
         cleanup_box.set_margin_start(12);
         cleanup_box.set_margin_end(12);
 
-        // TODO: Wire to config when ManagerState is extended with spam_auto_cleanup fields
         let cleanup_enabled = CheckButton::with_label(
             "Automatically delete spam messages older than:",
         );

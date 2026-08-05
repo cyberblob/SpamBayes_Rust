@@ -220,8 +220,8 @@ impl ManagerWindow {
         };
 
         // ─── Build all tabs ──────────────────────────────────────────────
-        let general = GeneralTab::new(state, stats, config, folder_provider.as_ref());
-        let filtering = FilteringTab::new(state, Rc::clone(&folder_provider));
+        let general = GeneralTab::new(state, stats, config, Rc::clone(&folder_provider));
+        let filtering = FilteringTab::new(state, config, Rc::clone(&folder_provider));
         let training = TrainingTab::new(state, config, Rc::clone(&folder_provider));
         let statistics = StatisticsTab::new(stats, statistics_manager);
         let notifications = NotificationsTab::new(&config.notification);

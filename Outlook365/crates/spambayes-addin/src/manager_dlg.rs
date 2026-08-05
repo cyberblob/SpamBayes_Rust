@@ -1,184 +1,19 @@
-//! `SpamBayes` Manager Dialog.
+//! `SpamBayes` Manager — shared state types.
 //!
-//! Implements the Manager dialog accessible from the `SpamBayes` toolbar or
-//! Outlook Tools menu. Provides classifier statistics display, filter
-//! settings adjustment, folder selection, and training/filter-now operations.
+//! Provides the data model used by the GTK4 Manager window: classifier
+//! statistics, editable filter/folder state, and formatting helpers.
 //!
 //! # Requirements
 //!
-//! - Req 14.1: Accessible from toolbar or Tools menu
 //! - Req 14.2: Display classifier statistics
 //! - Req 14.3: Allow changing filter settings (thresholds, actions)
-//! - Req 14.4: Initiate training and Filter Now with progress
 //! - Req 14.5: Enable/disable filtering via checkbox
 //! - Req 14.6: Select folders via MAPI folder picker
 //! - Req 14.7: Save changed settings on dialog close
 
-#![cfg(target_os = "windows")]
+use spambayes_config::{AppConfig, FilterAction, FolderId};
 
-use spambayes_config::{AppConfig, ConfigChain, FilterAction, FolderId};
-
-use crate::help_content::errors;
-use crate::help_content::sections;
-use crate::help_content::tooltips::MANAGER_TOOLTIPS;
-use crate::help_dialog::{help_section_for_control, show_help, show_help_for_control};
 use crate::statistics::StatisticsManager;
-use crate::tooltip_manager::TooltipManager;
-
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, FF_SWISS, HFONT,
-    OUT_DEFAULT_PRECIS,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    EndDialog, GetDlgCtrlID, GetDlgItem, GetWindowLongPtrW, KillTimer, MessageBoxW,
-    SendMessageW, SetDlgItemTextW, SetTimer, SetWindowLongPtrW, GWLP_USERDATA, IDYES,
-    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_INITDIALOG, WM_SETFONT, WM_TIMER,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
-
-// ─── WM_HELP Support ─────────────────────────────────────────────────────────
-
-/// WM_HELP message constant (0x0053).
-///
-/// Sent when the user presses F1 while a control has focus. The LPARAM
-/// points to a `HELPINFO` structure identifying the control.
-///
-/// **Validates: Requirement 3.2**
-const WM_HELP: u32 = 0x0053;
-
-/// HELPINFO structure received via WM_HELP's LPARAM.
-///
-/// Contains context about which control the user requested help for.
-/// We only use `iCtrlId` to look up the appropriate help section.
-#[repr(C)]
-#[allow(non_snake_case, dead_code)]
-struct HELPINFO {
-    cbSize: u32,
-    iContextType: i32,
-    iCtrlId: i32,
-    hItemHandle: HWND,
-    dwContextId: u32,
-    MousePos: POINT,
-}
-
-// ─── Dialog Control ID Constants ─────────────────────────────────────────────
-
-/// Dialog resource ID for the Manager dialog.
-#[allow(dead_code)]
-const IDD_MANAGER: u32 = 3000;
-
-// Statistics display controls — Training Statistics section (Req 3.1)
-#[allow(dead_code)]
-const IDC_STAT_HAM_TRAINED: u16 = 3001;
-#[allow(dead_code)]
-const IDC_STAT_SPAM_TRAINED: u16 = 3002;
-#[allow(dead_code)]
-const IDC_STAT_SESSION_CLASSIFIED: u16 = 3003;
-
-// Statistics display controls — Session Activity section (Req 3.2)
-#[allow(dead_code)]
-const IDC_STAT_SESSION_HAM: u16 = 3004;
-#[allow(dead_code)]
-const IDC_STAT_SESSION_UNSURE: u16 = 3005;
-#[allow(dead_code)]
-const IDC_STAT_SESSION_SPAM: u16 = 3006;
-
-// Statistics display controls — Lifetime Classification section (Req 3.3)
-#[allow(dead_code)]
-const IDC_STAT_LIFETIME_HAM_CLASSIFIED: u16 = 3007;
-#[allow(dead_code)]
-const IDC_STAT_LIFETIME_UNSURE_CLASSIFIED: u16 = 3008;
-#[allow(dead_code)]
-const IDC_STAT_LIFETIME_SPAM_CLASSIFIED: u16 = 3009;
-
-// Filter settings controls
-#[allow(dead_code)]
-const IDC_SPAM_THRESHOLD: u16 = 3010;
-#[allow(dead_code)]
-const IDC_UNSURE_THRESHOLD: u16 = 3011;
-#[allow(dead_code)]
-const IDC_SPAM_ACTION: u16 = 3012;
-#[allow(dead_code)]
-const IDC_UNSURE_ACTION: u16 = 3013;
-#[allow(dead_code)]
-const IDC_HAM_ACTION: u16 = 3014;
-#[allow(dead_code)]
-const IDC_ENABLE_FILTERING: u16 = 3015;
-
-// Folder selection controls
-#[allow(dead_code)]
-const IDC_WATCH_FOLDERS: u16 = 3020;
-#[allow(dead_code)]
-const IDC_SPAM_FOLDER: u16 = 3021;
-#[allow(dead_code)]
-const IDC_UNSURE_FOLDER: u16 = 3022;
-#[allow(dead_code)]
-const IDC_HAM_TRAIN_FOLDERS: u16 = 3023;
-#[allow(dead_code)]
-const IDC_SPAM_TRAIN_FOLDERS: u16 = 3024;
-
-// Browse buttons for folder pickers
-#[allow(dead_code)]
-const IDC_BROWSE_WATCH: u16 = 3030;
-#[allow(dead_code)]
-const IDC_BROWSE_SPAM_FOLDER: u16 = 3031;
-#[allow(dead_code)]
-const IDC_BROWSE_UNSURE_FOLDER: u16 = 3032;
-#[allow(dead_code)]
-const IDC_BROWSE_HAM_TRAIN: u16 = 3033;
-#[allow(dead_code)]
-const IDC_BROWSE_SPAM_TRAIN: u16 = 3034;
-
-// Action buttons
-#[allow(dead_code)]
-const IDC_TRAIN_NOW: u16 = 3040;
-#[allow(dead_code)]
-const IDC_FILTER_NOW: u16 = 3041;
-#[allow(dead_code)]
-const IDC_OK: u16 = 3042;
-#[allow(dead_code)]
-const IDC_CANCEL: u16 = 3043;
-#[allow(dead_code)]
-const IDC_RESET_STATS: u16 = 3044;
-/// Help button — shows context-sensitive help for the focused control/section.
-///
-/// **Validates: Requirement 3.1**
-#[allow(dead_code)]
-const IDC_HELP_BUTTON: u16 = 3045;
-
-// ─── Inline Help Label Control IDs ───────────────────────────────────────────
-//
-// Static text controls that display always-visible section descriptions
-// within the Manager dialog. Content is populated from `help_content::sections`
-// during WM_INITDIALOG.
-//
-// **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
-
-/// Inline help label for the Filter Settings section.
-#[allow(dead_code)]
-const IDC_HELP_LABEL_FILTER: u16 = 3070;
-/// Inline help label for the Folder Configuration section.
-#[allow(dead_code)]
-const IDC_HELP_LABEL_FOLDERS: u16 = 3071;
-/// Inline help label for the Training section.
-#[allow(dead_code)]
-const IDC_HELP_LABEL_TRAINING: u16 = 3072;
-/// Inline help label for the Notification section.
-#[allow(dead_code)]
-const IDC_HELP_LABEL_NOTIFICATION: u16 = 3073;
-/// Inline help label for the Cleanup section.
-#[allow(dead_code)]
-const IDC_HELP_LABEL_CLEANUP: u16 = 3074;
-
-// Timer constants for real-time statistics refresh (Req 3.4)
-/// Timer ID for periodic statistics refresh while the Manager dialog is open.
-const IDC_STATS_TIMER: usize = 3100;
-/// Refresh interval in milliseconds for the statistics timer (2 seconds).
-const STATS_REFRESH_MS: u32 = 2000;
 
 // ─── ManagerStats ────────────────────────────────────────────────────────────
 
@@ -619,703 +454,13 @@ impl ManagerState {
     }
 }
 
-// ─── ManagerDialog ───────────────────────────────────────────────────────────
-
-/// The Manager dialog controller.
-///
-/// Manages the Win32 dialog lifecycle, displays classifier statistics,
-/// and coordinates settings changes, training, and Filter Now operations.
-///
-/// **Validates: Requirements 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7**
-pub struct ManagerDialog {
-    /// The working copy of editable settings.
-    state: ManagerState,
-    /// Classifier statistics for display.
-    stats: ManagerStats,
-    /// Dialog handle (set when the dialog is created).
-    #[allow(dead_code)]
-    hwnd: HWND,
-    /// Optional statistics manager for reset operations.
-    ///
-    /// **Validates: Requirement 3.5**
-    statistics_manager: Option<StatisticsManager>,
-    /// Tooltip manager for hover help on dialog controls.
-    ///
-    /// Created during WM_INITDIALOG and destroyed on WM_DESTROY.
-    ///
-    /// **Validates: Requirements 1.1, 1.4**
-    tooltip_manager: Option<TooltipManager>,
-}
-
-impl ManagerDialog {
-    /// Create a new Manager dialog instance from current config and stats.
-    ///
-    /// If a `StatisticsManager` is provided, the Reset Statistics button
-    /// will be functional.
-    ///
-    /// **Validates: Requirements 14.1, 3.5**
-    #[must_use]
-    pub fn new(
-        config: &AppConfig,
-        stats: ManagerStats,
-        statistics_manager: Option<StatisticsManager>,
-    ) -> Self {
-        Self {
-            state: ManagerState::from_config(config),
-            stats,
-            hwnd: HWND::default(),
-            statistics_manager,
-            tooltip_manager: None,
-        }
-    }
-
-    /// Launch the Manager dialog as a modal dialog.
-    ///
-    /// Creates the Win32 dialog and enters a message loop until the user
-    /// closes the dialog. Returns `true` if the user closed with OK
-    /// (settings should be saved) or `false` if cancelled.
-    ///
-    /// **Validates: Requirement 14.1**
-    pub fn launch(&mut self, _hwnd_parent: HWND) -> bool {
-        // In a full implementation, this would create the Win32 dialog:
-        // unsafe {
-        //     let hinst = GetModuleHandleW(None).unwrap_or_default();
-        //     self.hwnd = CreateDialogParamW(
-        //         hinst,
-        //         PCWSTR::from_raw(IDD_MANAGER as *const u16),
-        //         hwnd_parent,
-        //         Some(Self::dialog_proc),
-        //         LPARAM(self as *mut _ as isize),
-        //     );
-        // }
-        //
-        // The message loop would run here and return true/false based on
-        // how the dialog was closed. This placeholder returns false until
-        // the dialog resources are integrated.
-        false
-    }
-
-    /// Apply changed settings to the config chain and save to disk.
-    ///
-    /// Called when the user closes the dialog with OK. If settings have
-    /// been modified, applies them to the `ConfigChain`'s config and
-    /// performs a sparse save to the profile-specific INI file.
-    ///
-    /// Returns `true` if settings were saved, `false` if nothing changed.
-    ///
-    /// **Validates: Requirements 2.1, 2.2, 14.7**
-    pub fn apply_changes(
-        &self,
-        config_chain: &mut ConfigChain,
-    ) -> bool {
-        if !self.state.is_dirty() {
-            return false;
-        }
-
-        self.state.apply_to_config(config_chain.config_mut());
-        let _ = config_chain.save();
-        true
-    }
-
-    /// Handle a "Train" button click.
-    ///
-    /// Signals that the caller should initiate a training operation with
-    /// a progress dialog. The caller provides a progress callback.
-    ///
-    /// **Validates: Requirement 14.4**
-    #[must_use]
-    pub fn show_train_progress(&self) -> TrainRequest {
-        TrainRequest {
-            ham_folder_ids: self.state.ham_training_folder_ids.clone(),
-            spam_folder_ids: self.state.spam_training_folder_ids.clone(),
-        }
-    }
-
-    /// Handle a "Filter Now" button click.
-    ///
-    /// Signals that the caller should initiate a Filter Now operation
-    /// with a progress dialog. The caller provides a progress callback.
-    ///
-    /// **Validates: Requirement 14.4**
-    #[must_use]
-    pub fn show_filter_now_progress(&self) -> FilterNowRequest {
-        FilterNowRequest {
-            folder_ids: self.state.watch_folder_ids.clone(),
-        }
-    }
-
-    /// Handle a folder selection event from the MAPI folder picker.
-    ///
-    /// Updates the appropriate folder setting based on which browse button
-    /// was clicked.
-    ///
-    /// **Validates: Requirement 14.6**
-    pub fn on_folder_select(&mut self, target: FolderTarget, folder_ids: Vec<FolderId>) {
-        match target {
-            FolderTarget::Watch => {
-                self.state.set_watch_folders(folder_ids);
-            }
-            FolderTarget::Spam => {
-                self.state.set_spam_folder(folder_ids.into_iter().next());
-            }
-            FolderTarget::Unsure => {
-                self.state.set_unsure_folder(folder_ids.into_iter().next());
-            }
-            FolderTarget::HamTraining => {
-                self.state.set_ham_training_folders(folder_ids);
-            }
-            FolderTarget::SpamTraining => {
-                self.state.set_spam_training_folders(folder_ids);
-            }
-        }
-    }
-
-    /// Returns a reference to the current dialog state.
-    #[must_use]
-    pub fn state(&self) -> &ManagerState {
-        &self.state
-    }
-
-    /// Returns a mutable reference to the dialog state.
-    pub fn state_mut(&mut self) -> &mut ManagerState {
-        &mut self.state
-    }
-
-    /// Returns the current classifier statistics.
-    #[must_use]
-    pub fn stats(&self) -> &ManagerStats {
-        &self.stats
-    }
-
-    /// Update the statistics display (e.g., after training completes).
-    pub fn update_stats(&mut self, stats: ManagerStats) {
-        self.stats = stats;
-    }
-
-    /// Reset lifetime statistics after user confirmation.
-    ///
-    /// Shows a confirmation `MessageBox`. If the user confirms, calls
-    /// `reset_lifetime()` on the stored `StatisticsManager` and refreshes
-    /// the in-memory stats snapshot. If no `StatisticsManager` is available
-    /// or the user cancels, this is a no-op.
-    ///
-    /// Returns `true` if the reset was performed.
-    ///
-    /// **Validates: Requirement 3.5**
-    pub fn reset_statistics(&mut self) -> bool {
-        let stats_mgr = match &self.statistics_manager {
-            Some(mgr) => mgr.clone(),
-            None => return false,
-        };
-
-        // Show confirmation dialog.
-        let confirmed = unsafe {
-            let msg = "Reset all lifetime statistics?";
-            let title = "SpamBayes Manager";
-            let wide_msg: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-            let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-
-            let result = MessageBoxW(
-                self.hwnd,
-                PCWSTR::from_raw(wide_msg.as_ptr()),
-                PCWSTR::from_raw(wide_title.as_ptr()),
-                MB_YESNO | MB_ICONQUESTION,
-            );
-            result == IDYES
-        };
-
-        if confirmed {
-            stats_mgr.reset_lifetime();
-            self.stats = ManagerStats::from_statistics(&stats_mgr);
-
-            // Refresh dialog labels if the dialog is currently visible.
-            if self.hwnd != HWND::default() {
-                unsafe {
-                    Self::populate_stats_controls(self.hwnd, &self.stats);
-                }
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Returns a reference to the stored `StatisticsManager`, if any.
-    #[must_use]
-    pub fn statistics_manager(&self) -> Option<&StatisticsManager> {
-        self.statistics_manager.as_ref()
-    }
-
-    /// Win32 dialog procedure callback for the Manager dialog.
-    ///
-    /// Handles dialog messages: initialization, button clicks, threshold
-    /// edits, checkbox toggles, and close actions.
-    ///
-    /// # Safety
-    ///
-    /// Called by the Windows message dispatcher. The `lparam` on
-    /// `WM_INITDIALOG` carries a pointer to the `ManagerDialog` instance.
-    #[allow(dead_code)]
-    unsafe extern "system" fn dialog_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> isize {
-        match msg {
-            WM_INITDIALOG => {
-                // Store the dialog pointer in window user data for later retrieval.
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, lparam.0);
-                // Populate controls from state and stats.
-                let dialog = &mut *(lparam.0 as *mut ManagerDialog);
-                Self::populate_stats_controls(hwnd, &dialog.stats);
-
-                // Create tooltip manager and register tooltips for all controls.
-                // **Validates: Requirements 1.1, 1.4**
-                let instance = GetModuleHandleW(None).unwrap_or_default();
-                let tm = TooltipManager::new(hwnd, instance.into());
-                tm.register_tooltips(hwnd, MANAGER_TOOLTIPS);
-                dialog.tooltip_manager = Some(tm);
-
-                // Populate and style inline help labels from help_content.
-                // **Validates: Requirements 2.1, 2.3, 2.4**
-                Self::populate_inline_help_labels(hwnd);
-                Self::style_inline_help_labels(hwnd);
-
-                // Start a periodic timer to refresh statistics while the dialog
-                // is open (Req 3.4: real-time update).
-                SetTimer(hwnd, IDC_STATS_TIMER, STATS_REFRESH_MS, None);
-                1 // Return TRUE to accept default focus
-            }
-            WM_COMMAND => {
-                let control_id = (wparam.0 & 0xFFFF) as u16;
-                match control_id {
-                    IDC_OK => {
-                        // Validate settings before accepting. If validation fails,
-                        // show an actionable error and keep the dialog open.
-                        // **Validates: Requirements 5.1, 5.2, 5.3**
-                        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-                        if ptr != 0 {
-                            let dialog = &*(ptr as *const ManagerDialog);
-                            if dialog.validate_settings(hwnd).is_err() {
-                                return 0;
-                            }
-                        }
-                        let _ = EndDialog(hwnd, 1);
-                        0
-                    }
-                    IDC_CANCEL => {
-                        let _ = EndDialog(hwnd, 0);
-                        0
-                    }
-                    IDC_TRAIN_NOW => {
-                        // Signal training request to caller
-                        0
-                    }
-                    IDC_FILTER_NOW => {
-                        // Signal filter now request to caller
-                        0
-                    }
-                    IDC_RESET_STATS => {
-                        // Show confirmation dialog before resetting lifetime statistics.
-                        // **Validates: Requirement 3.5**
-                        let msg = "Reset all lifetime statistics?";
-                        let title = "SpamBayes Manager";
-                        let wide_msg: Vec<u16> =
-                            msg.encode_utf16().chain(std::iter::once(0)).collect();
-                        let wide_title: Vec<u16> =
-                            title.encode_utf16().chain(std::iter::once(0)).collect();
-
-                        let result = MessageBoxW(
-                            hwnd,
-                            PCWSTR::from_raw(wide_msg.as_ptr()),
-                            PCWSTR::from_raw(wide_title.as_ptr()),
-                            MB_YESNO | MB_ICONQUESTION,
-                        );
-
-                        if result == IDYES {
-                            // Retrieve the dialog pointer from user data.
-                            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-                            if ptr != 0 {
-                                let dialog = &mut *(ptr as *mut ManagerDialog);
-                                if let Some(ref stats_mgr) = dialog.statistics_manager {
-                                    stats_mgr.reset_lifetime();
-                                    // Rebuild display stats from the reset manager.
-                                    dialog.stats = ManagerStats::from_statistics(stats_mgr);
-                                    Self::populate_stats_controls(hwnd, &dialog.stats);
-                                }
-                            }
-                        }
-                        0
-                    }
-                    IDC_BROWSE_WATCH
-                    | IDC_BROWSE_SPAM_FOLDER
-                    | IDC_BROWSE_UNSURE_FOLDER
-                    | IDC_BROWSE_HAM_TRAIN
-                    | IDC_BROWSE_SPAM_TRAIN => {
-                        // Open MAPI folder picker for the target
-                        0
-                    }
-                    IDC_ENABLE_FILTERING => {
-                        // Toggle filtering enabled state
-                        0
-                    }
-                    IDC_HELP_BUTTON => {
-                        // Show context-sensitive help based on the focused control.
-                        // **Validates: Requirement 3.1**
-                        let focused = GetFocus();
-                        let ctrl_id = if focused.is_invalid() || focused == hwnd {
-                            0u16
-                        } else {
-                            GetDlgCtrlID(focused) as u16
-                        };
-
-                        // Try to show help for the focused control; fall back to
-                        // general filter settings help if no mapping exists.
-                        if help_section_for_control(ctrl_id).is_some() {
-                            show_help_for_control(hwnd, ctrl_id);
-                        } else {
-                            show_help(hwnd, &crate::help_content::sections::FILTER_SETTINGS);
-                        }
-                        0
-                    }
-                    _ => 0,
-                }
-            }
-            WM_TIMER => {
-                // Periodic statistics refresh (Req 3.4).
-                // Retrieve the dialog pointer stored during WM_INITDIALOG.
-                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-                if ptr != 0 {
-                    let dialog = &mut *(ptr as *mut ManagerDialog);
-                    if let Some(ref stats_mgr) = dialog.statistics_manager {
-                        dialog.stats = ManagerStats::from_statistics(stats_mgr);
-                        Self::populate_stats_controls(hwnd, &dialog.stats);
-                    }
-                }
-                0
-            }
-            WM_HELP => {
-                // Context-sensitive help: F1 pressed while a control has focus.
-                // Extract the control ID from the HELPINFO structure and show
-                // the relevant help section.
-                // **Validates: Requirements 3.1, 3.2**
-                let help_info = &*(lparam.0 as *const HELPINFO);
-                let control_id = help_info.iCtrlId as u16;
-                show_help_for_control(hwnd, control_id);
-                1 // Return TRUE to indicate we handled it
-            }
-            WM_CLOSE => {
-                // Kill the statistics refresh timer before closing (Req 3.4).
-                let _ = KillTimer(hwnd, IDC_STATS_TIMER);
-                let _ = EndDialog(hwnd, 0);
-                0
-            }
-            WM_DESTROY => {
-                // Destroy the tooltip manager to clean up the tooltip window.
-                // **Validates: Requirements 1.1, 1.4**
-                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-                if ptr != 0 {
-                    let dialog = &mut *(ptr as *mut ManagerDialog);
-                    if let Some(ref tm) = dialog.tooltip_manager {
-                        tm.destroy();
-                    }
-                    dialog.tooltip_manager = None;
-                }
-                0
-            }
-            _ => 0,
-        }
-    }
-
-    /// Validate the current Manager dialog state before saving.
-    ///
-    /// Checks thresholds using guidance text from `help_content::errors`.
-    /// Returns `Ok(())` if valid, or shows a `MessageBox` with actionable
-    /// error guidance and returns `Err(())`.
-    ///
-    /// **Validates: Requirements 5.1, 5.2, 5.3**
-    #[allow(dead_code)]
-    fn validate_settings(&self, hwnd: HWND) -> Result<(), ()> {
-        // Validate thresholds
-        if !self.state.is_threshold_valid() {
-            Self::show_validation_error(hwnd, errors::THRESHOLD_INVALID);
-            return Err(());
-        }
-
-        Ok(())
-    }
-
-    /// Show a validation error `MessageBox` with guidance text from
-    /// `help_content::errors`.
-    ///
-    /// The message includes both what went wrong and what to do to fix it,
-    /// making the error actionable for the user.
-    ///
-    /// **Validates: Requirements 5.1, 5.2, 5.3**
-    #[allow(dead_code)]
-    fn show_validation_error(hwnd: HWND, message: &str) {
-        let title = "SpamBayes \u{2014} Validation Error";
-        let wide_msg: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
-        let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            MessageBoxW(
-                hwnd,
-                PCWSTR::from_raw(wide_msg.as_ptr()),
-                PCWSTR::from_raw(wide_title.as_ptr()),
-                MB_ICONERROR | MB_OK,
-            );
-        }
-    }
-
-    /// Show an error message in the Manager dialog context.
-    #[allow(dead_code)]
-    fn show_error(hwnd: HWND, message: &str) {
-        let wide_msg: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
-        let title = "SpamBayes Manager";
-        let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-
-        unsafe {
-            MessageBoxW(
-                hwnd,
-                PCWSTR::from_raw(wide_msg.as_ptr()),
-                PCWSTR::from_raw(wide_title.as_ptr()),
-                MB_OK | MB_ICONERROR,
-            );
-        }
-    }
-
-    /// Set the text of a dialog control using `SetDlgItemTextW`.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `hwnd` is a valid dialog window handle and
-    /// `control_id` refers to an existing control within the dialog.
-    #[allow(dead_code)]
-    unsafe fn set_control_text(hwnd: HWND, control_id: u16, text: &str) {
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let _ = SetDlgItemTextW(hwnd, i32::from(control_id), PCWSTR::from_raw(wide.as_ptr()));
-    }
-
-    /// Populate all statistics label controls from a `ManagerStats` snapshot.
-    ///
-    /// Called during `WM_INITDIALOG` and when stats are refreshed.
-    ///
-    /// **Validates: Requirements 3.1, 3.2, 3.3**
-    #[allow(dead_code)]
-    unsafe fn populate_stats_controls(hwnd: HWND, stats: &ManagerStats) {
-        // Training Statistics section (Req 3.1)
-        let ham_trained_text = format_stat(stats.ham_trained, stats.session_ham_trained);
-        let spam_trained_text = format_stat(stats.spam_trained, stats.session_spam_trained);
-        Self::set_control_text(hwnd, IDC_STAT_HAM_TRAINED, &ham_trained_text);
-        Self::set_control_text(hwnd, IDC_STAT_SPAM_TRAINED, &spam_trained_text);
-
-        // Session Activity section (Req 3.2)
-        let session_ham = format_with_thousands(u64::from(stats.session_ham_classified));
-        let session_unsure = format_with_thousands(u64::from(stats.session_unsure_classified));
-        let session_spam = format_with_thousands(u64::from(stats.session_spam_classified));
-        Self::set_control_text(hwnd, IDC_STAT_SESSION_HAM, &session_ham);
-        Self::set_control_text(hwnd, IDC_STAT_SESSION_UNSURE, &session_unsure);
-        Self::set_control_text(hwnd, IDC_STAT_SESSION_SPAM, &session_spam);
-
-        // Lifetime Classification section (Req 3.3)
-        let lifetime_ham = format_stat(stats.total_ham_classified, stats.session_ham_classified);
-        let lifetime_unsure =
-            format_stat(stats.total_unsure_classified, stats.session_unsure_classified);
-        let lifetime_spam =
-            format_stat(stats.total_spam_classified, stats.session_spam_classified);
-        Self::set_control_text(hwnd, IDC_STAT_LIFETIME_HAM_CLASSIFIED, &lifetime_ham);
-        Self::set_control_text(hwnd, IDC_STAT_LIFETIME_UNSURE_CLASSIFIED, &lifetime_unsure);
-        Self::set_control_text(hwnd, IDC_STAT_LIFETIME_SPAM_CLASSIFIED, &lifetime_spam);
-
-        // Total session classified count
-        let total_session = format_with_thousands(u64::from(stats.session_classified));
-        Self::set_control_text(hwnd, IDC_STAT_SESSION_CLASSIFIED, &total_session);
-    }
-
-    // ─── Inline Help Label Infrastructure ────────────────────────────────────
-
-    /// Populate inline help labels from `help_content::sections` constants.
-    ///
-    /// Sets the text of static label controls to the section descriptions,
-    /// providing always-visible contextual guidance within the dialog.
-    ///
-    /// Called during `WM_INITDIALOG` after tooltip setup.
-    ///
-    /// **Validates: Requirements 2.1, 2.3**
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `hwnd` is a valid dialog window handle. If any
-    /// label control does not exist in the dialog template, the corresponding
-    /// `SetDlgItemTextW` call is a no-op.
-    // TODO: The LTEXT controls for these labels must be added to the dialog
-    // template (programmatic or .rc) when the full dialog layout is implemented.
-    #[allow(dead_code)]
-    unsafe fn populate_inline_help_labels(hwnd: HWND) {
-        Self::set_help_label(hwnd, IDC_HELP_LABEL_FILTER, sections::FILTER_SETTINGS.description);
-        Self::set_help_label(hwnd, IDC_HELP_LABEL_FOLDERS, sections::FOLDER_CONFIG.description);
-        Self::set_help_label(hwnd, IDC_HELP_LABEL_TRAINING, sections::TRAINING.description);
-        Self::set_help_label(
-            hwnd,
-            IDC_HELP_LABEL_NOTIFICATION,
-            sections::NOTIFICATION.description,
-        );
-        Self::set_help_label(hwnd, IDC_HELP_LABEL_CLEANUP, sections::CLEANUP.description);
-    }
-
-    /// Set the text of an inline help label control.
-    ///
-    /// Converts the UTF-8 description string to a null-terminated UTF-16
-    /// string and applies it via `SetDlgItemTextW`.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `hwnd` is a valid dialog window handle.
-    #[allow(dead_code)]
-    unsafe fn set_help_label(hwnd: HWND, control_id: u16, text: &str) {
-        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-        let _ = SetDlgItemTextW(hwnd, i32::from(control_id), PCWSTR::from_raw(wide.as_ptr()));
-    }
-
-    /// Apply a smaller, grey-tinted font to inline help labels for visual
-    /// distinction from interactive controls.
-    ///
-    /// Creates a 7pt "MS Shell Dlg" font and applies it to all inline help
-    /// label controls via `WM_SETFONT`. The smaller size and lighter weight
-    /// visually separate descriptive text from actionable controls.
-    ///
-    /// Called during `WM_INITDIALOG` after `populate_inline_help_labels`.
-    ///
-    /// **Validates: Requirements 2.3, 2.4**
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `hwnd` is a valid dialog window handle. If a label
-    /// control does not exist, `GetDlgItem` returns a null handle and the
-    /// font message is skipped for that control.
-    // TODO: The font handle created here is intentionally leaked (never
-    // deleted) because it must remain valid for the lifetime of the dialog.
-    // In a full implementation, store it and call `DeleteObject` on WM_DESTROY.
-    #[allow(dead_code)]
-    unsafe fn style_inline_help_labels(hwnd: HWND) {
-        let hfont = Self::create_help_label_font();
-        if hfont.is_invalid() {
-            return;
-        }
-
-        let label_ids = [
-            IDC_HELP_LABEL_FILTER,
-            IDC_HELP_LABEL_FOLDERS,
-            IDC_HELP_LABEL_TRAINING,
-            IDC_HELP_LABEL_NOTIFICATION,
-            IDC_HELP_LABEL_CLEANUP,
-        ];
-
-        for &id in &label_ids {
-            let ctrl = GetDlgItem(hwnd, i32::from(id));
-            if let Ok(ctrl_hwnd) = ctrl {
-                if ctrl_hwnd != HWND::default() {
-                    SendMessageW(ctrl_hwnd, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
-                }
-            }
-        }
-    }
-
-    /// Create a smaller font for inline help labels.
-    ///
-    /// Returns a 7pt "MS Shell Dlg" font with normal weight (FW_NORMAL = 400).
-    /// This produces text that is visibly smaller than the standard dialog font,
-    /// helping users distinguish informational labels from interactive controls.
-    ///
-    /// # Safety
-    ///
-    /// Uses Win32 `CreateFontW`. Returns an invalid HFONT on failure.
-    #[allow(dead_code)]
-    unsafe fn create_help_label_font() -> HFONT {
-        let face_name: Vec<u16> = "MS Shell Dlg"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        // 7pt at 96 DPI ≈ -9 logical units (negative = character height)
-        let height = -9;
-
-        CreateFontW(
-            height,
-            0,                       // width (auto)
-            0,                       // escapement
-            0,                       // orientation
-            400,                     // weight (FW_NORMAL)
-            0,                       // italic
-            0,                       // underline
-            0,                       // strikeout
-            DEFAULT_CHARSET.0.into(),
-            OUT_DEFAULT_PRECIS.0.into(),
-            CLIP_DEFAULT_PRECIS.0.into(),
-            DEFAULT_QUALITY.0.into(),
-            FF_SWISS.0.into(),       // pitch and family
-            PCWSTR::from_raw(face_name.as_ptr()),
-        )
-    }
-}
-
-// ─── FolderTarget ────────────────────────────────────────────────────────────
-
-/// Identifies which folder setting a folder picker selection applies to.
-///
-/// Used by `on_folder_select` to route the selected folder(s) to the
-/// correct field in `ManagerState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FolderTarget {
-    /// Watch folders (multiple selection allowed).
-    Watch,
-    /// Spam destination folder (single selection).
-    Spam,
-    /// Unsure destination folder (single selection).
-    Unsure,
-    /// Ham training folders (multiple selection allowed).
-    HamTraining,
-    /// Spam training folders (multiple selection allowed).
-    SpamTraining,
-}
-
-// ─── TrainRequest ────────────────────────────────────────────────────────────
-
-/// Request payload for initiating a training operation from the dialog.
-///
-/// The caller receives this from `show_train_progress()` and uses it
-/// to invoke the `TrainingEngine` with the appropriate folder IDs.
-///
-/// **Validates: Requirement 14.4**
-#[derive(Debug, Clone)]
-pub struct TrainRequest {
-    /// Ham training folder IDs.
-    pub ham_folder_ids: Vec<FolderId>,
-    /// Spam training folder IDs.
-    pub spam_folder_ids: Vec<FolderId>,
-}
-
-// ─── FilterNowRequest ────────────────────────────────────────────────────────
-
-/// Request payload for initiating a Filter Now operation from the dialog.
-///
-/// The caller receives this from `show_filter_now_progress()` and uses
-/// it to invoke the `FilterEngine::filter_now()` method.
-///
-/// **Validates: Requirement 14.4**
-#[derive(Debug, Clone)]
-pub struct FilterNowRequest {
-    /// Folder IDs to filter.
-    pub folder_ids: Vec<FolderId>,
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // Test assertions comparing exact threshold values
 mod tests {
     use super::*;
-    use spambayes_config::{ConfigChain, EntryId, StoreId};
+    use spambayes_config::{EntryId, StoreId};
 
     /// Helper: create a test `FolderId`.
     fn make_folder_id(store: &str, entry: &str) -> FolderId {
@@ -1363,15 +508,8 @@ mod tests {
         assert_eq!(stats.ham_trained, 100);
         assert_eq!(stats.spam_trained, 200);
         assert_eq!(stats.session_classified, 50);
-        // Other fields should be zero via ..Self::new()
         assert_eq!(stats.session_ham_trained, 0);
         assert_eq!(stats.session_spam_trained, 0);
-        assert_eq!(stats.session_ham_classified, 0);
-        assert_eq!(stats.session_unsure_classified, 0);
-        assert_eq!(stats.session_spam_classified, 0);
-        assert_eq!(stats.total_ham_classified, 0);
-        assert_eq!(stats.total_unsure_classified, 0);
-        assert_eq!(stats.total_spam_classified, 0);
     }
 
     #[test]
@@ -1389,7 +527,6 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let mgr = StatisticsManager::new(&dir, 100);
 
-        // Simulate some activity.
         mgr.on_classified(Classification::Ham);
         mgr.on_classified(Classification::Ham);
         mgr.on_classified(Classification::Spam);
@@ -1400,21 +537,14 @@ mod tests {
 
         let stats = ManagerStats::from_statistics(&mgr);
 
-        // Lifetime training
         assert_eq!(stats.ham_trained, 1);
         assert_eq!(stats.spam_trained, 2);
-
-        // Session training
         assert_eq!(stats.session_ham_trained, 1);
         assert_eq!(stats.session_spam_trained, 2);
-
-        // Session classification
         assert_eq!(stats.session_ham_classified, 2);
         assert_eq!(stats.session_unsure_classified, 1);
         assert_eq!(stats.session_spam_classified, 1);
-        assert_eq!(stats.session_classified, 4); // 2 + 1 + 1
-
-        // Lifetime classification
+        assert_eq!(stats.session_classified, 4);
         assert_eq!(stats.total_ham_classified, 2);
         assert_eq!(stats.total_unsure_classified, 1);
         assert_eq!(stats.total_spam_classified, 1);
@@ -1519,7 +649,6 @@ mod tests {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
-        // Setting the same value should not mark dirty
         state.set_spam_threshold(90.0);
         assert!(!state.is_dirty());
     }
@@ -1561,7 +690,6 @@ mod tests {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
-        // Setting same action should not mark dirty
         state.set_spam_action(FilterAction::Move);
         assert!(!state.is_dirty());
     }
@@ -1591,7 +719,6 @@ mod tests {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
-        // Disable filtering
         state.set_filter_enabled(false);
         assert!(state.is_dirty());
         assert!(!state.filter_enabled);
@@ -1602,7 +729,6 @@ mod tests {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
-        // Setting same value should not mark dirty
         state.set_filter_enabled(true);
         assert!(!state.is_dirty());
     }
@@ -1677,13 +803,11 @@ mod tests {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
-        // Make changes
         state.set_spam_threshold(80.0);
         state.set_unsure_threshold(25.0);
         state.set_spam_action(FilterAction::Copy);
         state.set_filter_enabled(false);
 
-        // Apply to a fresh config
         let mut target_config = AppConfig::default();
         state.apply_to_config(&mut target_config);
 
@@ -1717,313 +841,33 @@ mod tests {
         assert_eq!(target_config.filter.watch_folder_ids, new_watch);
     }
 
-    // ─── ManagerDialog Tests ─────────────────────────────────────────────
-
-    #[test]
-    fn test_dialog_new() {
-        let config = make_test_config();
-        let stats = ManagerStats::with_values(500, 300, 42);
-        let dialog = ManagerDialog::new(&config, stats.clone(), None);
-
-        assert_eq!(dialog.stats().ham_trained, 500);
-        assert_eq!(dialog.stats().spam_trained, 300);
-        assert_eq!(dialog.stats().session_classified, 42);
-        assert!(dialog.state().filter_enabled);
-    }
-
-    #[test]
-    fn test_dialog_apply_changes_when_dirty() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        // Modify state
-        dialog.state_mut().set_spam_threshold(75.0);
-
-        // Apply via ConfigChain
-        let temp = std::env::temp_dir().join("spambayes_mgr_test_apply");
-        let _ = std::fs::create_dir_all(&temp);
-        let mut chain = ConfigChain::from_parts(make_test_config(), temp.clone(), "test_profile");
-        let saved = dialog.apply_changes(&mut chain);
-
-        assert!(saved);
-        assert_eq!(chain.config().filter.spam_threshold, 75.0);
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_dialog_apply_changes_not_dirty() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let dialog = ManagerDialog::new(&config, stats, None);
-
-        // No changes made — apply should return false
-        let temp = std::env::temp_dir().join("spambayes_mgr_test_no_apply");
-        let _ = std::fs::create_dir_all(&temp);
-        let mut chain = ConfigChain::from_parts(make_test_config(), temp.clone(), "test_profile");
-        let saved = dialog.apply_changes(&mut chain);
-
-        assert!(!saved);
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_dialog_show_train_progress() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let dialog = ManagerDialog::new(&config, stats, None);
-
-        let req = dialog.show_train_progress();
-        assert_eq!(req.ham_folder_ids.len(), 1);
-        assert_eq!(req.spam_folder_ids.len(), 1);
-        assert_eq!(req.ham_folder_ids[0], make_folder_id("STORE01", "HAM01"));
-        assert_eq!(req.spam_folder_ids[0], make_folder_id("STORE01", "SPAMTRAIN01"));
-    }
-
-    #[test]
-    fn test_dialog_show_filter_now_progress() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let dialog = ManagerDialog::new(&config, stats, None);
-
-        let req = dialog.show_filter_now_progress();
-        assert_eq!(req.folder_ids.len(), 1);
-        assert_eq!(req.folder_ids[0], make_folder_id("STORE01", "INBOX01"));
-    }
-
-    #[test]
-    fn test_dialog_on_folder_select_watch() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        let new_folders = vec![
-            make_folder_id("S1", "F1"),
-            make_folder_id("S1", "F2"),
-        ];
-        dialog.on_folder_select(FolderTarget::Watch, new_folders.clone());
-
-        assert_eq!(dialog.state().watch_folder_ids, new_folders);
-        assert!(dialog.state().is_dirty());
-    }
-
-    #[test]
-    fn test_dialog_on_folder_select_spam() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        let folder = make_folder_id("S2", "SPAM_NEW");
-        dialog.on_folder_select(FolderTarget::Spam, vec![folder.clone()]);
-
-        assert_eq!(dialog.state().spam_folder_id, Some(folder));
-        assert!(dialog.state().is_dirty());
-    }
-
-    #[test]
-    fn test_dialog_on_folder_select_unsure() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        let folder = make_folder_id("S2", "UNSURE_NEW");
-        dialog.on_folder_select(FolderTarget::Unsure, vec![folder.clone()]);
-
-        assert_eq!(dialog.state().unsure_folder_id, Some(folder));
-        assert!(dialog.state().is_dirty());
-    }
-
-    #[test]
-    fn test_dialog_on_folder_select_ham_training() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        let folders = vec![
-            make_folder_id("S1", "H1"),
-            make_folder_id("S1", "H2"),
-        ];
-        dialog.on_folder_select(FolderTarget::HamTraining, folders.clone());
-
-        assert_eq!(dialog.state().ham_training_folder_ids, folders);
-        assert!(dialog.state().is_dirty());
-    }
-
-    #[test]
-    fn test_dialog_on_folder_select_spam_training() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        let folders = vec![make_folder_id("S1", "ST1")];
-        dialog.on_folder_select(FolderTarget::SpamTraining, folders.clone());
-
-        assert_eq!(dialog.state().spam_training_folder_ids, folders);
-        assert!(dialog.state().is_dirty());
-    }
-
-    #[test]
-    fn test_dialog_update_stats() {
-        let config = make_test_config();
-        let stats = ManagerStats::new();
-        let mut dialog = ManagerDialog::new(&config, stats, None);
-
-        let new_stats = ManagerStats {
-            ham_trained: 1000,
-            spam_trained: 500,
-            session_ham_trained: 10,
-            session_spam_trained: 5,
-            session_classified: 100,
-            session_ham_classified: 60,
-            session_unsure_classified: 15,
-            session_spam_classified: 25,
-            total_ham_classified: 5000,
-            total_unsure_classified: 300,
-            total_spam_classified: 2000,
-            correctly_classified: 0,
-            false_positives: 0,
-            false_negatives: 0,
-            manually_classified_good: 0,
-            manually_classified_spam: 0,
-            last_reset_date: None,
-        };
-        dialog.update_stats(new_stats.clone());
-
-        assert_eq!(dialog.stats(), &new_stats);
-    }
-
-    // ─── Timer Constant Tests (Req 3.4) ─────────────────────────────────
-
-    #[test]
-    fn test_stats_timer_id_is_distinct() {
-        // The timer ID must not conflict with any dialog control IDs.
-        assert_eq!(IDC_STATS_TIMER, 3100);
-        // Ensure it doesn't overlap with the highest control ID (IDC_RESET_STATS = 3044).
-        assert!(IDC_STATS_TIMER as u16 > IDC_RESET_STATS);
-    }
-
-    #[test]
-    fn test_stats_refresh_interval() {
-        // The refresh interval should be 2 seconds (2000ms) per the design.
-        assert_eq!(STATS_REFRESH_MS, 2000);
-    }
-
-    // ─── Error Guidance Content Tests (Task 6.3) ─────────────────────────
-
-    #[test]
-    fn test_threshold_invalid_contains_actionable_guidance() {
-        use crate::help_content::errors;
-
-        let msg = errors::THRESHOLD_INVALID;
-        // Contains valid range information
-        assert!(
-            msg.contains("0 and 100"),
-            "THRESHOLD_INVALID should mention valid range '0 and 100'"
-        );
-        // Contains relationship constraint
-        assert!(
-            msg.contains("unsure threshold") || msg.contains("unsure value"),
-            "THRESHOLD_INVALID should mention unsure threshold relationship"
-        );
-        // Contains actionable instruction
-        assert!(
-            msg.contains("fix") || msg.contains("enter") || msg.contains("set"),
-            "THRESHOLD_INVALID should contain an actionable instruction"
-        );
-    }
-
-    #[test]
-    fn test_cleanup_days_invalid_contains_actionable_guidance() {
-        use crate::help_content::errors;
-
-        let msg = errors::CLEANUP_DAYS_INVALID;
-        // Contains valid constraint
-        assert!(
-            msg.contains("positive") || msg.contains("1 or greater"),
-            "CLEANUP_DAYS_INVALID should mention 'positive' or '1 or greater'"
-        );
-        // Contains fix instruction
-        assert!(
-            msg.contains("fix") || msg.contains("enter") || msg.contains("set"),
-            "CLEANUP_DAYS_INVALID should contain a fix instruction"
-        );
-    }
-
-    #[test]
-    fn test_folder_not_found_contains_actionable_guidance() {
-        use crate::help_content::errors;
-
-        let msg = errors::FOLDER_NOT_FOUND;
-        // Tells user what to do
-        assert!(
-            msg.contains("Browse") || msg.contains("select"),
-            "FOLDER_NOT_FOUND should tell user to Browse or select a folder"
-        );
-        // Explains what went wrong
-        assert!(
-            msg.contains("renamed") || msg.contains("deleted") || msg.contains("moved"),
-            "FOLDER_NOT_FOUND should explain the folder was renamed, deleted, or moved"
-        );
-    }
-
-    #[test]
-    fn test_training_required_contains_actionable_guidance() {
-        use crate::help_content::errors;
-
-        let msg = errors::TRAINING_REQUIRED;
-        // Tells user to train
-        assert!(
-            msg.contains("Train"),
-            "TRAINING_REQUIRED should tell user to Train"
-        );
-        // Tells user what's needed
-        assert!(
-            msg.contains("ham"),
-            "TRAINING_REQUIRED should mention 'ham'"
-        );
-        assert!(
-            msg.contains("spam"),
-            "TRAINING_REQUIRED should mention 'spam'"
-        );
-    }
+    // ─── Threshold Validation Tests ──────────────────────────────────────
 
     #[test]
     fn test_is_threshold_valid_invalid_unsure_exceeds_spam() {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
-        // Set unsure > spam (invalid: unsure=60, spam=50)
         state.spam_threshold = 50.0;
         state.unsure_threshold = 60.0;
-        assert!(
-            !state.is_threshold_valid(),
-            "Thresholds should be invalid when unsure (60) > spam (50)"
-        );
+        assert!(!state.is_threshold_valid());
     }
 
     #[test]
     fn test_is_threshold_valid_out_of_range() {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
-        // Set spam > 100 (out of range)
         state.spam_threshold = 101.0;
         state.unsure_threshold = 15.0;
-        assert!(
-            !state.is_threshold_valid(),
-            "Thresholds should be invalid when spam (101) > 100"
-        );
+        assert!(!state.is_threshold_valid());
     }
 
     #[test]
     fn test_is_threshold_valid_valid_state() {
         let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
-        // Set valid values: spam=90, unsure=15
         state.spam_threshold = 90.0;
         state.unsure_threshold = 15.0;
-        assert!(
-            state.is_threshold_valid(),
-            "Thresholds should be valid when spam=90, unsure=15"
-        );
+        assert!(state.is_threshold_valid());
     }
 
     // ─── Spam Auto-Cleanup Tests (Req 18) ────────────────────────────────
@@ -2065,11 +909,11 @@ mod tests {
 
     #[test]
     fn test_apply_to_config_writes_cleanup_disabled() {
-        let config = make_test_config(); // defaults: disabled, 30 days
+        let config = make_test_config();
         let state = ManagerState::from_config(&config);
 
         let mut target = AppConfig::default();
-        target.filter.spam_auto_cleanup_enabled = true; // pre-set to true
+        target.filter.spam_auto_cleanup_enabled = true;
         target.filter.spam_auto_cleanup_days = 99;
 
         state.apply_to_config(&mut target);
@@ -2090,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_set_cleanup_enabled_same_not_dirty() {
-        let config = make_test_config(); // default: disabled
+        let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
         state.set_spam_auto_cleanup_enabled(false);
@@ -2109,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_set_cleanup_days_same_not_dirty() {
-        let config = make_test_config(); // default: 30 days
+        let config = make_test_config();
         let mut state = ManagerState::from_config(&config);
 
         state.set_spam_auto_cleanup_days(30);
@@ -2148,22 +992,18 @@ mod tests {
 
     #[test]
     fn test_cleanup_roundtrip_through_config() {
-        // Simulate: load config → modify in GUI → apply → reload
         let mut config = make_test_config();
         config.filter.spam_auto_cleanup_enabled = false;
         config.filter.spam_auto_cleanup_days = 30;
 
         let mut state = ManagerState::from_config(&config);
 
-        // User enables cleanup and sets 7 days
         state.set_spam_auto_cleanup_enabled(true);
         state.set_spam_auto_cleanup_days(7);
 
-        // Apply back to config
         let mut saved_config = AppConfig::default();
         state.apply_to_config(&mut saved_config);
 
-        // Reload from saved config
         let reloaded_state = ManagerState::from_config(&saved_config);
         assert!(reloaded_state.spam_auto_cleanup_enabled);
         assert_eq!(reloaded_state.spam_auto_cleanup_days, 7);
