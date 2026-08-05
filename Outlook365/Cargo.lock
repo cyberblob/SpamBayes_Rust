@@ -1405,7 +1405,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spambayes-addin"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 dependencies = [
  "crossbeam-channel",
  "glib",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-config"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 dependencies = [
  "indexmap",
  "proptest",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-core"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 dependencies = [
  "criterion",
  "mailparse",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-mapi"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 dependencies = [
  "log",
  "spambayes-core",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-storage"
-version = "0.3.0-alpha.5"
+version = "0.3.0-alpha.6"
 dependencies = [
  "criterion",
  "memmap2",

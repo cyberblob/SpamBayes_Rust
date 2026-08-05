@@ -6,7 +6,7 @@
 ;   - Provides clean uninstall
 
 #define MyAppName "SpamBayes Outlook Add-in"
-#define MyAppVersion "0.3.0a5"
+#define MyAppVersion "0.3.0a6"
 #define MyAppPublisher "SpamBayes Project"
 #define MyAppURL "https://github.com/cyberblob/SpamBayes_Rust"
 
