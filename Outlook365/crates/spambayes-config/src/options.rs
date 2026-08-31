@@ -522,6 +522,22 @@ pub struct UpdateConfig {
     pub latest_known_version: String,
     /// The download URL for the latest known update (if any).
     pub latest_download_url: String,
+    /// The version of the add-in DLL that is actually running.
+    ///
+    /// This is a persisted mirror of the compile-time `CURRENT_VERSION`
+    /// constant, refreshed on every Outlook startup by the add-in. It is a
+    /// reporting/diagnostic value only — the update comparison always uses the
+    /// runtime constant, never this field — so it can never lie about which
+    /// code is loaded. External tools (installer, Manager GUI) can read it
+    /// without loading the DLL.
+    /// Empty string means it has not been stamped yet.
+    pub installed_version: String,
+    /// The version the installer intended to place on disk, written by the
+    /// installer. If it differs from `installed_version` after startup, a
+    /// pending update did not take effect (e.g. the DLL was locked by a running
+    /// Outlook and needs a restart/reboot to finish).
+    /// Empty string means no installer stamp is present.
+    pub install_target_version: String,
 }
 
 impl Default for UpdateConfig {
@@ -534,6 +550,8 @@ impl Default for UpdateConfig {
             update_notified: false,
             latest_known_version: String::new(),
             latest_download_url: String::new(),
+            installed_version: String::new(),
+            install_target_version: String::new(),
         }
     }
 }
@@ -1085,6 +1103,12 @@ impl AppConfig {
         if let Some(v) = get("Update", "latest_download_url") {
             update.latest_download_url = v;
         }
+        if let Some(v) = get("Update", "installed_version") {
+            update.installed_version = v;
+        }
+        if let Some(v) = get("Update", "install_target_version") {
+            update.install_target_version = v;
+        }
     }
 
     fn load_experimental_section(
@@ -1346,6 +1370,12 @@ impl AppConfig {
         if self.update.latest_download_url != defaults.update.latest_download_url {
             update.insert("latest_download_url".to_string(), self.update.latest_download_url.clone());
         }
+        if self.update.installed_version != defaults.update.installed_version {
+            update.insert("installed_version".to_string(), self.update.installed_version.clone());
+        }
+        if self.update.install_target_version != defaults.update.install_target_version {
+            update.insert("install_target_version".to_string(), self.update.install_target_version.clone());
+        }
         if !update.is_empty() {
             data.insert("Update".to_string(), update);
         }
@@ -1518,6 +1548,8 @@ impl AppConfig {
         update.insert("update_notified".to_string(), format_bool(self.update.update_notified).to_string());
         update.insert("latest_known_version".to_string(), self.update.latest_known_version.clone());
         update.insert("latest_download_url".to_string(), self.update.latest_download_url.clone());
+        update.insert("installed_version".to_string(), self.update.installed_version.clone());
+        update.insert("install_target_version".to_string(), self.update.install_target_version.clone());
         data.insert("Update".to_string(), update);
 
         // ── Experimental section ──

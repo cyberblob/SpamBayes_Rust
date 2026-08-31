@@ -1405,7 +1405,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "spambayes-addin"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "crossbeam-channel",
  "glib",
@@ -1423,11 +1423,12 @@ dependencies = [
  "thiserror",
  "ureq",
  "windows",
+ "winresource",
 ]
 
 [[package]]
 name = "spambayes-config"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "indexmap",
  "proptest",
@@ -1438,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-core"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "criterion",
  "mailparse",
@@ -1449,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-mapi"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "log",
  "spambayes-core",
@@ -1459,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "spambayes-storage"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 dependencies = [
  "criterion",
  "memmap2",
@@ -1685,6 +1686,12 @@ name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wait-timeout"
@@ -1970,6 +1977,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "toml",
+ "version_check",
 ]
 
 [[package]]

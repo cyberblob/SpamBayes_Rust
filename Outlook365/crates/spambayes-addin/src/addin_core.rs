@@ -75,6 +75,14 @@ const MANAGER_WATCH_TIMER_ID: usize = 0x5B05;
 /// Timer ID for deferred update check (fires once after startup).
 const UPDATE_CHECK_TIMER_ID: usize = 0x5B06;
 
+/// Guard ensuring the deferred update check is scheduled at most once per
+/// process. `OnStartupComplete` can be invoked more than once by Outlook in
+/// some scenarios; without this guard each invocation would arm another
+/// one-shot timer, each spawning its own check thread and popping its own
+/// notification dialog (the cascading-dialogs bug).
+static UPDATE_CHECK_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Timer ID for deferred spam auto-cleanup (recurring every 4 hours after startup).
 const CLEANUP_TIMER_ID: usize = 0x5B07;
 
@@ -583,6 +591,12 @@ unsafe extern "system" fn update_check_timer_proc(
         update_section.insert(
             "update_notified".to_string(),
             if updated_config.update.update_notified { "True" } else { "False" }.to_string(),
+        );
+        // Persist which version was notified so repeat popups for the same
+        // version are suppressed across restarts.
+        update_section.insert(
+            "latest_known_version".to_string(),
+            updated_config.update.latest_known_version.clone(),
         );
         let mut update_overlay = spambayes_config::IniData::new();
         update_overlay.insert("Update".to_string(), update_section);
@@ -1727,13 +1741,23 @@ impl AddinCore {
 
         // Schedule deferred update check (fires 10 seconds after startup).
         // This gives Outlook time to fully initialize before we make network calls.
+        // Guard against multiple OnStartupComplete invocations so we never arm
+        // more than one update-check timer (each would spawn its own dialog).
         if self.config.as_ref().map_or(true, |c| c.update.enabled) {
-            unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::SetTimer;
-                use windows::Win32::Foundation::HWND;
-                SetTimer(HWND::default(), UPDATE_CHECK_TIMER_ID, 10_000, Some(update_check_timer_proc));
+            use std::sync::atomic::Ordering;
+            if UPDATE_CHECK_SCHEDULED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                    use windows::Win32::Foundation::HWND;
+                    SetTimer(HWND::default(), UPDATE_CHECK_TIMER_ID, 10_000, Some(update_check_timer_proc));
+                }
+                self.log_verbose("OnStartupComplete: Update check timer scheduled (10s delay)");
+            } else {
+                self.log_verbose("OnStartupComplete: Update check already scheduled, skipping");
             }
-            self.log_verbose("OnStartupComplete: Update check timer scheduled (10s delay)");
         }
 
         // Schedule deferred spam auto-cleanup (fires 15 seconds after startup).
@@ -1753,6 +1777,11 @@ impl AddinCore {
         } else {
             self.log_info("OnStartupComplete: Spam auto-cleanup is DISABLED, timer not scheduled");
         }
+
+        // Stamp the running DLL version into the profile INI so the on-disk
+        // config always mirrors the code that is actually loaded, and surface
+        // any pending-update mismatch left by a locked-DLL install.
+        self.stamp_installed_version();
 
         self.log_info("OnStartupComplete: Startup complete");
 
@@ -3250,6 +3279,92 @@ impl AddinCore {
     /// backward compatibility with existing code that reads `self.config`.
     ///
     /// **Validates: Requirements 1.1, 1.6, 3.1, 3.2, 4.4**
+    /// Persist the running DLL version into the profile INI and detect a
+    /// pending update that did not take effect.
+    ///
+    /// The authoritative "what am I running" value is the compile-time
+    /// [`crate::version_manifest::CURRENT_VERSION`] constant. Because this code
+    /// only executes once the DLL is actually loaded, that constant cannot lie
+    /// about which build is running — so writing it to the INI on every startup
+    /// keeps the on-disk `installed_version` "always current at execution",
+    /// readable by external tools without loading the DLL.
+    ///
+    /// This never feeds the update comparison (which keeps using the runtime
+    /// constant); the INI value is a reporting mirror only.
+    ///
+    /// If the installer stamped `install_target_version` and it differs from the
+    /// running version, a manual install did not replace the loaded DLL (it was
+    /// locked by a running Outlook). We surface that so the user knows a restart
+    /// or reboot is required to finish updating.
+    fn stamp_installed_version(&mut self) {
+        use crate::version_manifest::CURRENT_VERSION;
+
+        let data_dir = Self::get_data_directory();
+        let profile_ini_path = data_dir.join("default.ini");
+
+        // Read the existing on-disk values (may be empty on first run).
+        let existing_data = match spambayes_config::IniFile::read(&profile_ini_path) {
+            Ok(data) => data,
+            Err(_) => spambayes_config::IniData::new(),
+        };
+        let get = |key: &str| -> String {
+            existing_data
+                .get("Update")
+                .and_then(|s| s.get(key))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let recorded_installed = get("installed_version");
+        let install_target = get("install_target_version");
+
+        // Pending-update detection: the installer said it wanted CURRENT to be
+        // `install_target`, but we're running something else → the new DLL
+        // never loaded (locked file). Log a clear, actionable message.
+        if !install_target.is_empty() && install_target != CURRENT_VERSION {
+            self.log_error(&format!(
+                "Pending update not applied: installer target version is {install_target} but the \
+                 running add-in is {CURRENT_VERSION}. The new DLL was not loaded (likely locked by \
+                 a running Outlook). Fully close Outlook and, if it persists, reboot to finish updating."
+            ));
+        }
+
+        // If the on-disk mirror already matches the running version, nothing to
+        // write — avoid a redundant INI write on every startup.
+        if recorded_installed == CURRENT_VERSION {
+            self.log_verbose(&format!(
+                "stamp_installed_version: INI already current ({CURRENT_VERSION})"
+            ));
+            return;
+        }
+
+        self.log_info(&format!(
+            "stamp_installed_version: updating INI installed_version {recorded:?} -> {CURRENT_VERSION}",
+            recorded = if recorded_installed.is_empty() { "<unset>" } else { recorded_installed.as_str() },
+        ));
+
+        // Read-merge-write just the [Update] key we changed, so we don't clobber
+        // other sections/settings that may have been written concurrently.
+        let mut merged = existing_data;
+        let mut update_section = spambayes_config::SectionData::new();
+        update_section.insert("installed_version".to_string(), CURRENT_VERSION.to_string());
+        let mut overlay = spambayes_config::IniData::new();
+        overlay.insert("Update".to_string(), update_section);
+        spambayes_config::merge_ini_data(&mut merged, &overlay);
+
+        if let Err(e) = spambayes_config::IniFile::write(&profile_ini_path, &merged) {
+            self.log_error(&format!(
+                "stamp_installed_version: failed to write {}: {e}",
+                profile_ini_path.display()
+            ));
+            return;
+        }
+
+        // Keep the in-memory config consistent with what we just wrote.
+        if let Some(config) = self.config.as_mut() {
+            config.update.installed_version = CURRENT_VERSION.to_string();
+        }
+    }
+
     fn load_config_chain(&mut self) {
         // Check BAYESCUSTOMIZE environment variable first.
         if let Ok(env_value) = std::env::var("BAYESCUSTOMIZE") {

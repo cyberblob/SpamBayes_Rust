@@ -1,7 +1,7 @@
 {
-    "version":  "0.3.0-alpha.6",
+    "version":  "0.3.0-alpha.7",
     "build_number":  0,
-    "release_date":  "2026-08-04",
+    "release_date":  "2026-08-31",
     "download_url":  "https://github.com/cyberblob/SpamBayes_Rust/releases/latest",
     "installer_url":  "",
     "release_notes":  "",

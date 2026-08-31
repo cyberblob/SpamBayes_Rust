@@ -17,6 +17,7 @@
 //! - Build number comparison catches hotfix rebuilds of the same version.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +41,14 @@ pub struct UpdateChecker {
     last_check_timestamp: u64,
     /// Whether the user has already been notified about the current update.
     already_notified: bool,
+    /// The version string the user was last notified about (persisted via
+    /// `latest_known_version`). Used to suppress repeat notifications for the
+    /// same available version while still notifying when a *new* version
+    /// appears. Empty means "never notified about a specific version".
+    notified_version: String,
+    /// The latest available version seen in the most recent check. Set during
+    /// `check_for_update` and written to `latest_known_version` by `save_state`.
+    latest_available_version: String,
     /// The data directory for persisting update state.
     data_dir: std::path::PathBuf,
     /// Profile name for config persistence.
@@ -86,6 +95,8 @@ impl UpdateChecker {
             check_interval_secs: config.update.check_interval.as_secs(),
             last_check_timestamp: config.update.last_check_timestamp,
             already_notified: config.update.update_notified,
+            notified_version: config.update.latest_known_version.clone(),
+            latest_available_version: config.update.latest_known_version.clone(),
             data_dir: data_dir.to_path_buf(),
             profile_name: profile_name.to_string(),
             logger,
@@ -138,7 +149,11 @@ impl UpdateChecker {
         match status {
             UpdateStatus::UpToDate => {
                 self.log_info("Update check: running the latest version");
+                // We're current: clear any stale "notified" state so that a
+                // genuinely new future version will notify again.
                 self.already_notified = false;
+                self.notified_version.clear();
+                self.latest_available_version.clear();
                 UpdateCheckResult::UpToDate
             }
             UpdateStatus::NewVersionAvailable {
@@ -150,6 +165,13 @@ impl UpdateChecker {
                 self.log_info(&format!(
                     "Update available: {current} → {latest}"
                 ));
+                // If this is a different version than the one we last notified
+                // about, reset the notified flag so the user is told about the
+                // new version exactly once.
+                if self.notified_version != latest {
+                    self.already_notified = false;
+                }
+                self.latest_available_version = latest.clone();
                 UpdateCheckResult::UpdateAvailable {
                     current_version: current,
                     latest_version: latest,
@@ -166,6 +188,13 @@ impl UpdateChecker {
                 self.log_info(&format!(
                     "Build update available: {version} build {current_build} → {latest_build}"
                 ));
+                // Key the notify guard on the build number so a newer build
+                // re-notifies but the same build does not.
+                let build_key = format!("{version}+build.{latest_build}");
+                if self.notified_version != build_key {
+                    self.already_notified = false;
+                }
+                self.latest_available_version = build_key;
                 UpdateCheckResult::BuildUpdateAvailable {
                     version,
                     current_build,
@@ -185,11 +214,18 @@ impl UpdateChecker {
     pub fn save_state(&self, config: &mut AppConfig) {
         config.update.last_check_timestamp = self.last_check_timestamp;
         config.update.update_notified = self.already_notified;
+        // Persist which version we've notified about so the guard survives
+        // restarts and suppresses repeat popups for the same version.
+        config.update.latest_known_version = self.notified_version.clone();
     }
 
     /// Mark that the user has been notified about the current available update.
+    ///
+    /// Records the specific version so subsequent checks for the *same* version
+    /// are suppressed, while a newer version will notify again.
     pub fn mark_notified(&mut self) {
         self.already_notified = true;
+        self.notified_version = self.latest_available_version.clone();
     }
 
     /// Returns `true` if the user has already been notified about the current update.
@@ -231,6 +267,30 @@ impl UpdateChecker {
 
 // ─── Update Notification (Windows UI) ────────────────────────────────────────
 
+/// Process-global guard ensuring at most one update notification dialog is on
+/// screen at any time.
+///
+/// `MessageBoxW` with a `None` owner does not block other threads, so without
+/// this guard several concurrent update-check threads (e.g. from a re-armed
+/// timer or re-entrant startup) would each pop their own box and cascade. We
+/// use a compare-and-swap so only the first caller shows a dialog; the rest
+/// return immediately.
+static NOTIFICATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Try to acquire the single-notification slot. Returns `true` if the caller
+/// may show a dialog (and must call [`release_notification_slot`] afterward),
+/// `false` if a dialog is already on screen.
+fn acquire_notification_slot() -> bool {
+    NOTIFICATION_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Release the single-notification slot after a dialog has closed.
+fn release_notification_slot() {
+    NOTIFICATION_IN_FLIGHT.store(false, Ordering::Release);
+}
+
 /// Display an update notification to the user via a Windows message box.
 ///
 /// This should be called on the STA thread (from a timer callback or
@@ -247,6 +307,11 @@ pub fn show_update_notification(
     use windows::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, IDYES, MB_ICONINFORMATION, MB_YESNO,
     };
+
+    // Only one update dialog may be visible at a time; drop overlapping calls.
+    if !acquire_notification_slot() {
+        return false;
+    }
 
     let message = if release_notes.is_empty() {
         format!(
@@ -279,6 +344,8 @@ pub fn show_update_notification(
         )
     };
 
+    release_notification_slot();
+
     if result == IDYES {
         // Open the download URL in the default browser.
         open_url(download_url);
@@ -299,6 +366,11 @@ pub fn show_build_update_notification(
     use windows::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, IDYES, MB_ICONINFORMATION, MB_YESNO,
     };
+
+    // Only one update dialog may be visible at a time; drop overlapping calls.
+    if !acquire_notification_slot() {
+        return false;
+    }
 
     let message = format!(
         "A newer build of SpamBayes {version} is available.\n\n\
@@ -321,6 +393,8 @@ pub fn show_build_update_notification(
             MB_YESNO | MB_ICONINFORMATION,
         )
     };
+
+    release_notification_slot();
 
     if result == IDYES {
         open_url(download_url);
@@ -437,5 +511,52 @@ mod tests {
 
         assert_eq!(config.update.last_check_timestamp, 12345);
         assert!(config.update.update_notified);
+    }
+
+    #[test]
+    fn test_mark_notified_records_version() {
+        let config = AppConfig::default();
+        let dir = std::path::PathBuf::from(".");
+        let mut checker = UpdateChecker::new(&config, &dir, "default", None);
+
+        // Simulate a check that found version 0.3.0-alpha.6.
+        checker.latest_available_version = "0.3.0-alpha.6".to_string();
+        checker.mark_notified();
+
+        assert!(checker.was_notified());
+        assert_eq!(checker.notified_version, "0.3.0-alpha.6");
+
+        // save_state persists the notified version into latest_known_version so
+        // the guard survives a restart.
+        let mut cfg = AppConfig::default();
+        checker.save_state(&mut cfg);
+        assert_eq!(cfg.update.latest_known_version, "0.3.0-alpha.6");
+        assert!(cfg.update.update_notified);
+    }
+
+    #[test]
+    fn test_notified_state_restored_from_config() {
+        // A config that already recorded a prior notification for alpha.6.
+        let mut config = AppConfig::default();
+        config.update.update_notified = true;
+        config.update.latest_known_version = "0.3.0-alpha.6".to_string();
+
+        let dir = std::path::PathBuf::from(".");
+        let checker = UpdateChecker::new(&config, &dir, "default", None);
+
+        // The checker should consider the user already notified for alpha.6.
+        assert!(checker.was_notified());
+        assert_eq!(checker.notified_version, "0.3.0-alpha.6");
+    }
+
+    #[test]
+    fn test_notification_slot_is_exclusive() {
+        // First acquire succeeds; a second (overlapping) acquire fails until
+        // released. This is what prevents cascading dialogs.
+        assert!(acquire_notification_slot());
+        assert!(!acquire_notification_slot());
+        release_notification_slot();
+        assert!(acquire_notification_slot());
+        release_notification_slot();
     }
 }

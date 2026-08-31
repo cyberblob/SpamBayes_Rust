@@ -44,3 +44,8 @@ crossbeam-channel = "0.5"
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds a Win32 version resource (FILEVERSION/PRODUCTVERSION) into the DLL so
+# external version detection matches the version baked in via SPAMBAYES_VERSION.
+winresource = "0.1"

@@ -34,9 +34,71 @@ fn main() {
     println!("cargo:rustc-env=SPAMBAYES_VERSION={version}");
     // Embed the raw build number (Unix timestamp) for fine-grained build comparison.
     println!("cargo:rustc-env=SPAMBAYES_BUILD_NUMBER={now}");
+
+    // Embed a Win32 version resource into the DLL so that Windows file-version
+    // metadata (Explorer "Details" tab, installers checking FILEVERSION, etc.)
+    // reflects the real crate version. Without this the DLL reports 0.0.0.0,
+    // which makes external "current version" detection unreliable even when the
+    // updater's own embedded SPAMBAYES_VERSION string is correct.
+    #[cfg(windows)]
+    embed_version_resource(&version);
+
     // Tell Cargo to always re-run this build script so the timestamp updates
     // on every build. Using a non-existent file means "always dirty".
     println!("cargo:rerun-if-changed=__always_rebuild__");
+}
+
+/// Compile a Windows version-info resource carrying both the numeric
+/// FILEVERSION/PRODUCTVERSION (four u16 fields) and the full SemVer string
+/// (which may include a pre-release suffix like `-alpha.6`).
+#[cfg(windows)]
+fn embed_version_resource(version: &str) {
+    // Split off any pre-release suffix (e.g. "0.3.0-alpha.6" -> "0.3.0", "alpha.6").
+    let (numeric, prerelease) = match version.split_once('-') {
+        Some((num, pre)) => (num, Some(pre)),
+        None => (version, None),
+    };
+
+    let mut parts = numeric.split('.').filter_map(|s| s.parse::<u16>().ok());
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+
+    // Encode the pre-release number into the 4th FILEVERSION field so alpha.6
+    // and alpha.7 produce distinct numeric versions. 0 means "final release".
+    let build_field = prerelease
+        .and_then(|pre| pre.rsplit('.').next())
+        .and_then(|n| n.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let mut res = winresource::WindowsResource::new();
+    res.set_version_info(
+        winresource::VersionInfo::FILEVERSION,
+        (u64::from(major) << 48)
+            | (u64::from(minor) << 32)
+            | (u64::from(patch) << 16)
+            | u64::from(build_field),
+    );
+    res.set_version_info(
+        winresource::VersionInfo::PRODUCTVERSION,
+        (u64::from(major) << 48)
+            | (u64::from(minor) << 32)
+            | (u64::from(patch) << 16)
+            | u64::from(build_field),
+    );
+    res.set("FileVersion", version);
+    res.set("ProductVersion", version);
+    res.set("ProductName", "SpamBayes Outlook Add-in");
+    res.set("FileDescription", "SpamBayes Outlook Add-in");
+    res.set("CompanyName", "SpamBayes Project");
+    res.set("OriginalFilename", "spambayes_addin.dll");
+    res.set("InternalName", "spambayes_addin");
+
+    if let Err(e) = res.compile() {
+        // Don't fail the whole build if the resource compiler is unavailable;
+        // the runtime SPAMBAYES_VERSION string is still correct.
+        println!("cargo:warning=failed to embed version resource: {e}");
+    }
 }
 
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
