@@ -22,6 +22,8 @@ pub mod wizard_window;
 pub mod filter_now_dialog;
 pub mod folder_browser;
 pub mod mapi_folder_provider;
+#[cfg(target_os = "windows")]
+pub mod wizard_folder_creator;
 pub mod message_boxes;
 pub mod progress_dialog;
 pub mod clues_dialog;

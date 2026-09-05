@@ -224,7 +224,7 @@ impl Default for FilterConfig {
             spam_mark_as_read: false,
             unsure_mark_as_read: false,
             ham_mark_as_read: false,
-            save_spam_info: true,
+            save_spam_info: false,
             watch_folder_ids: Vec::new(),
             timer_enabled: true,
             timer_start_delay: 10.0,

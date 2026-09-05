@@ -51,10 +51,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 /// Default name for the spam destination folder.
-const DEFAULT_SPAM_FOLDER_NAME: &str = "Junk E-Mail";
+const DEFAULT_SPAM_FOLDER_NAME: &str = "SpamBayes Junk E-Mail";
 
 /// Default name for the unsure destination folder.
-const DEFAULT_UNSURE_FOLDER_NAME: &str = "Junk Suspects";
+const DEFAULT_UNSURE_FOLDER_NAME: &str = "SpamBayes Junk Suspects";
 
 /// WM_HELP message constant (sent when F1 is pressed in a dialog).
 const WM_HELP: u32 = 0x0053;
@@ -911,8 +911,8 @@ mod tests {
     fn test_wizard_state_default() {
         let state = WizardState::default();
         assert_eq!(state.current_page, WizardPage::Welcome);
-        assert_eq!(state.spam_folder_name, "Junk E-Mail");
-        assert_eq!(state.unsure_folder_name, "Junk Suspects");
+        assert_eq!(state.spam_folder_name, "SpamBayes Junk E-Mail");
+        assert_eq!(state.unsure_folder_name, "SpamBayes Junk Suspects");
         assert!(state.watch_folder_ids.is_empty());
         assert!(state.completion_choice.is_none());
     }

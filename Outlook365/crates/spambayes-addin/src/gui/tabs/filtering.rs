@@ -874,6 +874,42 @@ impl FilteringTab {
         Ok(())
     }
 
+    /// Apply spam/unsure/watch folder IDs chosen by the Configuration Wizard.
+    ///
+    /// Updates both the stored folder-ID state (which `ManagerWindow::apply_changes`
+    /// reads on save) and the visible folder-name entries/labels, so a wizard run
+    /// from the Manager is reflected in the Filtering tab and persisted correctly.
+    ///
+    /// `watch_folder_id` is the delivery store's Inbox (auto-detected by the
+    /// wizard). When `Some`, it replaces the watched-folder list; when `None`
+    /// the existing watched folders are left unchanged.
+    pub fn apply_wizard_folders(
+        &self,
+        spam_folder_id: &FolderId,
+        spam_folder_name: &str,
+        unsure_folder_id: &FolderId,
+        unsure_folder_name: &str,
+        watch: Option<(&FolderId, &str)>,
+    ) {
+        // Update the stored IDs that apply_changes() reads.
+        *self.spam_folder_id.borrow_mut() = Some(spam_folder_id.clone());
+        *self.unsure_folder_id.borrow_mut() = Some(unsure_folder_id.clone());
+
+        // Update watched folders (and their display) when the wizard resolved one.
+        if let Some((watch_id, watch_name)) = watch {
+            *self.watched_folder_ids.borrow_mut() = vec![watch_id.clone()];
+            self.watched_folders_label.set_text(watch_name);
+        }
+
+        // Set the displayed folder names directly from the names the wizard
+        // resolved via a fresh MAPI read. We do NOT use the folder provider
+        // here: its tree is cached from Manager startup and does not yet
+        // contain the just-created folders, so it would resolve them to
+        // "(unknown folder)" until Outlook is restarted.
+        self.spam_folder_entry.set_text(spam_folder_name);
+        self.unsure_folder_entry.set_text(unsure_folder_name);
+    }
+
     // ─── Private helpers ─────────────────────────────────────────────────
 
     /// Format watched folder display text from state.

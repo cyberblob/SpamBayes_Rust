@@ -8,15 +8,15 @@
 
 use gtk4::prelude::*;
 use gtk4::{
-    self, Align, Box as GtkBox, Button, CheckButton, CssProvider, Entry, Label, Orientation,
-    Stack, StackTransitionType, Window,
+    self, Align, Box as GtkBox, Button, CheckButton, ComboBoxText, CssProvider, Entry, Label,
+    Orientation, Stack, StackTransitionType, Window,
 };
 use gtk4::gdk;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use spambayes_config::AppConfig;
+use spambayes_config::{AppConfig, FolderId};
 
 use crate::gui::message_boxes;
 
@@ -56,13 +56,87 @@ const WIZARD_CSS: &str = r#"
 }
 "#;
 
+/// The user's preparation choice from the wizard's first page.
+///
+/// Determines what the caller should do after the wizard completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WizardPreparation {
+    /// "I haven't prepared" — enable filtering; SpamBayes learns as it goes.
+    NoPrep,
+    /// "I have pre-sorted mail" — enable filtering; the user will train now/later.
+    PreSorted,
+    /// "I want to configure manually" — save config but do NOT enable filtering;
+    /// the caller should open the Manager.
+    Manual,
+}
+
+impl WizardPreparation {
+    /// Map the page-1 radio index (0/1/2) to a `WizardPreparation`.
+    #[must_use]
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => WizardPreparation::PreSorted,
+            2 => WizardPreparation::Manual,
+            _ => WizardPreparation::NoPrep,
+        }
+    }
+}
+
+/// Where the wizard should create the spam/unsure folders.
+///
+/// Exposes the parent-location decision to the user instead of resolving it
+/// silently. Both options operate within the delivery store (the mailbox that
+/// receives mail); they differ only in the parent folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderLocation {
+    /// Create the folders under the mailbox's existing "Junk Email" folder.
+    /// Recommended for Exchange / Outlook.com / Microsoft 365. Falls back to
+    /// the mailbox top if no Junk Email folder exists.
+    UnderJunkEmail,
+    /// Create the folders at the top level of the mailbox (the store root).
+    /// Appropriate for POP3 / IMAP / PST personal stores.
+    MailboxRoot,
+}
+
+impl FolderLocation {
+    /// Map the location combo index (0 = under Junk, 1 = mailbox root).
+    #[must_use]
+    pub fn from_index(index: u32) -> Self {
+        match index {
+            1 => FolderLocation::MailboxRoot,
+            _ => FolderLocation::UnderJunkEmail,
+        }
+    }
+}
+
 /// Result of the wizard completion.
 pub enum WizardResult {
-    /// User completed the wizard with the given folder names.
+    /// User completed the wizard. The spam/unsure folders have already been
+    /// created (or opened if they existed) in the message store, and their
+    /// resolved [`FolderId`]s are provided so the caller can persist them to
+    /// the configuration.
     Completed {
-        spam_folder: String,
-        unsure_folder: String,
+        /// The created/resolved spam destination folder.
+        spam_folder_id: FolderId,
+        /// Display name for the spam folder, resolved from a fresh MAPI read
+        /// (so callers can show it without a possibly-stale folder tree).
+        spam_folder_name: String,
+        /// The created/resolved unsure destination folder.
+        unsure_folder_id: FolderId,
+        /// Display name for the unsure folder.
+        unsure_folder_name: String,
+        /// The folder to watch for incoming mail (the delivery store's Inbox)
+        /// and its display name, if one was resolved. `None` means the caller
+        /// should leave the existing watch-folder configuration untouched.
+        watch_folder: Option<(FolderId, String)>,
+        /// The user's preparation choice. Either `NoPrep` or `PreSorted`;
+        /// both enable filtering. (`Manual` produces `CompletedManual`.)
+        preparation: WizardPreparation,
     },
+    /// User completed the wizard but chose to configure manually. No folders
+    /// were created and filtering should NOT be enabled; the caller should
+    /// open the Manager so the user can finish setup by hand.
+    CompletedManual,
     /// User cancelled the wizard.
     Cancelled,
 }
@@ -95,6 +169,9 @@ pub struct WizardWindow {
     pub spam_folder_entry: Entry,
     /// Entry for unsure folder name.
     pub unsure_folder_entry: Entry,
+    /// Combo selecting where the new folders are created (under the Junk
+    /// Email folder, or at the mailbox top level).
+    pub location_combo: ComboBoxText,
     // ─── Page 3 widgets ──────────────────────────────────────────────────
     /// Label for training guidance text (updated dynamically based on Page 1 selection).
     pub training_text_label: Label,
@@ -105,6 +182,11 @@ pub struct WizardWindow {
     pub next_btn: Button,
     /// The "Cancel" button.
     pub cancel_btn: Button,
+    /// Hex-encoded store entry ID of the delivery store, derived from the
+    /// configured watch folders. Used to decide *which store* the spam/unsure
+    /// folders are created in. `None` falls back to the default store.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    store_id_hint: Option<String>,
 }
 
 impl WizardWindow {
@@ -115,7 +197,16 @@ impl WizardWindow {
     ///
     /// **Validates: Requirements 9.1, 9.2, 9.3, 9.4, 9.5**
     pub fn new(config: &AppConfig) -> Rc<Self> {
-        let _ = config; // Will be used in task 9.2 for defaults
+        // Derive the delivery store from the first configured watch folder.
+        // Folders created by the wizard should live in the same store where
+        // mail is actually delivered. When no watch folder is configured yet,
+        // this stays `None` and the folder creator falls back to the default
+        // store.
+        let store_id_hint = config
+            .filter
+            .watch_folder_ids
+            .first()
+            .map(|fid| fid.store_id.0.clone());
 
         // ─── Create the window ───────────────────────────────────────────
         let window = Window::new();
@@ -139,7 +230,8 @@ impl WizardWindow {
         stack.add_named(&page1, Some("page-1"));
 
         // ─── Build Page 2: Folders ───────────────────────────────────────
-        let (page2, spam_folder_entry, unsure_folder_entry) = Self::build_page_folders();
+        let (page2, spam_folder_entry, unsure_folder_entry, location_combo) =
+            Self::build_page_folders();
         stack.add_named(&page2, Some("page-2"));
 
         // ─── Build Page 3: Training ──────────────────────────────────────
@@ -194,10 +286,12 @@ impl WizardWindow {
             radio_manual,
             spam_folder_entry,
             unsure_folder_entry,
+            location_combo,
             training_text_label,
             back_btn,
             next_btn,
             cancel_btn,
+            store_id_hint,
         })
     }
 
@@ -285,7 +379,10 @@ impl WizardWindow {
     /// Build Page 2: Folders configuration page.
     ///
     /// **Validates: Requirement 9.3**
-    fn build_page_folders() -> (GtkBox, Entry, Entry) {
+    // ComboBoxText is deprecated since GTK 4.10 but used consistently across
+    // the manager tabs; matching that choice here for uniformity.
+    #[allow(deprecated)]
+    fn build_page_folders() -> (GtkBox, Entry, Entry, ComboBoxText) {
         let page = GtkBox::new(Orientation::Vertical, 8);
         page.set_margin_top(20);
         page.set_margin_bottom(20);
@@ -318,7 +415,7 @@ impl WizardWindow {
         spam_section.append(&spam_label);
 
         let spam_folder_entry = Entry::new();
-        spam_folder_entry.set_text("Junk E-Mail");
+        spam_folder_entry.set_text("SpamBayes Junk E-Mail");
         spam_folder_entry.set_margin_start(20);
         spam_folder_entry.set_hexpand(true);
         spam_section.append(&spam_folder_entry);
@@ -335,21 +432,55 @@ impl WizardWindow {
         unsure_section.append(&unsure_label);
 
         let unsure_folder_entry = Entry::new();
-        unsure_folder_entry.set_text("Junk Suspects");
+        unsure_folder_entry.set_text("SpamBayes Junk Suspects");
         unsure_folder_entry.set_margin_start(20);
         unsure_folder_entry.set_hexpand(true);
         unsure_section.append(&unsure_folder_entry);
 
         page.append(&unsure_section);
 
+        // Location section — lets the user choose the parent folder for the
+        // new folders. The correct default depends on the mail system, so we
+        // expose it rather than deciding silently.
+        let location_section = GtkBox::new(Orientation::Vertical, 4);
+        location_section.set_margin_top(16);
+
+        let location_label = Label::new(Some("Create these folders in:"));
+        location_label.add_css_class("wizard-section-title");
+        location_label.set_halign(Align::Start);
+        location_section.append(&location_label);
+
+        let location_combo = ComboBoxText::new();
+        // Index 0 → UnderJunkEmail (default), Index 1 → MailboxRoot.
+        location_combo.append_text("Under the Junk Email folder (recommended)");
+        location_combo.append_text("At the top level of my mailbox");
+        location_combo.set_active(Some(0));
+        location_combo.set_margin_start(20);
+        location_section.append(&location_combo);
+
+        page.append(&location_section);
+
         // Info note
-        let info_note = Label::new(Some("These folders will be created if they don't exist."));
+        let info_note = Label::new(Some(
+            "These folders will be created in the mailbox that receives your \
+             mail, under the location you choose above. If they already exist, \
+             they will be reused.",
+        ));
         info_note.add_css_class("wizard-info-note");
         info_note.set_halign(Align::Start);
+        info_note.set_wrap(true);
         info_note.set_margin_top(16);
         page.append(&info_note);
 
-        (page, spam_folder_entry, unsure_folder_entry)
+        (page, spam_folder_entry, unsure_folder_entry, location_combo)
+    }
+
+    /// Return the user's chosen folder location from the location combo.
+    #[allow(deprecated)]
+    #[must_use]
+    pub fn folder_location(&self) -> FolderLocation {
+        let index = self.location_combo.active().unwrap_or(0);
+        FolderLocation::from_index(index)
     }
 
     /// Build Page 3: Training guidance page.
@@ -606,11 +737,33 @@ impl WizardWindow {
         }
     }
 
-    /// Complete the wizard: validate folders, save, show summary, and close.
+    /// Complete the wizard: create the destination folders, show a summary,
+    /// and close.
+    ///
+    /// Behaviour depends on the page-1 preparation choice:
+    ///
+    /// - **Manual**: no folders are created (the user will configure by hand
+    ///   in the Manager). Returns [`WizardResult::CompletedManual`].
+    /// - **`NoPrep` / `PreSorted`**: validates the folder names, creates the
+    ///   spam and unsure folders in the message store, and returns their
+    ///   resolved [`FolderId`]s via [`WizardResult::Completed`]. On a
+    ///   folder-creation failure, shows an error and does NOT close the wizard
+    ///   (Req 13.11).
     fn finish(
         &self,
         on_close: &Rc<RefCell<Option<Box<dyn FnOnce(WizardResult) + 'static>>>>,
     ) {
+        let preparation = WizardPreparation::from_index(self.preparation_selection());
+
+        // Manual configuration: don't create folders, just hand off to Manager.
+        if preparation == WizardPreparation::Manual {
+            if let Some(callback) = on_close.borrow_mut().take() {
+                callback(WizardResult::CompletedManual);
+            }
+            self.window.destroy();
+            return;
+        }
+
         let spam_folder = self.spam_folder_entry.text().to_string();
         let unsure_folder = self.unsure_folder_entry.text().to_string();
 
@@ -632,32 +785,141 @@ impl WizardWindow {
             return;
         }
 
-        // Show summary message
+        // Actually create the folders in Outlook via MAPI. This is the step
+        // that was previously missing — the wizard used to only collect names.
+        let location = self.folder_location();
+        let folders = match self.create_folders(
+            spam_folder.trim(),
+            unsure_folder.trim(),
+            location,
+        ) {
+            Ok(f) => f,
+            Err(err) => {
+                // Req 13.11: display error and abort (do not close) on failure.
+                message_boxes::report_error(
+                    Some(&self.window),
+                    "SpamBayes Configuration Error",
+                    &format!(
+                        "There was an error creating the SpamBayes folders.\n\n{err}\n\n\
+                         Please make sure Outlook is running, then try again.",
+                    ),
+                );
+                return;
+            }
+        };
+
+        // Show summary message (folders now exist, so no manual-creation step).
+        let watched_line = if folders.watch.is_some() {
+            "\nWatching your Inbox for incoming mail.\n"
+        } else {
+            "\nNote: your Inbox could not be found automatically — set a \
+             watched folder in the Manager's Filtering tab.\n"
+        };
         message_boxes::report_information(
             Some(&self.window),
             "SpamBayes Configuration Complete",
             &format!(
                 "Configuration saved successfully!\n\n\
-                 Spam folder: {spam_folder}\n\
-                 Unsure folder: {unsure_folder}\n\n\
-                 Next steps:\n\
-                 1. Create these folders in Outlook if they don't exist\n\
-                 2. Use the SpamBayes Manager to complete setup\n\
-                 3. Enable filtering from the SpamBayes menu",
+                 Spam folder: {}\n\
+                 Unsure folder: {}\n\
+                 {}\n\
+                 These folders have been created in Outlook.\n\
+                 SpamBayes filtering is now enabled.",
+                spam_folder.trim(),
+                unsure_folder.trim(),
+                watched_line,
             ),
         );
 
         // Invoke the completion callback (takes it so close-request won't re-ask)
+        let WizardFolders {
+            spam_id,
+            spam_name,
+            unsure_id,
+            unsure_name,
+            watch,
+        } = folders;
+        #[cfg(target_os = "windows")]
+        crate::gui::wizard_folder_creator::debug_log(&format!(
+            "finish: Completed preparation={preparation:?} spam_id=({}/{}) unsure_id=({}/{}) watch={}",
+            spam_id.store_id.0,
+            spam_id.entry_id.0,
+            unsure_id.store_id.0,
+            unsure_id.entry_id.0,
+            watch
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |(w, _)| format!("{}/{}", w.store_id.0, w.entry_id.0)),
+        ));
         if let Some(callback) = on_close.borrow_mut().take() {
             callback(WizardResult::Completed {
-                spam_folder,
-                unsure_folder,
+                spam_folder_id: spam_id,
+                spam_folder_name: spam_name,
+                unsure_folder_id: unsure_id,
+                unsure_folder_name: unsure_name,
+                watch_folder: watch,
+                preparation,
             });
+        } else {
+            #[cfg(target_os = "windows")]
+            crate::gui::wizard_folder_creator::debug_log(
+                "finish: WARNING no completion callback present; folder IDs will NOT be saved",
+            );
         }
 
         // Use destroy() to avoid triggering close-request → do_cancel loop
         self.window.destroy();
     }
+
+    /// Create the spam and unsure folders in the message store.
+    ///
+    /// On Windows this performs real MAPI folder creation via
+    /// [`crate::gui::wizard_folder_creator`], choosing the parent based on the
+    /// user's mail system (under the Junk Email folder when present, else the
+    /// store root). On non-Windows builds (tests on other platforms) this is a
+    /// no-op that returns an error, since MAPI is unavailable.
+    #[cfg(target_os = "windows")]
+    fn create_folders(
+        &self,
+        spam_folder: &str,
+        unsure_folder: &str,
+        location: FolderLocation,
+    ) -> Result<WizardFolders, String> {
+        let created = crate::gui::wizard_folder_creator::create_wizard_folders(
+            self.store_id_hint.clone(),
+            location,
+            spam_folder.to_string(),
+            unsure_folder.to_string(),
+        )
+        .map_err(|e| format!("{} (while creating '{}')", e.reason, e.folder_name))?;
+        Ok(WizardFolders {
+            spam_id: created.spam.id,
+            spam_name: created.spam.display_name,
+            unsure_id: created.unsure.id,
+            unsure_name: created.unsure.display_name,
+            watch: created.watch.map(|w| (w.id, w.display_name)),
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn create_folders(
+        &self,
+        _spam_folder: &str,
+        _unsure_folder: &str,
+        _location: FolderLocation,
+    ) -> Result<WizardFolders, String> {
+        Err("Folder creation requires Windows/MAPI.".to_string())
+    }
+}
+
+/// Folders resolved by the wizard's folder-creation step, with display names
+/// resolved from a fresh MAPI read (so the UI need not rely on a stale tree).
+struct WizardFolders {
+    spam_id: FolderId,
+    spam_name: String,
+    unsure_id: FolderId,
+    unsure_name: String,
+    /// The watched folder (Inbox) and its display name, when resolved.
+    watch: Option<(FolderId, String)>,
 }
 
 /// Register wizard CSS with the given display.

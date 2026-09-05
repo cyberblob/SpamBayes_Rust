@@ -353,6 +353,19 @@ impl ManagerWindow {
             });
         }
 
+        // ─── Wire Configuration Wizard button ────────────────────────────
+        // Override the GeneralTab's default handler so that a wizard run from
+        // the Manager updates the Filtering tab's folder state (and display),
+        // then persists. Updating the tab is essential: apply_changes() reads
+        // folder IDs from the Filtering tab widgets, so writing only to disk
+        // would be overwritten when the Manager saves on close.
+        {
+            let mgr = Rc::clone(&manager);
+            manager.general.wizard_btn.connect_clicked(move |_| {
+                mgr.handle_configuration_wizard();
+            });
+        }
+
         // ─── Wire keyboard shortcuts (Task 8.3) ─────────────────────────
         {
             let mgr = Rc::clone(&manager);
@@ -507,6 +520,68 @@ impl ManagerWindow {
         });
 
         dialog.present();
+    }
+
+    /// Launch the Configuration Wizard from the Manager.
+    ///
+    /// On completion, the wizard has already created the spam/unsure folders in
+    /// the store. We push the resolved folder IDs into the Filtering tab (so
+    /// they are shown and, crucially, picked up by `apply_changes`), set the
+    /// enable-filtering checkbox as appropriate, then persist immediately.
+    fn handle_configuration_wizard(self: &Rc<Self>) {
+        use super::wizard_window::{WizardResult, WizardWindow};
+
+        let config = self.config.borrow().clone();
+        let wizard = WizardWindow::new(&config);
+
+        let mgr = Rc::clone(self);
+        wizard.connect_signals(Some(Box::new(move |result| {
+            match result {
+                WizardResult::Completed {
+                    spam_folder_id,
+                    spam_folder_name,
+                    unsure_folder_id,
+                    unsure_folder_name,
+                    watch_folder,
+                    preparation,
+                } => {
+                    super::wizard_folder_creator::debug_log(&format!(
+                        "manager wizard: Completed preparation={preparation:?} watch={}; \
+                         applying folders to Filtering tab and saving",
+                        watch_folder.is_some()
+                    ));
+                    // Update the Filtering tab widgets/state so apply_changes()
+                    // picks these up (and the UI reflects them).
+                    mgr.filtering.apply_wizard_folders(
+                        &spam_folder_id,
+                        &spam_folder_name,
+                        &unsure_folder_id,
+                        &unsure_folder_name,
+                        watch_folder.as_ref().map(|(id, name)| (id, name.as_str())),
+                    );
+                    // NoPrep and PreSorted enable filtering; Manual would not
+                    // (but Manual produces CompletedManual, handled below).
+                    mgr.general.enable_checkbox.set_active(true);
+                    // Persist now so the change survives even if the window is
+                    // closed via a path that skips save.
+                    if let Err(e) = mgr.apply_changes() {
+                        super::wizard_folder_creator::debug_log(&format!(
+                            "manager wizard: apply_changes failed: {e}"
+                        ));
+                    }
+                }
+                WizardResult::CompletedManual => {
+                    super::wizard_folder_creator::debug_log(
+                        "manager wizard: CompletedManual; leaving folders unchanged",
+                    );
+                }
+                WizardResult::Cancelled => {
+                    super::wizard_folder_creator::debug_log("manager wizard: Cancelled");
+                }
+            }
+        })));
+
+        wizard.present();
     }
 
     /// Validate and save all settings from all tabs.

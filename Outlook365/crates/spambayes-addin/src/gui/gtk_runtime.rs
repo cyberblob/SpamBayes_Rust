@@ -487,14 +487,69 @@ impl GtkRuntime {
             let sender = self.sender.clone();
             let state_for_manager = state.clone();
             let config_for_manager = config.clone();
+            // Own the config-file location so the completion closure can persist.
+            let data_dir_owned = data_dir.to_path_buf();
+            let profile_owned = profile_name.to_string();
             self.show_wizard(config, move |result| {
                 match result {
-                    WizardResult::Completed { .. } => {
-                        // Wizard completed — now show the manager.
-                        log::info!("First-run wizard completed, opening manager.");
+                    WizardResult::Completed {
+                        spam_folder_id,
+                        spam_folder_name: _,
+                        unsure_folder_id,
+                        unsure_folder_name: _,
+                        watch_folder,
+                        preparation,
+                    } => {
+                        // The wizard already created the folders in the store.
+                        // Persist the resolved folder IDs and enable filtering,
+                        // then open the manager.
+                        crate::gui::wizard_folder_creator::debug_log(&format!(
+                            "gtk_runtime first-run: Completed preparation={preparation:?} \
+                             watch={}; saving config to {} profile={profile_owned}",
+                            watch_folder.is_some(),
+                            data_dir_owned.display()
+                        ));
+                        let mut config = config_for_manager;
+                        config.filter.spam_folder_id = Some(spam_folder_id);
+                        config.filter.unsure_folder_id = Some(unsure_folder_id);
+                        // Watch the delivery store's Inbox, if we resolved it.
+                        // Leave any existing watch config untouched otherwise.
+                        if let Some((watch_id, _)) = watch_folder {
+                            config.filter.watch_folder_ids = vec![watch_id];
+                        }
+                        // NoPrep and PreSorted both enable filtering.
+                        config.filter.enabled = true;
+                        match config.save(&data_dir_owned, &profile_owned) {
+                            Ok(()) => crate::gui::wizard_folder_creator::debug_log(
+                                "gtk_runtime first-run: config saved OK",
+                            ),
+                            Err(e) => crate::gui::wizard_folder_creator::debug_log(&format!(
+                                "gtk_runtime first-run: FAILED to save config: {e}"
+                            )),
+                        }
                         let _ = sender.send(GuiCommand::ShowManager {
                             state: state_for_manager,
-                            config: config_for_manager,
+                            config,
+                            on_close: Some(Box::new(on_close)),
+                            folder_tree,
+                            training_executor,
+                            stats,
+                            statistics_manager,
+                        });
+                    }
+                    WizardResult::CompletedManual => {
+                        // User chose manual configuration: save config WITHOUT
+                        // enabling filtering, then open the manager so they can
+                        // finish setup by hand.
+                        log::info!("First-run wizard: manual configuration chosen, opening manager.");
+                        let config = config_for_manager;
+                        // filtering stays disabled (default).
+                        if let Err(e) = config.save(&data_dir_owned, &profile_owned) {
+                            log::error!("Failed to save wizard config: {e}");
+                        }
+                        let _ = sender.send(GuiCommand::ShowManager {
+                            state: state_for_manager,
+                            config,
                             on_close: Some(Box::new(on_close)),
                             folder_tree,
                             training_executor,
@@ -504,6 +559,7 @@ impl GtkRuntime {
                     }
                     WizardResult::Cancelled => {
                         // User cancelled the wizard — just call on_close.
+                        // No config saved, so the wizard re-runs next startup.
                         log::info!("First-run wizard cancelled.");
                         on_close();
                     }

@@ -271,8 +271,18 @@ pub(crate) struct IMAPIFolderVtbl {
         obj_type: *mut u32,
         obj: *mut *mut c_void,
     ) -> i32,                             // slot 16
-    // IMAPIFolder (slots 17+)
-    pub create_message: *const c_void,    // slot 17
+    // NOTE: IMAPIContainer also declares SetSearchCriteria (slot 17) and
+    // GetSearchCriteria (slot 18). These MUST be present so the IMAPIFolder
+    // methods below land on their correct vtable slots. Omitting them shifts
+    // every IMAPIFolder method up by two slots — which made create_folder
+    // actually invoke CopyMessages and fail with E_INVALIDARG (0x80070057).
+    pub set_search_criteria: *const c_void, // slot 17
+    pub get_search_criteria: *const c_void, // slot 18
+    // IMAPIFolder (slots 19+). Vtable order per the MAPI IMAPIFolder spec:
+    // CreateMessage, CopyMessages, DeleteMessages, CreateFolder, CopyFolder,
+    // DeleteFolder, SetReadFlags, GetMessageStatus, SetMessageStatus,
+    // SaveContentsSort, EmptyFolder.
+    pub create_message: *const c_void,    // slot 19
     pub copy_messages: unsafe extern "system" fn(
         this: *mut c_void,
         msg_list: *const SBinaryArray,
@@ -281,14 +291,14 @@ pub(crate) struct IMAPIFolderVtbl {
         ui_param: usize,
         progress: *mut c_void,
         flags: u32,
-    ) -> i32,                             // slot 18
+    ) -> i32,                             // slot 20
     pub delete_messages: unsafe extern "system" fn(
         this: *mut c_void,
         msg_list: *const SBinaryArray,
         ui_param: usize,
         progress: *mut c_void,
         flags: u32,
-    ) -> i32,                             // slot 19
+    ) -> i32,                             // slot 21
     pub create_folder: unsafe extern "system" fn(
         this: *mut c_void,
         folder_type: u32,
@@ -297,11 +307,14 @@ pub(crate) struct IMAPIFolderVtbl {
         interface: *const c_void,
         flags: u32,
         folder: *mut *mut c_void,
-    ) -> i32,                             // slot 20
-    pub delete_folder: *const c_void,     // slot 21
-    pub empty_folder: *const c_void,      // slot 22
+    ) -> i32,                             // slot 22
     pub copy_folder: *const c_void,       // slot 23
-    pub move_folder: *const c_void,       // slot 24
+    pub delete_folder: *const c_void,     // slot 24
+    pub set_read_flags: *const c_void,    // slot 25
+    pub get_message_status: *const c_void, // slot 26
+    pub set_message_status: *const c_void, // slot 27
+    pub save_contents_sort: *const c_void, // slot 28
+    pub empty_folder: *const c_void,      // slot 29
 }
 
 /// `IMAPITable` vtable — used for hierarchy and contents tables.

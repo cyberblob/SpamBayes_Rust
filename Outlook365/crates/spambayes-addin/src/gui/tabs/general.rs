@@ -21,7 +21,6 @@ use spambayes_config::AppConfig;
 
 use crate::gui::filter_now_dialog::FilterNowDialog;
 use crate::gui::folder_browser::{FolderBrowserDialog, FolderProvider};
-use crate::gui::wizard_window::WizardWindow;
 use crate::manager_dlg::{ManagerState, ManagerStats};
 
 // ─── CSS class names ─────────────────────────────────────────────────────────
@@ -331,30 +330,11 @@ impl GeneralTab {
             log::info!("Reset Configuration clicked (handler should be overridden by ManagerWindow)");
         });
 
-        wizard_btn.connect_clicked({
-            let config = config.clone();
-            move |_btn| {
-                log::info!("Configuration Wizard launched from Manager.");
-                let wizard = WizardWindow::new(&config);
-                wizard.connect_signals(Some(Box::new(|result| {
-                    match result {
-                        crate::gui::wizard_window::WizardResult::Completed {
-                            spam_folder,
-                            unsure_folder,
-                        } => {
-                            log::info!(
-                                "Wizard completed: spam_folder={}, unsure_folder={}",
-                                spam_folder,
-                                unsure_folder
-                            );
-                        }
-                        crate::gui::wizard_window::WizardResult::Cancelled => {
-                            log::info!("Wizard cancelled by user.");
-                        }
-                    }
-                })));
-                wizard.present();
-            }
+        // The real handler is wired by ManagerWindow after construction, so it
+        // can update the Filtering tab and persist correctly. This placeholder
+        // only runs in standalone tab testing (no ManagerWindow present).
+        wizard_btn.connect_clicked(|_btn| {
+            log::info!("Configuration Wizard clicked (handler should be overridden by ManagerWindow)");
         });
 
         // ─── 8. ScrolledWindow wrapper (Req 1.8) ────────────────────────
@@ -538,4 +518,5 @@ impl GeneralTab {
             }
         }
     }
+
 }
