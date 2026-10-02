@@ -94,41 +94,112 @@ Filename: "{localappdata}\SpamBayes\default.ini"; Section: "Update"; \
     Flags: uninsdeleteentry
 
 [Code]
-// Check if Outlook is running before install.
+// --- Outlook running-state detection -------------------------------------
 //
 // The add-in DLL is memory-mapped by OUTLOOK.EXE while it is running, so
 // Windows refuses to overwrite it. If we let the install proceed with Outlook
 // open, the new DLL is NOT copied and the add-in keeps loading (and reporting)
-// the OLD version. We therefore block the install until Outlook is closed
-// rather than merely warning. CloseApplications=yes will also attempt to close
-// it automatically, and restartreplace handles the edge case where a handle
-// lingers.
+// the OLD version.
+//
+// We detect "Outlook is running" using TWO independent signals:
+//
+//   1. CheckForMutexes('_Outlook_Mutex_') — fast, but only reflects the main
+//      Outlook session. Outlook frequently lingers as a background OUTLOOK.EXE
+//      process (shutdown, MAPI/sync, "still running" tray state) AFTER the
+//      mutex is released, while the process still holds the DLL file lock.
+//
+//   2. A process-table check for OUTLOOK.EXE via `tasklist`. This closes the
+//      gap above: it proves the process is actually gone, not just the window.
+//
+// Only when BOTH signals are clear do we allow files to be replaced.
+
+// Returns True if an OUTLOOK.EXE process is currently present in the process
+// table. Shells out to tasklist with a CSV image-name filter and inspects the
+// output file. Any failure to run/read tasklist is treated as "not detected"
+// so a broken tasklist never hard-blocks the install (the mutex check and
+// restartreplace flag remain as backstops).
+function IsOutlookProcessRunning(): Boolean;
+var
+  ResultCode: Integer;
+  TmpFile: String;
+  Output: AnsiString;
+  Cmd: String;
+begin
+  Result := False;
+  TmpFile := ExpandConstant('{tmp}\sb_outlook_tasklist.txt');
+  // /FI "IMAGENAME eq OUTLOOK.EXE" + /NH keeps the output to matching rows
+  // only; /FO CSV makes the row easy to scan. Redirect through cmd so we can
+  // capture stdout to a file (Exec cannot capture output directly).
+  Cmd := '/C tasklist /FI "IMAGENAME eq OUTLOOK.EXE" /NH /FO CSV > "' +
+    TmpFile + '"';
+  if Exec(ExpandConstant('{cmd}'), Cmd, '', SW_HIDE, ewWaitUntilTerminated,
+    ResultCode) then
+  begin
+    if LoadStringFromFile(TmpFile, Output) then
+    begin
+      // When no process matches, tasklist prints an INFO line instead of a
+      // CSV row (e.g. "INFO: No tasks are running which match..."). So the
+      // presence of the image name in a quoted CSV field is our signal.
+      if Pos('"OUTLOOK.EXE"', Uppercase(String(Output))) > 0 then
+        Result := True;
+    end;
+  end;
+  // Best-effort cleanup of the temp capture file.
+  DeleteFile(TmpFile);
+end;
+
+// True if EITHER signal indicates Outlook is still up.
+function IsOutlookRunning(): Boolean;
+begin
+  Result := CheckForMutexes('_Outlook_Mutex_') or IsOutlookProcessRunning();
+end;
+
+// Check if Outlook is running before install, and block until it is actually
+// gone from the process table (not just the mutex). CloseApplications=yes will
+// also attempt to close it automatically, and restartreplace handles the edge
+// case where a handle lingers past our checks.
 function InitializeSetup(): Boolean;
 begin
   Result := True;
-  if CheckForMutexes('_Outlook_Mutex_') then
+  if not IsOutlookRunning() then
+    Exit;
+
+  // Retry loop: prompt, let the user close Outlook, then RE-VERIFY both the
+  // mutex and the live process before proceeding. We never fall through with
+  // Outlook still detected.
+  while IsOutlookRunning() do
   begin
     if MsgBox('Microsoft Outlook is currently running.' + #13#10 +
       'SpamBayes cannot update its add-in while Outlook has it open, and ' +
       'the update will not take effect until Outlook is closed.' + #13#10#13#10 +
-      'Please close Outlook completely, then click Retry.' + #13#10 +
+      'Please close Outlook completely (check the system tray and Task ' +
+      'Manager for OUTLOOK.EXE), then click Retry.' + #13#10 +
       'Click Cancel to abort the installation.',
       mbError, MB_RETRYCANCEL) = IDCANCEL then
     begin
       Result := False;
       Exit;
     end;
-    // Re-check after the user says they've closed it. If it is still running,
-    // abort so we never silently leave the old DLL in place.
-    if CheckForMutexes('_Outlook_Mutex_') then
-    begin
-      MsgBox('Outlook still appears to be running. Installation aborted.' + #13#10 +
-        'Close Outlook (check the system tray and Task Manager for ' +
-        'OUTLOOK.EXE) and run the installer again.',
-        mbError, MB_OK);
-      Result := False;
-    end;
+    // Loop condition re-evaluates IsOutlookRunning(): if the process is still
+    // present we prompt again; once it is truly gone we fall out and proceed.
   end;
+end;
+
+// Final gate immediately before the [Files] step. InitializeSetup runs early
+// (before the wizard pages), so the user could reopen Outlook while clicking
+// through the wizard. PrepareToInstall fires just before any file is written,
+// giving us a last-moment re-verification that OUTLOOK.EXE is gone. Returning
+// a non-empty string aborts the install with that message, so we never replace
+// the locked DLL and silently leave the old version in place.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if IsOutlookRunning() then
+    Result :=
+      'Microsoft Outlook started running again before installation could ' +
+      'complete.' + #13#10 +
+      'Close Outlook completely (check the system tray and Task Manager for ' +
+      'OUTLOOK.EXE), then run the installer again.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
