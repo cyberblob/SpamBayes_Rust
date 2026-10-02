@@ -93,6 +93,10 @@ fn embed_version_resource(version: &str) {
     res.set("CompanyName", "SpamBayes Project");
     res.set("OriginalFilename", "spambayes_addin.dll");
     res.set("InternalName", "spambayes_addin");
+    res.set(
+        "LegalCopyright",
+        "Copyright (C) 2026 Douglas Farrell. Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).",
+    );
 
     if let Err(e) = res.compile() {
         // Don't fail the whole build if the resource compiler is unavailable;

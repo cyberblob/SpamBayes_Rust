@@ -733,7 +733,7 @@ impl ManagerWindow {
              statistical analysis of message content.",
         ));
         about.set_copyright(Some(
-            "Copyright © 2026 Doug Farrell\n\
+            "Copyright © 2026 Douglas Farrell\n\
              Based on SpamBayes but a complete rewrite in Rust",
         ));
         about.set_website(Some("https://github.com/cyberblob/SpamBayes_Rust"));
@@ -741,10 +741,7 @@ impl ManagerWindow {
         about.set_authors(&[
             "Doug Farrell and Kiro.dev",
         ]);
-        about.set_license_type(gtk4::License::Custom);
-        about.set_license(Some(
-            "Licensed under the MIT License.",
-        ));
+        about.set_license_type(gtk4::License::Agpl30);
         about.present();
     }
 }

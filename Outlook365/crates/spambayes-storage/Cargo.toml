@@ -2,6 +2,7 @@
 name = "spambayes-storage"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Database persistence for classifier token data"
 
 [dependencies]

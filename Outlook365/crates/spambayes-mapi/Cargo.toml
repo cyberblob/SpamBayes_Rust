@@ -2,6 +2,7 @@
 name = "spambayes-mapi"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "MAPI abstraction layer for Outlook message store access"
 
 [dependencies]

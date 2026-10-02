@@ -14,6 +14,7 @@
 #define MyAppSemVer "0.3.0-alpha.9"
 #define MyAppPublisher "SpamBayes Project"
 #define MyAppURL "https://github.com/cyberblob/SpamBayes_Rust"
+#define MyAppCopyright "Copyright (C) 2026 Douglas Farrell. Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)."
 
 [Setup]
 AppId={{E7F3A2B1-9C4D-4E8F-A1B2-567890ABCDEF}
@@ -21,6 +22,10 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
+AppCopyright={#MyAppCopyright}
+; Show the AGPL-3.0 license agreement page during setup. Path is relative to
+; this .iss file: installer/ -> Outlook365/ -> workspace root.
+LicenseFile=..\..\LICENSE
 DefaultDirName={autopf}\SpamBayes
 DefaultGroupName={#MyAppName}
 OutputDir=..\installer\output

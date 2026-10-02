@@ -2,6 +2,7 @@
 name = "spambayes-config"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Configuration system with INI read/write"
 
 [dependencies]
