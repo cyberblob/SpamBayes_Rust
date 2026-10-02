@@ -6,12 +6,12 @@
 ;   - Provides clean uninstall
 
 #define MyAppName "SpamBayes Outlook Add-in"
-#define MyAppVersion "0.3.0a8"
+#define MyAppVersion "0.3.0a9"
 ; Canonical SemVer string that matches the DLL's compiled-in CARGO_PKG_VERSION
 ; (env!("SPAMBAYES_VERSION")). Must be kept in sync with the workspace
 ; Cargo.toml `version` field. Used to stamp install_target_version into the
 ; user's INI so the add-in can detect a pending update that did not load.
-#define MyAppSemVer "0.3.0-alpha.8"
+#define MyAppSemVer "0.3.0-alpha.9"
 #define MyAppPublisher "SpamBayes Project"
 #define MyAppURL "https://github.com/cyberblob/SpamBayes_Rust"
 
