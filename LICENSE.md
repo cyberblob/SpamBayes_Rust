@@ -3,7 +3,7 @@
 SpamBayes (Rust Outlook Add-in) is licensed under the
 **GNU Affero General Public License, version 3 (AGPL-3.0)**.
 
-Copyright (C) 2026 \ Douglas Farrell
+Copyright (C) 2026 Douglas Farrell
 
 The complete, legally binding license text is in the [`LICENSE`](./LICENSE)
 file in the project root. This document is a plain-language summary only; where
@@ -30,7 +30,7 @@ commercial license from the copyright holder.
 The AGPL recommends a short header at the top of each source file:
 
 ```
-Copyright (C) 2026  <COPYRIGHT HOLDER>
+Copyright (C) 2026  Douglas Farrell
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
