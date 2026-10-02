@@ -71,11 +71,17 @@ try {
     Write-Host "  [OK] $cargoToml -> $Version" -ForegroundColor Green
 
     # ─── 2. installer/spambayes_outlook.iss ───────────────────────────────────
+    # Two defines must be kept in sync:
+    #   MyAppVersion — PEP 440 form (e.g. 0.3.0a3), used for display + output filename
+    #   MyAppSemVer  — canonical SemVer form (e.g. 0.3.0-alpha.3), stamped into the
+    #                  user's INI as install_target_version so the add-in can detect
+    #                  a pending update that did not load. Must match Cargo.toml.
     $issFile = "installer\spambayes_outlook.iss"
     $content = Get-Content $issFile -Raw
     $content = $content -replace '(#define MyAppVersion\s+")[^"]+(")', "`${1}$Pep440Version`${2}"
+    $content = $content -replace '(#define MyAppSemVer\s+")[^"]+(")', "`${1}$Version`${2}"
     Set-Content $issFile $content -NoNewline
-    Write-Host "  [OK] $issFile -> $Pep440Version" -ForegroundColor Green
+    Write-Host "  [OK] $issFile -> MyAppVersion=$Pep440Version, MyAppSemVer=$Version" -ForegroundColor Green
 
     # ─── 3. installer/version_manifest.json ───────────────────────────────────
     $manifestFile = "installer\version_manifest.json"

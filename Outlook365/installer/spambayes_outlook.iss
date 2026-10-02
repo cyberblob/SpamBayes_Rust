@@ -11,7 +11,7 @@
 ; (env!("SPAMBAYES_VERSION")). Must be kept in sync with the workspace
 ; Cargo.toml `version` field. Used to stamp install_target_version into the
 ; user's INI so the add-in can detect a pending update that did not load.
-#define MyAppSemVer "0.3.0-alpha.6"
+#define MyAppSemVer "0.3.0-alpha.8"
 #define MyAppPublisher "SpamBayes Project"
 #define MyAppURL "https://github.com/cyberblob/SpamBayes_Rust"
 
